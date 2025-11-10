@@ -80,6 +80,45 @@ JINJA_EXPRESSION_PATTERN = re.compile(r"\{\{.*?\}\}", re.DOTALL)
 JINJA_STATEMENT_PATTERN = re.compile(r"\{\%.*?\%\}", re.DOTALL)
 JINJA_COMMENT_PATTERN = re.compile(r"\{\#.*?\#\}", re.DOTALL)
 ENV_TEMPLATE_PATTERN = re.compile(r"\$\{.*?\}")
+TEMPLATE_IDENTIFIER_PATTERNS = [
+    re.compile(r"params\[['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"]\]"),
+    re.compile(r"params\.?(?P<name>[A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(r"env\[['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"]\]"),
+    re.compile(r"env\.?(?P<name>[A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(r"var\[['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"]\]"),
+    re.compile(r"var\.?(?P<name>[A-Za-z_][A-Za-z0-9_]*)"),
+]
+
+
+def _extract_template_identifier(inner: str) -> Optional[str]:
+    candidate = inner.strip()
+    if not candidate:
+        return None
+    # Remove filters or conditional logic after pipe or ternary keywords.
+    for splitter in ("|", " if ", " else ", " or ", " and "):
+        if splitter in candidate:
+            candidate = candidate.split(splitter, 1)[0].strip()
+    for pattern in TEMPLATE_IDENTIFIER_PATTERNS:
+        match = pattern.fullmatch(candidate)
+        if match:
+            name = match.group("name")
+            if name:
+                return name
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", candidate):
+        return candidate
+    return None
+
+
+def _extract_env_identifier(inner: str) -> Optional[str]:
+    candidate = inner.strip()
+    if not candidate:
+        return None
+    for splitter in (":", "-", "|"):
+        if splitter in candidate:
+            candidate = candidate.split(splitter, 1)[0].strip()
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", candidate):
+        return candidate
+    return None
 
 
 def sanitize_sql(sql_text: str) -> str:
@@ -90,11 +129,17 @@ def sanitize_sql(sql_text: str) -> str:
     cleaned = JINJA_STATEMENT_PATTERN.sub(" ", cleaned)
 
     def replace_expression(match: re.Match) -> str:
-        # Replace Jinja expressions with a neutral literal
-        return "0"
+        inner = match.group(0)[2:-2]
+        identifier = _extract_template_identifier(inner)
+        return identifier or "0"
+
+    def replace_env(match: re.Match) -> str:
+        inner = match.group(0)[2:-1]
+        identifier = _extract_env_identifier(inner)
+        return identifier or "0"
 
     cleaned = JINJA_EXPRESSION_PATTERN.sub(replace_expression, cleaned)
-    cleaned = ENV_TEMPLATE_PATTERN.sub("0", cleaned)
+    cleaned = ENV_TEMPLATE_PATTERN.sub(replace_env, cleaned)
     return cleaned
 
 
