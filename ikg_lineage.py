@@ -72,6 +72,33 @@ LOGGER = logging.getLogger("ikg_lineage")
 
 
 # ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+
+JINJA_EXPRESSION_PATTERN = re.compile(r"\{\{.*?\}\}", re.DOTALL)
+JINJA_STATEMENT_PATTERN = re.compile(r"\{\%.*?\%\}", re.DOTALL)
+JINJA_COMMENT_PATTERN = re.compile(r"\{\#.*?\#\}", re.DOTALL)
+ENV_TEMPLATE_PATTERN = re.compile(r"\$\{.*?\}")
+
+
+def sanitize_sql(sql_text: str) -> str:
+    """
+    Remove templating constructs (Jinja, env placeholders) that prevent sqlglot parsing.
+    """
+    cleaned = JINJA_COMMENT_PATTERN.sub(" ", sql_text)
+    cleaned = JINJA_STATEMENT_PATTERN.sub(" ", cleaned)
+
+    def replace_expression(match: re.Match) -> str:
+        # Replace Jinja expressions with a neutral literal
+        return "0"
+
+    cleaned = JINJA_EXPRESSION_PATTERN.sub(replace_expression, cleaned)
+    cleaned = ENV_TEMPLATE_PATTERN.sub("0", cleaned)
+    return cleaned
+
+
+# ---------------------------------------------------------------------------
 # Data classes for configuration and lineage entities
 # ---------------------------------------------------------------------------
 
@@ -355,8 +382,23 @@ class SQLLineageExtractor:
         try:
             statements = parse(sql_text, read=self.dialect)
         except ParseError as err:
-            LOGGER.error("Failed to parse %s: %s", file_path, err)
-            return records, referenced_tables
+            LOGGER.debug("Initial parse failed for %s: %s", file_path, err)
+            cleaned_sql = sanitize_sql(sql_text)
+            if cleaned_sql != sql_text:
+                try:
+                    statements = parse(cleaned_sql, read=self.dialect)
+                    LOGGER.info("Parsed %s after removing templating constructs.", file_path)
+                    sql_text = cleaned_sql
+                except ParseError as sanitized_err:
+                    LOGGER.error(
+                        "Failed to parse %s even after sanitizing templates: %s",
+                        file_path,
+                        sanitized_err,
+                    )
+                    return records, referenced_tables
+            else:
+                LOGGER.error("Failed to parse %s: %s", file_path, err)
+                return records, referenced_tables
 
         cte_definitions: Dict[str, exp.Expression] = {}
         for statement in statements:
