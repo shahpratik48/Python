@@ -1134,9 +1134,13 @@ class OutputManager:
                 )
             )
         else:
-            name = f"ikg_lineage_{self.date_str}_{self.time_str}.xls"
-        if not name.lower().endswith(".xls"):
-            name = f"{name}.xls"
+            name = f"ikg_lineage_{self.date_str}_{self.time_str}.xlsx"
+        if not name.lower().endswith(".xlsx"):
+            LOGGER.warning(
+                "Excel output renamed to .xlsx for openpyxl compatibility (was %s).",
+                name,
+            )
+            name = f"{Path(name).stem}.xlsx"
         return name
 
     def write_excel(self, records: List[LineageRecord]) -> Optional[Path]:
@@ -1159,14 +1163,27 @@ class OutputManager:
         ]
         df = pd.DataFrame(data)
         path = self.output_dir / self._resolve_excel_name()
+        engine = None
         try:
-            df.to_excel(path, index=False, engine="xlwt")
-        except ValueError:
-            # xlwt might be unavailable; fall back to default engine but warn about xls limitations.
+            import openpyxl  # noqa: F401
+
+            engine = "openpyxl"
+        except ImportError:
             LOGGER.warning(
-                "xlwt engine unavailable; attempting default engine for xls output. Consider installing xlwt."
+                "openpyxl not installed; attempting pandas default engine for xlsx output."
             )
-            df.to_excel(path, index=False)
+        try:
+            if engine:
+                df.to_excel(path, index=False, engine=engine)
+            else:
+                df.to_excel(path, index=False)
+        except (ValueError, ModuleNotFoundError) as err:
+            LOGGER.error(
+                "Failed to write Excel file %s. Ensure openpyxl is installed. Error: %s",
+                path,
+                err,
+            )
+            raise
         LOGGER.info("Excel lineage exported to %s", path)
         return path
 
