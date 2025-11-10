@@ -5,10 +5,9 @@ IKG SQL Lineage Extraction Tool
 
 This tool connects to a GitLab repository, downloads SQL files from a specified branch
 and directory, parses them with sqlglot to derive column-level lineage, and exports
-the lineage to multiple formats (Excel, JSON, graph files, PyVis HTML, and optionally
-Neo4j). It supports recursive discovery of SQL dependencies starting from a user-supplied
-root SQL file, CTE parsing, alias handling, and Greenplum metadata lookups for unmapped
-columns.
+the lineage to multiple formats (Excel, JSON, graph files, PyVis HTML). It supports
+recursive discovery of SQL dependencies starting from a user-supplied root SQL file,
+CTE parsing, alias handling, and Greenplum metadata lookups for unmapped columns.
 
 Key features:
     * GitLab API integration (python-gitlab)
@@ -16,7 +15,7 @@ Key features:
     * Column-level lineage extraction via sqlglot
     * CTE and subquery lineage propagation
     * Optional metadata resolution via Greenplum (psycopg2)
-    * Outputs: Excel, JSON, NetworkX graph (GEXF), PyVis interactive HTML, Neo4j push
+    * Outputs: Excel, JSON, NetworkX graph (GEXF), PyVis interactive HTML
 
 Usage:
     python ikg_lineage.py --project-id <PROJECT_ID> --token <TOKEN> --start-table <TABLE>
@@ -31,8 +30,9 @@ import datetime as dt
 import json
 import logging
 import os
+import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
@@ -57,11 +57,6 @@ try:
     from pyvis.network import Network as PyVisNetwork
 except ImportError:  # pragma: no cover - optional dependency
     PyVisNetwork = None
-
-try:
-    from neo4j import GraphDatabase
-except ImportError:  # pragma: no cover - optional dependency
-    GraphDatabase = None
 
 try:
     import psycopg2
@@ -99,6 +94,7 @@ class GreenplumConfig:
     user: Optional[str] = None
     password: Optional[str] = None
     default_schema: Optional[str] = None
+    schema_whitelist: Optional[List[str]] = None
 
     @property
     def enabled(self) -> bool:
@@ -110,17 +106,6 @@ class GreenplumConfig:
                 self.password,
             ]
         )
-
-
-@dataclass
-class Neo4jConfig:
-    uri: Optional[str] = None
-    user: Optional[str] = None
-    password: Optional[str] = None
-
-    @property
-    def enabled(self) -> bool:
-        return all([self.uri, self.user, self.password])
 
 
 @dataclass
@@ -167,6 +152,7 @@ class GitLabSQLFetcher:
     def __init__(self, config: GitLabConfig) -> None:
         self.config = config
         self._project = None
+        self._exclusions = self._prepare_exclusions(config.exclude_folder)
 
     @property
     def project(self):
@@ -197,9 +183,8 @@ class GitLabSQLFetcher:
         )
         for item in tree_items:
             item_path = item["path"]
-            if (
-                self.config.exclude_folder
-                and item_path.startswith(self.config.exclude_folder)
+            if self._exclusions and any(
+                item_path.startswith(exclusion) for exclusion in self._exclusions
             ):
                 LOGGER.debug("Skipping excluded path %s", item_path)
                 continue
@@ -217,6 +202,23 @@ class GitLabSQLFetcher:
         file_obj = self.project.files.get(file_path=file_path, ref=self.config.branch)
         content = base64.b64decode(file_obj.content).decode("utf-8", errors="ignore")
         return content
+
+    @staticmethod
+    def _prepare_exclusions(exclude_folder: Optional[str]) -> Set[str]:
+        if not exclude_folder:
+            return set()
+        candidates: Set[str] = set()
+        parts = re.split(r"[;,]", exclude_folder) if isinstance(exclude_folder, str) else exclude_folder
+        for part in parts or []:
+            cleaned = str(part).strip()
+            if not cleaned:
+                continue
+            normalised = cleaned.replace("\\", "/")
+            candidates.add(normalised)
+            # Also consider replacing spaces with underscores if present.
+            if " " in normalised:
+                candidates.add(normalised.replace(" ", "_"))
+        return candidates
 
 
 # ---------------------------------------------------------------------------
@@ -264,17 +266,27 @@ class GreenplumMetadataClient:
         if conn is None:
             return None
 
-        tables_filter = ""
         params: List[str] = []
-        if candidate_tables:
-            placeholders = ", ".join(["%s"] * len(list(candidate_tables)))
+        tables = [t for t in (candidate_tables or []) if t]
+        schemas: List[str] = []
+        if schema:
+            schemas = [schema]
+        elif self.config.schema_whitelist:
+            schemas = list(self.config.schema_whitelist)
+        elif self.config.default_schema:
+            schemas = [self.config.default_schema]
+
+        tables_filter = ""
+        if tables:
+            placeholders = ", ".join(["%s"] * len(tables))
             tables_filter = f"AND table_name IN ({placeholders})"
-            params.extend(candidate_tables)
-        if schema or self.config.default_schema:
-            params.append(schema or self.config.default_schema or "")
-            schema_clause = "AND table_schema = %s"
-        else:
-            schema_clause = ""
+            params.extend(tables)
+
+        schema_clause = ""
+        if schemas:
+            placeholders = ", ".join(["%s"] * len(schemas))
+            schema_clause = f"AND table_schema IN ({placeholders})"
+            params.extend(schemas)
 
         query = f"""
             SELECT table_schema, table_name, column_name
@@ -561,7 +573,7 @@ class SQLLineageExtractor:
                 if not sources:
                     resolved = self._fallback_metadata_resolution(
                         column_name=target_col,
-                        candidate_aliases=alias_map.keys(),
+                        candidate_refs=alias_map.values(),
                     )
                     sources = [resolved] if resolved else []
                 for source in sources:
@@ -689,7 +701,7 @@ class SQLLineageExtractor:
                 if not sources:
                     resolved = self._fallback_metadata_resolution(
                         column_name=target_column,
-                        candidate_aliases=alias_map.keys(),
+                        candidate_refs=alias_map.values(),
                         schema_hint=target_schema,
                     )
                     sources = [resolved] if resolved else []
@@ -872,7 +884,7 @@ class SQLLineageExtractor:
 
             resolved = self._fallback_metadata_resolution(
                 column_name=column_name,
-                candidate_aliases=alias_map.keys(),
+                candidate_refs=alias_map.values(),
             )
             if resolved:
                 sources.append(resolved)
@@ -883,12 +895,20 @@ class SQLLineageExtractor:
     def _fallback_metadata_resolution(
         self,
         column_name: str,
-        candidate_aliases: Iterable[str],
+        candidate_refs: Iterable[TableReference],
         schema_hint: Optional[str] = None,
     ) -> Optional[Tuple[Optional[str], str, str]]:
         if not self.metadata_client:
             return None
-        candidate_tables = [alias for alias in candidate_aliases if alias]
+        refs = list(candidate_refs)
+        candidate_tables = [
+            ref.name for ref in refs if ref and ref.name and not ref.is_cte
+        ]
+        if not schema_hint:
+            for ref in refs:
+                if ref and ref.schema:
+                    schema_hint = ref.schema
+                    break
         resolved = self.metadata_client.resolve_column(
             column_name=column_name,
             candidate_tables=candidate_tables,
@@ -1005,10 +1025,32 @@ class SQLLineageExtractor:
 
 
 class OutputManager:
-    def __init__(self, output_dir: Path, timestamp: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        output_dir: Path,
+        timestamp: Optional[str] = None,
+        base_filename: Optional[str] = None,
+    ) -> None:
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.timestamp = timestamp or dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.generated_at = dt.datetime.now()
+        self.date_str = self.generated_at.strftime("%Y%m%d")
+        self.time_str = self.generated_at.strftime("%H%M%S")
+        self.timestamp = timestamp or f"{self.date_str}_{self.time_str}"
+        self.base_filename = base_filename
+
+    def _resolve_excel_name(self) -> str:
+        if self.base_filename:
+            name = (
+                self.base_filename.replace("<date>", self.date_str).replace(
+                    "<timestamp>", self.time_str
+                )
+            )
+        else:
+            name = f"ikg_lineage_{self.date_str}_{self.time_str}.xls"
+        if not name.lower().endswith(".xls"):
+            name = f"{name}.xls"
+        return name
 
     def write_excel(self, records: List[LineageRecord]) -> Optional[Path]:
         if pd is None:
@@ -1029,8 +1071,15 @@ class OutputManager:
             for r in records
         ]
         df = pd.DataFrame(data)
-        path = self.output_dir / f"ikg_column_lineage_output_{self.timestamp}.xlsx"
-        df.to_excel(path, index=False)
+        path = self.output_dir / self._resolve_excel_name()
+        try:
+            df.to_excel(path, index=False, engine="xlwt")
+        except ValueError:
+            # xlwt might be unavailable; fall back to default engine but warn about xls limitations.
+            LOGGER.warning(
+                "xlwt engine unavailable; attempting default engine for xls output. Consider installing xlwt."
+            )
+            df.to_excel(path, index=False)
         LOGGER.info("Excel lineage exported to %s", path)
         return path
 
@@ -1131,61 +1180,6 @@ class OutputManager:
         return path
 
 
-class Neo4jExporter:
-    """Push lineage graph into Neo4j if credentials are supplied."""
-
-    def __init__(self, config: Neo4jConfig) -> None:
-        self.config = config
-        if config.enabled and GraphDatabase is None:
-            LOGGER.warning("neo4j driver is not installed; Neo4j export skipped.")
-        self._driver = None
-
-    def _ensure_driver(self):
-        if not self.config.enabled or GraphDatabase is None:
-            return None
-        if self._driver is None:
-            LOGGER.info("Connecting to Neo4j at %s", self.config.uri)
-            self._driver = GraphDatabase.driver(
-                self.config.uri,
-                auth=(self.config.user, self.config.password),
-            )
-        return self._driver
-
-    def export(self, records: List[LineageRecord]) -> None:
-        driver = self._ensure_driver()
-        if not driver:
-            return
-
-        create_nodes_query = """
-        MERGE (t:Table {name: $target_table, schema: coalesce($target_schema, 'public')})
-        MERGE (s:Table {name: $source_table, schema: coalesce($source_schema, 'public')})
-        MERGE (tc:Column {name: $target_column})-[:BELONGS_TO]->(t)
-        MERGE (sc:Column {name: $source_column})-[:BELONGS_TO]->(s)
-        MERGE (sc)-[r:DERIVES]->(tc)
-        SET r.logic = $logic, r.sql_file = $sql_file
-        """
-
-        with driver.session() as session:
-            for record in records:
-                session.run(
-                    create_nodes_query,
-                    target_table=record.target_table,
-                    target_schema=record.target_schema,
-                    target_column=record.target_column,
-                    source_table=record.source_table,
-                    source_schema=record.source_schema,
-                    source_column=record.source_column,
-                    logic=record.logic,
-                    sql_file=record.sql_file,
-                )
-        LOGGER.info("Neo4j export completed.")
-
-    def close(self) -> None:
-        if self._driver:
-            self._driver.close()
-            self._driver = None
-
-
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
@@ -1197,13 +1191,11 @@ class LineageService:
         gitlab_config: GitLabConfig,
         extractor: SQLLineageExtractor,
         metadata_client: Optional[GreenplumMetadataClient],
-        neo4j_exporter: Optional[Neo4jExporter],
         output_manager: OutputManager,
     ) -> None:
         self.gitlab_config = gitlab_config
         self.extractor = extractor
         self.metadata_client = metadata_client
-        self.neo4j_exporter = neo4j_exporter
         self.output_manager = output_manager
         self.fetcher = GitLabSQLFetcher(gitlab_config)
 
@@ -1267,13 +1259,8 @@ class LineageService:
         if pyvis_path:
             outputs["pyvis"] = pyvis_path
 
-        if self.neo4j_exporter:
-            self.neo4j_exporter.export(records)
-
         if self.metadata_client:
             self.metadata_client.close()
-        if self.neo4j_exporter:
-            self.neo4j_exporter.close()
 
         return outputs
 
@@ -1291,9 +1278,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--branch", default=os.getenv("GITLAB_BRANCH", "ikg-master"))
     parser.add_argument("--sql-folder", default=os.getenv("SQL_FOLDER", "dags/ikg/scripts/sql"))
     parser.add_argument("--exclude-folder", default=os.getenv("EXCLUDE_FOLDER", "ikg_new_fa_shhp_map"))
-    parser.add_argument("--start-table", help="Root SQL/table name to start lineage tracing", required=True)
+    parser.add_argument("--start-table", help="Root SQL/table name to start lineage tracing", required=False)
     parser.add_argument("--dialect", default=os.getenv("SQL_DIALECT", "postgres"))
     parser.add_argument("--output-dir", default=os.getenv("OUTPUT_DIR", "./lineage_output"))
+    parser.add_argument("--output-filename", default=os.getenv("OUTPUT_FILENAME"))
     parser.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"))
 
     # Greenplum metadata options
@@ -1303,11 +1291,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--greenplum-user", default=os.getenv("GREENPLUM_USER"))
     parser.add_argument("--greenplum-password", default=os.getenv("GREENPLUM_PASSWORD"))
     parser.add_argument("--greenplum-schema", default=os.getenv("GREENPLUM_SCHEMA"))
-
-    # Neo4j options
-    parser.add_argument("--neo4j-uri", default=os.getenv("NEO4J_URI"))
-    parser.add_argument("--neo4j-user", default=os.getenv("NEO4J_USER"))
-    parser.add_argument("--neo4j-password", default=os.getenv("NEO4J_PASSWORD"))
+    parser.add_argument(
+        "--greenplum-schemas",
+        default=os.getenv("GREENPLUM_SCHEMAS"),
+        help="Comma-separated list of schemas to search when resolving metadata.",
+    )
 
     return parser
 
@@ -1330,6 +1318,13 @@ def main(args: Optional[List[str]] = None) -> int:
 
     configure_logging(parsed.log_level)
 
+    start_table = parsed.start_table
+    if not start_table:
+        start_table = input("Enter start table name: ").strip()
+    start_table = start_table.strip().strip("'\"")
+    if not start_table:
+        parser.error("A start table must be provided via --start-table or interactive input.")
+
     gitlab_config = GitLabConfig(
         url=parsed.gitlab_url,
         private_token=parsed.token,
@@ -1339,6 +1334,12 @@ def main(args: Optional[List[str]] = None) -> int:
         exclude_folder=parsed.exclude_folder,
     )
 
+    schema_whitelist = None
+    if parsed.greenplum_schemas:
+        schema_whitelist = [
+            s.strip() for s in parsed.greenplum_schemas.split(",") if s.strip()
+        ]
+
     greenplum_config = GreenplumConfig(
         host=parsed.greenplum_host,
         port=parsed.greenplum_port,
@@ -1346,6 +1347,7 @@ def main(args: Optional[List[str]] = None) -> int:
         user=parsed.greenplum_user,
         password=parsed.greenplum_password,
         default_schema=parsed.greenplum_schema,
+        schema_whitelist=schema_whitelist,
     )
 
     metadata_client = GreenplumMetadataClient(greenplum_config) if greenplum_config.enabled else None
@@ -1355,24 +1357,20 @@ def main(args: Optional[List[str]] = None) -> int:
         metadata_client=metadata_client,
     )
 
-    neo4j_config = Neo4jConfig(
-        uri=parsed.neo4j_uri,
-        user=parsed.neo4j_user,
-        password=parsed.neo4j_password,
+    output_dir = Path(parsed.output_dir).expanduser()
+    output_manager = OutputManager(
+        output_dir=output_dir,
+        base_filename=parsed.output_filename,
     )
-    neo4j_exporter = Neo4jExporter(neo4j_config) if neo4j_config.enabled else None
-
-    output_manager = OutputManager(Path(parsed.output_dir))
 
     service = LineageService(
         gitlab_config=gitlab_config,
         extractor=extractor,
         metadata_client=metadata_client,
-        neo4j_exporter=neo4j_exporter,
         output_manager=output_manager,
     )
 
-    outputs = service.run(start_table=parsed.start_table)
+    outputs = service.run(start_table=start_table)
     LOGGER.info("Lineage extraction completed. Outputs: %s", outputs)
     return 0
 
