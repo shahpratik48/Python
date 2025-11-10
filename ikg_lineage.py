@@ -1230,7 +1230,7 @@ class OutputManager:
         if PyVisNetwork is None:
             LOGGER.warning("pyvis not installed; skipping interactive visualization.")
             return None
-        network = PyVisNetwork(height="750px", width="100%", directed=True)
+        network = PyVisNetwork(height="750px", width="100%", directed=True, notebook=False)
         nodes = set()
         for record in records:
             target_node = (
@@ -1262,7 +1262,11 @@ class OutputManager:
                 arrows="to",
             )
         path = self.output_dir / f"ikg_column_lineage_output_{self.timestamp}.html"
-        network.show(str(path))
+        try:
+            network.write_html(str(path), notebook=False)
+        except AttributeError:
+            LOGGER.warning("PyVis write_html unavailable; falling back to show which may require Jinja2 templates.")
+            network.show(str(path))
         LOGGER.info("PyVis HTML exported to %s", path)
         return path
 
