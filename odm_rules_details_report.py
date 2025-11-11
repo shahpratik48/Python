@@ -50,6 +50,7 @@ REPORT_COLUMNS: Sequence[str] = (
     "profile_column",
     "logic",
     "file_path",
+    "dependency",
 )
 
 PLACEHOLDER_PATTERN = re.compile(r"\{\{\s*([^\{\}]+?)\s*\}\}")
@@ -219,16 +220,18 @@ def parse_insert_statement(statement: str, source_file: str) -> List[ParsedRow]:
     if isinstance(payload, exp.Paren):
         payload = payload.this
 
-    if isinstance(payload, exp.Select):
-        rows.extend(
-            build_rows_from_select(
-                target_columns,
-                payload,
-                placeholder_map,
-                full_statement,
-                source_file,
+    select_statements = list(iter_select_statements(payload))
+    if select_statements:
+        for select_stmt in select_statements:
+            rows.extend(
+                build_rows_from_select(
+                    target_columns,
+                    select_stmt,
+                    placeholder_map,
+                    full_statement,
+                    source_file,
+                )
             )
-        )
     elif isinstance(payload, exp.Values):
         value_rows: List[List[str]] = []
         for tup in payload.expressions:
@@ -298,6 +301,7 @@ def build_rows_from_values(
         report_data = {column: row_map.get(column, "") for column in REPORT_COLUMNS}
         report_data["logic"] = logic_sql.strip()
         report_data["file_path"] = source_file
+        report_data["dependency"] = ""
         parsed_rows.append(
             ParsedRow(
                 data=report_data,
@@ -307,6 +311,39 @@ def build_rows_from_values(
         )
 
     return parsed_rows
+
+
+def iter_select_statements(expression: exp.Expression | None) -> List[exp.Select]:
+    """Yield SELECT statements from the provided expression, flattening set operations."""
+    if expression is None:
+        return []
+
+    stack = [expression]
+    results: List[exp.Select] = []
+
+    while stack:
+        node = stack.pop()
+        if isinstance(node, exp.Paren):
+            stack.append(node.this)
+            continue
+        if isinstance(node, exp.With):
+            stack.append(node.this)
+            continue
+        if isinstance(node, exp.Subquery):
+            stack.append(node.this)
+            continue
+        if isinstance(node, (exp.Order, exp.Limit)):
+            stack.append(node.this)
+            continue
+        if isinstance(node, exp.Select):
+            results.append(node)
+            continue
+        if isinstance(node, exp.SetOperation):
+            stack.append(node.right)
+            stack.append(node.left)
+            continue
+
+    return results
 
 
 def build_rows_from_select(
@@ -330,9 +367,13 @@ def build_rows_from_select(
             expr = expr.this
         select_mappings.append((column_name, expr))
 
+    dependency_values = extract_dependency_values(select_expression, placeholder_map)
+    dependency_text = ", ".join(dependency_values)
+
     base_defaults: Dict[str, str] = {column: "" for column in REPORT_COLUMNS}
     base_defaults["profile_table"] = profile_table
     base_defaults["file_path"] = source_file
+    base_defaults["dependency"] = dependency_text
 
     parsed_rows: List[ParsedRow] = []
 
@@ -357,6 +398,7 @@ def build_rows_from_select(
             row_data = row_base.copy()
             row_data["profile_column"] = profile_column
             row_data["logic"] = where_logic
+            row_data["dependency"] = dependency_text
             report_data = {column: row_data.get(column, "") for column in REPORT_COLUMNS}
             parsed_rows.append(
                 ParsedRow(
@@ -407,38 +449,99 @@ def extract_where_context(
     return where_clause, profile_columns
 
 
+def extract_dependency_values(
+    select_expression: exp.Select,
+    placeholder_map: Dict[str, str],
+) -> List[str]:
+    """Collect unique insight_type literals used in WHERE clause equality or IN filters."""
+    where_exp = select_expression.args.get("where")
+    if not where_exp:
+        return []
+
+    seen: Set[str] = set()
+    ordered: List[str] = []
+
+    def add_literal(expr: exp.Expression) -> None:
+        literal_sql = unmask_placeholders(expr.sql(dialect="postgres"), placeholder_map).strip()
+        if (
+            len(literal_sql) >= 2
+            and literal_sql[0] == literal_sql[-1]
+            and literal_sql[0] in {"'", '"'}
+        ):
+            literal_sql = literal_sql[1:-1]
+        literal_sql = literal_sql.strip()
+        if literal_sql and literal_sql not in seen:
+            seen.add(literal_sql)
+            ordered.append(literal_sql)
+
+    def is_insight_type(expr: exp.Expression | None) -> bool:
+        if expr is None:
+            return False
+        if isinstance(expr, exp.Column):
+            column_sql = unmask_placeholders(expr.sql(dialect="postgres"), placeholder_map)
+            normalized = column_sql.replace('"', "").strip().lower()
+            return normalized.endswith(".insight_type") or normalized == "insight_type"
+        return False
+
+    for condition in where_exp.this.walk():
+        if isinstance(condition, exp.EQ):
+            left = condition.left
+            right = condition.right
+            if is_insight_type(left) and isinstance(right, exp.Expression):
+                if isinstance(right, exp.Literal):
+                    add_literal(right)
+            elif is_insight_type(right) and isinstance(left, exp.Expression):
+                if isinstance(left, exp.Literal):
+                    add_literal(left)
+        elif isinstance(condition, exp.In):
+            if is_insight_type(condition.this):
+                for option in condition.expressions:
+                    if isinstance(option, exp.Literal):
+                        add_literal(option)
+
+    return ordered
+
+
 def extract_value_combinations(
     select_expression: exp.Select,
     placeholder_map: Dict[str, str],
 ) -> List[Dict[str, str]]:
     """Return cartesian combinations of VALUES-based cross joins."""
-    value_tables: List[Tuple[str, List[str], List[List[str]]]] = []
+    value_tables: List[Tuple[Set[str], List[str], List[List[str]]]] = []
 
-    for alias in select_expression.find_all(exp.Alias):
-        base_expr = alias.this
+    for values_expr in select_expression.find_all(exp.Values):
+        base_expr = values_expr
         if isinstance(base_expr, exp.Paren):
             base_expr = base_expr.this
-        if not isinstance(base_expr, exp.Values):
+
+        table_alias = values_expr.args.get("alias")
+        if not table_alias:
             continue
 
-        alias_identifier = alias.args.get("alias")
-        alias_name = alias_identifier.name.lower() if alias_identifier is not None else ""
-        if not alias_name:
+        alias_sql_name = table_alias.this.sql(dialect="postgres").strip()
+        if not alias_sql_name:
             continue
+        alias_variants = {
+            alias_sql_name.lower(),
+            alias_sql_name.replace('"', "").lower(),
+        }
 
-        alias_columns_expr = alias.args.get("columns")
+        alias_columns_expr = table_alias.args.get("columns")
         if alias_columns_expr is None:
             continue
 
-        alias_column_nodes = (
-            list(alias_columns_expr.expressions)
-            if hasattr(alias_columns_expr, "expressions")
-            else [alias_columns_expr]
-        )
-        alias_columns: List[str] = [
-            unmask_placeholders(col.sql(dialect="postgres"), placeholder_map).strip().strip('"')
-            for col in alias_column_nodes
-        ]
+        if isinstance(alias_columns_expr, list):
+            alias_column_nodes = alias_columns_expr
+        elif hasattr(alias_columns_expr, "expressions"):
+            alias_column_nodes = list(alias_columns_expr.expressions)
+        else:
+            alias_column_nodes = [alias_columns_expr]
+        alias_columns: List[str] = []
+        for col in alias_column_nodes:
+            column_sql = unmask_placeholders(col.sql(dialect="postgres"), placeholder_map).strip()
+            if not column_sql:
+                continue
+            alias_columns.append(column_sql)
 
         rows: List[List[str]] = []
         for tuple_expr in base_expr.expressions:
@@ -452,22 +555,32 @@ def extract_value_combinations(
             rows.append(row_values)
 
         if alias_columns and rows:
-            value_tables.append((alias_name, alias_columns, rows))
+            value_tables.append((alias_variants, alias_columns, rows))
 
     if not value_tables:
         return [dict()]
 
     combinations: List[Dict[str, str]] = [dict()]
-    for alias_name, columns, rows in value_tables:
+    for alias_variants, columns, rows in value_tables:
         new_combinations: List[Dict[str, str]] = []
         for combo in combinations:
             for row in rows:
                 updated = combo.copy()
                 for idx, column_name in enumerate(columns):
                     value = row[idx] if idx < len(row) else ""
-                    key = f"{alias_name}.{column_name}".lower()
-                    updated[key] = value
-                    updated[column_name.lower()] = value
+                    column_clean = column_name.replace('"', "")
+                    column_variants = {
+                        column_name.lower(),
+                        column_clean.lower(),
+                        f'"{column_clean}"'.lower(),
+                    }
+                    for alias_variant in alias_variants:
+                        if alias_variant:
+                            updated[f"{alias_variant}.{column_name}".lower()] = value
+                            updated[f"{alias_variant}.{column_clean}".lower()] = value
+                            updated[f"{alias_variant}.\"{column_clean}\"".lower()] = value
+                    for column_variant in column_variants:
+                        updated[column_variant] = value
                 new_combinations.append(updated)
         combinations = new_combinations or combinations
 
@@ -554,12 +667,8 @@ def fallback_build_rows_from_select(
         logging.warning("Fallback parse error in %s: %s", source_file, exc)
         return []
 
-    if isinstance(select_expression, exp.With):
-        select_expression = select_expression.this
-    if isinstance(select_expression, exp.Paren):
-        select_expression = select_expression.this
-
-    if not isinstance(select_expression, exp.Select):
+    select_statements = list(iter_select_statements(select_expression))
+    if not select_statements:
         logging.warning(
             "Fallback parser produced %s instead of SELECT in %s; skipping.",
             type(select_expression).__name__,
@@ -567,13 +676,19 @@ def fallback_build_rows_from_select(
         )
         return []
 
-    return build_rows_from_select(
-        target_columns,
-        select_expression,
-        placeholder_map,
-        full_statement,
-        source_file,
-    )
+    fallback_rows: List[ParsedRow] = []
+    for stmt in select_statements:
+        fallback_rows.extend(
+            build_rows_from_select(
+                target_columns,
+                stmt,
+                placeholder_map,
+                full_statement,
+                source_file,
+            )
+        )
+
+    return fallback_rows
 
 
 def extract_report_rows(sql_text: str, source_file: str) -> List[ParsedRow]:
