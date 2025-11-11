@@ -35,6 +35,7 @@ IGNORE_FILES = {"aa_nlg_review.sql"}
 IGNORE_FOLDERS = {"odm_process"}
 
 REPORT_COLUMNS: Sequence[str] = (
+    "filename",
     "target_type",
     "insight_type",
     "profile_table",
@@ -51,6 +52,8 @@ REPORT_COLUMNS: Sequence[str] = (
     "logic",
     "file_path",
     "dependency",
+    "is_active",
+    "generated_at",
 )
 
 PLACEHOLDER_PATTERN = re.compile(r"\{\{\s*([^\{\}]+?)\s*\}\}")
@@ -100,6 +103,20 @@ def strip_quotes(value: str) -> str:
     if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
         text = text[1:-1]
     return text.strip()
+
+
+def normalize_profile_table_value(value: str) -> str:
+    """Remove schema parameter prefix from profile table references."""
+    if not value:
+        return value
+    cleaned = value.strip()
+    cleaned = re.sub(
+        r"^\{\{\s*params\.IKG_SCHEMA\s*\}\}\.",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    return strip_quotes(cleaned)
 
 
 def extract_insert_columns_from_text(sql_text: str) -> List[str]:
@@ -333,6 +350,10 @@ def build_rows_from_values(
         report_data["logic"] = logic_sql.strip()
         report_data["file_path"] = source_file
         report_data["dependency"] = ""
+        report_data["filename"] = os.path.basename(source_file)
+        report_data["profile_table"] = normalize_profile_table_value(report_data.get("profile_table", ""))
+        report_data["is_active"] = ""
+        report_data["generated_at"] = ""
         parsed_rows.append(
             ParsedRow(
                 data=report_data,
@@ -593,13 +614,16 @@ def build_rows_from_select(
             expr = candidate.this if isinstance(candidate, exp.Alias) else candidate
         select_mappings.append((column_name, expr))
 
-    dependency_values = extract_dependency_values(select_expression, placeholder_map, cte_map)
+    dependency_values = extract_dependency_values(select_expression, placeholder_map, cte_map, expected_column_names=normalized_columns)
     dependency_text = ", ".join(dependency_values)
 
     base_defaults: Dict[str, str] = {column: "" for column in REPORT_COLUMNS}
     base_defaults["profile_table"] = profile_table
     base_defaults["file_path"] = source_file
     base_defaults["dependency"] = dependency_text
+    base_defaults["filename"] = os.path.basename(source_file)
+    base_defaults["is_active"] = ""
+    base_defaults["generated_at"] = ""
 
     parsed_rows: List[ParsedRow] = []
 
@@ -625,6 +649,7 @@ def build_rows_from_select(
             row_data["profile_column"] = profile_column
             row_data["logic"] = where_logic
             row_data["dependency"] = dependency_text
+            row_data["profile_table"] = normalize_profile_table_value(row_data.get("profile_table", ""))
             report_data = {column: row_data.get(column, "") for column in REPORT_COLUMNS}
             parsed_rows.append(
                 ParsedRow(
@@ -640,7 +665,8 @@ def build_rows_from_select(
 def extract_profile_table(select_expression: exp.Select, placeholder_map: Dict[str, str]) -> str:
     """Return the first table reference found in the SELECT statement."""
     for table in select_expression.find_all(exp.Table):
-        return unmask_placeholders(table.sql(dialect="postgres"), placeholder_map)
+        table_name = unmask_placeholders(table.sql(dialect="postgres"), placeholder_map)
+        return normalize_profile_table_value(table_name)
     return ""
 
 
@@ -801,6 +827,10 @@ def _infer_select_column_names(
             alias_or_name = f"column_{idx}"
         names.append(alias_or_name.lower())
     return names
+
+
+def normalize_insight_type_key(value: str) -> str:
+    return strip_quotes(value).strip().lower()
 
 
 def extract_value_combinations(
@@ -1034,14 +1064,14 @@ def write_excel_report(df: pd.DataFrame, directory: str = ".") -> str:
 def upload_dataframe_to_db(df: pd.DataFrame, db_password: str) -> None:
     """Drop and recreate the destination table, then load the DataFrame contents."""
     db_config = {
-        "host": "greenulum-rdso.zur_swissbank.com",
+        "host": "greenplum-rdsp.zur.swissbank.com",
         "port": 5432,
         "dbname": "gprdsp",
         "user": "ds_rdsp_dev",
         "password": db_password,
     }
 
-    table_fqn = "sandbox_prj_smart_insights.odm_rules_details"
+    table_fqn = "sandbox_prj_smart_insights.odm_rule_details_auto_task"
     owner_role = "erd_gpdb_prj_smart_insights"
     reader_role = "erd_gpdb_prj_smart_insights_ro"
 
@@ -1052,8 +1082,7 @@ def upload_dataframe_to_db(df: pd.DataFrame, db_password: str) -> None:
         with conn.cursor() as cur:
             cur.execute(f"DROP TABLE IF EXISTS {table_fqn};")
 
-            column_definitions = ", ".join(f'"{column}" TEXT' if column != "logic" else '"logic" TEXT'
-                                           for column in REPORT_COLUMNS)
+            column_definitions = ", ".join(f'"{column}" TEXT' for column in REPORT_COLUMNS)
             cur.execute(f"CREATE TABLE {table_fqn} ({column_definitions});")
 
             if not df.empty:
@@ -1070,6 +1099,30 @@ def upload_dataframe_to_db(df: pd.DataFrame, db_password: str) -> None:
 
         conn.commit()
         logging.info("Table %s refreshed successfully.", table_fqn)
+
+
+def fetch_exclusion_insight_types(db_password: str) -> Set[str]:
+    """Fetch insight types that should be marked as inactive."""
+    db_config = {
+        "host": "greenplum-rdsp.zur.swissbank.com",
+        "port": 5432,
+        "dbname": "gprdsp",
+        "user": "ds_rdsp_dev",
+        "password": db_password,
+    }
+
+    query = """
+        SELECT insight_type
+        FROM core_ikg.odm_exclusion_insight_type
+        WHERE is_curr = 1
+    """
+
+    with psycopg2.connect(**db_config) as conn:
+        with conn.cursor() as cur:
+            cur.execute(query)
+            results = cur.fetchall()
+
+    return {normalize_insight_type_key(row[0]) for row in results if row and row[0]}
 
 
 def main() -> None:
@@ -1097,10 +1150,25 @@ def main() -> None:
         raise RuntimeError("No ODM rule rows were parsed from the SQL sources.")
 
     df = create_report_dataframe(all_rows)
+
+    generated_at = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S%z")
+    df["generated_at"] = generated_at
+    df["filename"] = df["filename"].fillna("").apply(lambda v: os.path.basename(v) if isinstance(v, str) else "")
+    df["profile_table"] = df["profile_table"].fillna("").apply(normalize_profile_table_value)
+
+    db_password = getpass.getpass("Enter Password for DB User: ")
+    exclusion_types = fetch_exclusion_insight_types(db_password)
+    logging.info("Fetched %d exclusion insight_type record(s) for is_active flag.", len(exclusion_types))
+
+    def resolve_is_active(value: str) -> str:
+        key = normalize_insight_type_key(value)
+        return "N" if key and key in exclusion_types else "Y"
+
+    df["is_active"] = df["insight_type"].fillna("").apply(resolve_is_active)
+
     excel_path = write_excel_report(df)
     logging.info("Report contains %d rows.", len(df))
 
-    db_password = getpass.getpass("Enter Password for DB User: ")
     upload_dataframe_to_db(df, db_password)
 
     logging.info("Process completed. Excel report saved at: %s", excel_path)
