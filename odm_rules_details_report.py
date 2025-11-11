@@ -13,7 +13,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Sequence, Set, Tuple
 
 import gitlab  # type: ignore
 import pandas as pd
@@ -136,9 +136,10 @@ def parse_insert_statement(statement: str, source_file: str) -> List[ParsedRow]:
         logging.warning("Insert without explicit column list in %s; skipping.", source_file)
         return []
 
+    column_items = columns_expr.expressions if hasattr(columns_expr, "expressions") else columns_expr
     target_columns = [
         unmask_placeholders(col.sql(dialect="postgres"), placeholder_map).strip('"').strip()
-        for col in columns_expr
+        for col in column_items
     ]
 
     payload = expression.args.get("expression")
@@ -146,21 +147,21 @@ def parse_insert_statement(statement: str, source_file: str) -> List[ParsedRow]:
         logging.warning("Insert without payload in %s; skipping.", source_file)
         return []
 
-    logic_sql = unmask_placeholders(payload.sql(dialect="postgres"), placeholder_map)
     full_statement = unmask_placeholders(expression.sql(dialect="postgres"), placeholder_map)
 
     rows: List[ParsedRow] = []
 
+    if isinstance(payload, exp.With):
+        payload = payload.this
+    if isinstance(payload, exp.Paren):
+        payload = payload.this
+
     if isinstance(payload, exp.Select):
-        row_values = [
-            unmask_placeholders(item.sql(dialect="postgres"), placeholder_map).strip()
-            for item in payload.expressions
-        ]
         rows.extend(
-            build_rows_from_values(
+            build_rows_from_select(
                 target_columns,
-                [row_values],
-                logic_sql,
+                payload,
+                placeholder_map,
                 full_statement,
                 source_file,
             )
@@ -178,7 +179,7 @@ def parse_insert_statement(statement: str, source_file: str) -> List[ParsedRow]:
             build_rows_from_values(
                 target_columns,
                 value_rows,
-                logic_sql,
+                "",
                 full_statement,
                 source_file,
             )
@@ -219,7 +220,7 @@ def build_rows_from_values(
         }
 
         report_data = {column: row_map.get(column, "") for column in REPORT_COLUMNS}
-        report_data["logic"] = f"-- Source: {source_file}\n{logic_sql.strip()}"
+        report_data["logic"] = logic_sql.strip()
         parsed_rows.append(
             ParsedRow(
                 data=report_data,
@@ -229,6 +230,97 @@ def build_rows_from_values(
         )
 
     return parsed_rows
+
+
+def build_rows_from_select(
+    target_columns: Sequence[str],
+    select_expression: exp.Select,
+    placeholder_map: Dict[str, str],
+    full_statement: str,
+    source_file: str,
+) -> List[ParsedRow]:
+    """Extract report rows from an INSERT ... SELECT statement."""
+    normalized_columns = [col.lower() for col in target_columns]
+    select_items = list(select_expression.expressions)
+
+    if len(select_items) < len(target_columns):
+        logging.warning(
+            "Column/SELECT mismatch in %s: %d columns but %d select expressions.",
+            source_file,
+            len(target_columns),
+            len(select_items),
+        )
+
+    base_data: Dict[str, str] = {column: "" for column in REPORT_COLUMNS}
+    for idx, column_name in enumerate(normalized_columns):
+        if idx < len(select_items):
+            item = select_items[idx]
+            if isinstance(item, exp.Alias):
+                item = item.this
+            base_data[column_name] = unmask_placeholders(
+                item.sql(dialect="postgres"), placeholder_map
+            ).strip()
+        else:
+            base_data[column_name] = ""
+
+    profile_table = extract_profile_table(select_expression, placeholder_map)
+    where_logic, profile_columns = extract_where_context(select_expression, placeholder_map)
+
+    base_data["profile_table"] = profile_table
+
+    parsed_rows: List[ParsedRow] = []
+
+    target_profile_columns = profile_columns or [""]
+    for profile_column in target_profile_columns:
+        row_data = base_data.copy()
+        row_data["profile_column"] = profile_column
+        row_data["logic"] = where_logic
+        report_data = {column: row_data.get(column, "") for column in REPORT_COLUMNS}
+        parsed_rows.append(
+            ParsedRow(
+                data=report_data,
+                source_statement=full_statement,
+                source_file=source_file,
+            )
+        )
+
+    return parsed_rows
+
+
+def extract_profile_table(select_expression: exp.Select, placeholder_map: Dict[str, str]) -> str:
+    """Return the first table reference found in the SELECT statement."""
+    for table in select_expression.find_all(exp.Table):
+        return unmask_placeholders(table.sql(dialect="postgres"), placeholder_map)
+    return ""
+
+
+def extract_where_context(
+    select_expression: exp.Select,
+    placeholder_map: Dict[str, str],
+) -> Tuple[str, List[str]]:
+    """Return the textual WHERE clause and the ordered unique column references."""
+    where_clause = ""
+    profile_columns: List[str] = []
+    seen: Set[str] = set()
+
+    where_exp = select_expression.args.get("where")
+    if not where_exp:
+        return where_clause, profile_columns
+
+    where_clause = unmask_placeholders(
+        where_exp.this.sql(dialect="postgres"),
+        placeholder_map,
+    ).strip()
+
+    for column in where_exp.this.find_all(exp.Column):
+        column_sql = unmask_placeholders(column.sql(dialect="postgres"), placeholder_map).strip()
+        if not column_sql or column_sql.lower() == "null":
+            continue
+        if column_sql not in seen:
+            seen.add(column_sql)
+            profile_columns.append(column_sql)
+
+    return where_clause, profile_columns
 
 
 def extract_report_rows(sql_text: str, source_file: str) -> List[ParsedRow]:
