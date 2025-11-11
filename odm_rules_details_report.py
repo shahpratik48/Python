@@ -188,6 +188,15 @@ def parse_insert_statement(statement: str, source_file: str) -> List[ParsedRow]:
 
     payload = expression.args.get("expression")
     if payload is None:
+        fallback_rows = fallback_build_rows_from_select(
+            masked_sql,
+            placeholder_map,
+            target_columns,
+            full_statement,
+            source_file,
+        )
+        if fallback_rows:
+            return fallback_rows
         logging.warning("Insert without payload in %s; skipping.", source_file)
         return []
 
@@ -232,6 +241,15 @@ def parse_insert_statement(statement: str, source_file: str) -> List[ParsedRow]:
         logging.warning(
             "Unsupported INSERT payload (%s) in %s; statement skipped.",
             type(payload).__name__,
+            source_file,
+        )
+
+    if not rows:
+        rows = fallback_build_rows_from_select(
+            masked_sql,
+            placeholder_map,
+            target_columns,
+            full_statement,
             source_file,
         )
 
@@ -365,6 +383,56 @@ def extract_where_context(
             profile_columns.append(column_sql)
 
     return where_clause, profile_columns
+
+
+def fallback_build_rows_from_select(
+    masked_statement: str,
+    placeholder_map: Dict[str, str],
+    target_columns: Sequence[str],
+    full_statement: str,
+    source_file: str,
+) -> List[ParsedRow]:
+    """Fallback parser for INSERT statements when sqlglot fails on payload."""
+    if not target_columns:
+        target_columns = extract_insert_columns_from_text(
+            unmask_placeholders(masked_statement, placeholder_map)
+        )
+        if not target_columns:
+            return []
+
+    lower_masked = masked_statement.lower()
+    select_pos = lower_masked.find("select")
+    if select_pos == -1:
+        return []
+
+    select_sql_masked = masked_statement[select_pos:].strip().rstrip(";")
+
+    try:
+        select_expression = parse_one(select_sql_masked, read="postgres")
+    except ParseError as exc:
+        logging.warning("Fallback parse error in %s: %s", source_file, exc)
+        return []
+
+    if isinstance(select_expression, exp.With):
+        select_expression = select_expression.this
+    if isinstance(select_expression, exp.Paren):
+        select_expression = select_expression.this
+
+    if not isinstance(select_expression, exp.Select):
+        logging.warning(
+            "Fallback parser produced %s instead of SELECT in %s; skipping.",
+            type(select_expression).__name__,
+            source_file,
+        )
+        return []
+
+    return build_rows_from_select(
+        target_columns,
+        select_expression,
+        placeholder_map,
+        full_statement,
+        source_file,
+    )
 
 
 def extract_report_rows(sql_text: str, source_file: str) -> List[ParsedRow]:
