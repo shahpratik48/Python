@@ -395,6 +395,8 @@ def extract_where_context(
     ).strip()
 
     for column in where_exp.this.find_all(exp.Column):
+        if column_in_odm_table_subquery(column, select_expression, placeholder_map):
+            continue
         column_sql = unmask_placeholders(column.sql(dialect="postgres"), placeholder_map).strip()
         if not column_sql or column_sql.lower() == "null":
             continue
@@ -413,35 +415,39 @@ def extract_value_combinations(
     value_tables: List[Tuple[str, List[str], List[List[str]]]] = []
 
     for alias in select_expression.find_all(exp.Alias):
-        if not isinstance(alias.this, exp.Values):
+        base_expr = alias.this
+        if isinstance(base_expr, exp.Paren):
+            base_expr = base_expr.this
+        if not isinstance(base_expr, exp.Values):
             continue
 
-        alias_name = (alias.alias or "").strip().lower()
+        alias_identifier = alias.args.get("alias")
+        alias_name = alias_identifier.name.lower() if alias_identifier is not None else ""
         if not alias_name:
             continue
 
-        alias_columns_expr = alias.args.get("columns") or []
+        alias_columns_expr = alias.args.get("columns")
+        if alias_columns_expr is None:
+            continue
+
+        alias_column_nodes = (
+            list(alias_columns_expr.expressions)
+            if hasattr(alias_columns_expr, "expressions")
+            else [alias_columns_expr]
+        )
         alias_columns: List[str] = [
-            unmask_placeholders(col.sql(dialect="postgres"), placeholder_map)
-            .strip()
-            .strip('"')
-            for col in alias_columns_expr
+            unmask_placeholders(col.sql(dialect="postgres"), placeholder_map).strip().strip('"')
+            for col in alias_column_nodes
         ]
 
         rows: List[List[str]] = []
-        for tuple_expr in alias.this.expressions:
+        for tuple_expr in base_expr.expressions:
             row_values: List[str] = []
             for value_expr in tuple_expr.expressions:
                 value_text = unmask_placeholders(
                     value_expr.sql(dialect="postgres"),
                     placeholder_map,
                 ).strip()
-                if (
-                    len(value_text) >= 2
-                    and value_text[0] == value_text[-1]
-                    and value_text[0] in {"'", '"'}
-                ):
-                    value_text = value_text[1:-1]
                 row_values.append(value_text)
             rows.append(row_values)
 
@@ -492,15 +498,32 @@ def evaluate_select_expression(
             return combination[column_only]
 
     if isinstance(expr, exp.Literal):
-        if (
-            len(expr_sql) >= 2
-            and expr_sql[0] == expr_sql[-1]
-            and expr_sql[0] in {"'", '"'}
-        ):
-            return expr_sql[1:-1]
         return expr_sql
 
     return expr_sql
+
+
+def column_in_odm_table_subquery(
+    column: exp.Column,
+    root_select: exp.Select,
+    placeholder_map: Dict[str, str],
+) -> bool:
+    """Determine if the column resides in a subquery that targets the ODM table."""
+    current: exp.Expression | None = column
+    while current is not None:
+        if current is root_select:
+            return False
+        if isinstance(current, exp.Select):
+            for table in current.find_all(exp.Table):
+                table_sql = unmask_placeholders(
+                    table.sql(dialect="postgres"),
+                    placeholder_map,
+                )
+                normalized = table_sql.replace(" ", "").lower()
+                if "{{params.odm_table}}" in normalized:
+                    return True
+        current = current.parent
+    return False
 
 
 def fallback_build_rows_from_select(
