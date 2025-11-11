@@ -182,7 +182,12 @@ def parse_insert_statement(statement: str, source_file: str) -> List[ParsedRow]:
     if not isinstance(expression, exp.Insert):
         return []
 
-    target_table = unmask_placeholders(expression.this.sql(dialect="postgres"), placeholder_map)
+    table_expr = expression.this
+    if isinstance(table_expr, exp.Schema) and table_expr.this is not None:
+        table_sql = table_expr.this.sql(dialect="postgres")
+    else:
+        table_sql = expression.this.sql(dialect="postgres")
+    target_table = unmask_placeholders(table_sql, placeholder_map)
     target_table_normalized = target_table.replace(" ", "").lower()
     if "{{params.odm_table}}" not in target_table_normalized:
         return []
@@ -190,8 +195,13 @@ def parse_insert_statement(statement: str, source_file: str) -> List[ParsedRow]:
     columns_expr = expression.args.get("columns")
     target_columns: List[str] = []
 
+    column_items = None
     if columns_expr:
         column_items = columns_expr.expressions if hasattr(columns_expr, "expressions") else columns_expr
+    elif isinstance(table_expr, exp.Schema) and table_expr.expressions:
+        column_items = table_expr.expressions
+
+    if column_items:
         target_columns = [
             unmask_placeholders(col.sql(dialect="postgres"), placeholder_map).strip('"').strip()
             for col in column_items
@@ -385,6 +395,166 @@ def iter_select_statements(
     return results
 
 
+def expand_select_expressions(
+    select_expression: exp.Select,
+    placeholder_map: Dict[str, str],
+    cte_map: Dict[str, exp.Expression],
+    column_cache: Dict[str, List[exp.Expression]],
+    visited_ctes: Set[str],
+) -> List[exp.Expression]:
+    """Expand SELECT list, replacing star expressions with concrete expressions when possible."""
+    expanded: List[exp.Expression] = []
+
+    for expression in select_expression.expressions:
+        replacement = _expand_select_expression_item(
+            expression,
+            select_expression,
+            placeholder_map,
+            cte_map,
+            column_cache,
+            visited_ctes,
+        )
+        if not replacement:
+            expanded.append(expression)
+        else:
+            expanded.extend(replacement)
+
+    return expanded
+
+
+def _expand_select_expression_item(
+    expression: exp.Expression,
+    select_expression: exp.Select,
+    placeholder_map: Dict[str, str],
+    cte_map: Dict[str, exp.Expression],
+    column_cache: Dict[str, List[exp.Expression]],
+    visited_ctes: Set[str],
+) -> List[exp.Expression]:
+    if isinstance(expression, exp.Star):
+        resolved = _resolve_star_expressions(
+            select_expression,
+            qualifier=None,
+            placeholder_map=placeholder_map,
+            cte_map=cte_map,
+            column_cache=column_cache,
+            visited_ctes=visited_ctes,
+        )
+        return resolved
+
+    if isinstance(expression, exp.Column) and getattr(expression, "is_star", False):
+        table_ref = expression.table
+        if isinstance(table_ref, exp.Expression):
+            qualifier = table_ref.sql(dialect="postgres")
+        else:
+            qualifier = str(table_ref) if table_ref is not None else None
+        resolved = _resolve_star_expressions(
+            select_expression,
+            qualifier=qualifier.lower() if qualifier else None,
+            placeholder_map=placeholder_map,
+            cte_map=cte_map,
+            column_cache=column_cache,
+            visited_ctes=visited_ctes,
+        )
+        return resolved
+
+    return []
+
+
+def _resolve_star_expressions(
+    select_expression: exp.Select,
+    qualifier: str | None,
+    placeholder_map: Dict[str, str],
+    cte_map: Dict[str, exp.Expression],
+    column_cache: Dict[str, List[exp.Expression]],
+    visited_ctes: Set[str],
+) -> List[exp.Expression]:
+    """Resolve star projections to explicit expressions when sources are CTEs or subqueries."""
+    resolved: List[exp.Expression] = []
+
+    sources: List[exp.Expression] = []
+    from_expr = select_expression.args.get("from")
+    if isinstance(from_expr, exp.From) and from_expr.this is not None:
+        sources.append(from_expr.this)
+    for join in select_expression.args.get("joins") or []:
+        sources.append(join.this)
+
+    qualifier_lower = qualifier.lower() if qualifier else None
+
+    for source in sources:
+        alias = (source.alias or source.alias_or_name or "").strip()
+        alias_lower = alias.lower()
+        if qualifier_lower and alias_lower != qualifier_lower:
+            continue
+
+        expressions = _resolve_source_output_expressions(
+            source,
+            alias_lower,
+            placeholder_map,
+            cte_map,
+            column_cache,
+            visited_ctes,
+        )
+        if expressions:
+            resolved.extend(expressions)
+        if qualifier_lower:
+            break
+
+    return resolved
+
+
+def _resolve_source_output_expressions(
+    source_expression: exp.Expression,
+    alias_lower: str,
+    placeholder_map: Dict[str, str],
+    cte_map: Dict[str, exp.Expression],
+    column_cache: Dict[str, List[exp.Expression]],
+    visited_ctes: Set[str],
+) -> List[exp.Expression]:
+    """Resolve the output expressions for a source referenced by a star projection."""
+    if alias_lower in column_cache:
+        return [expr.copy() for expr in column_cache[alias_lower]]
+
+    resolved: List[exp.Expression] = []
+
+    if alias_lower and alias_lower in cte_map:
+        if alias_lower in visited_ctes:
+            return []
+        visited_ctes.add(alias_lower)
+        cte_expression = cte_map[alias_lower]
+        for inner_select, inner_cte_scope in iter_select_statements(cte_expression, base_ctes=cte_map):
+            combined_scope = dict(cte_map)
+            combined_scope.update(inner_cte_scope)
+            resolved = expand_select_expressions(
+                inner_select,
+                placeholder_map,
+                combined_scope,
+                column_cache,
+                visited_ctes,
+            )
+            if resolved:
+                break
+        visited_ctes.remove(alias_lower)
+    elif isinstance(source_expression, exp.Subquery):
+        subquery_expression = source_expression.this
+        for inner_select, inner_cte_scope in iter_select_statements(subquery_expression, base_ctes=cte_map):
+            combined_scope = dict(cte_map)
+            combined_scope.update(inner_cte_scope)
+            resolved = expand_select_expressions(
+                inner_select,
+                placeholder_map,
+                combined_scope,
+                column_cache,
+                visited_ctes,
+            )
+            if resolved:
+                break
+
+    if alias_lower and resolved:
+        column_cache[alias_lower] = [expr.copy() for expr in resolved]
+
+    return [expr.copy() for expr in resolved]
+
+
 def build_rows_from_select(
     target_columns: Sequence[str],
     select_expression: exp.Select,
@@ -395,16 +565,32 @@ def build_rows_from_select(
 ) -> List[ParsedRow]:
     """Extract report rows from an INSERT ... SELECT statement."""
     normalized_columns = [col.lower() for col in target_columns]
-    select_items = list(select_expression.expressions)
+    select_items = expand_select_expressions(
+        select_expression,
+        placeholder_map,
+        cte_map,
+        column_cache={},
+        visited_ctes=set(),
+    )
 
     profile_table = extract_profile_table(select_expression, placeholder_map)
     where_logic, profile_columns = extract_where_context(select_expression, placeholder_map)
 
+    alias_map: Dict[str, List[exp.Expression]] = {}
+    for expr in select_items:
+        key = (expr.alias_or_name or "").replace('"', "").strip().lower()
+        if key:
+            value_expr = expr.this if isinstance(expr, exp.Alias) else expr
+            alias_map.setdefault(key, []).append(value_expr)
+
     select_mappings: List[Tuple[str, exp.Expression | None]] = []
     for idx, column_name in enumerate(normalized_columns):
-        expr = select_items[idx] if idx < len(select_items) else None
-        if expr is not None and isinstance(expr, exp.Alias):
-            expr = expr.this
+        expr: exp.Expression | None = None
+        if column_name in alias_map and alias_map[column_name]:
+            expr = alias_map[column_name].pop(0)
+        elif idx < len(select_items):
+            candidate = select_items[idx]
+            expr = candidate.this if isinstance(candidate, exp.Alias) else candidate
         select_mappings.append((column_name, expr))
 
     dependency_values = extract_dependency_values(select_expression, placeholder_map, cte_map)
@@ -494,6 +680,7 @@ def extract_dependency_values(
     placeholder_map: Dict[str, str],
     cte_map: Dict[str, exp.Expression],
     visited_ctes: Set[str] | None = None,
+    expected_column_names: Sequence[str] | None = None,
 ) -> List[str]:
     """Collect unique insight_type literals from SELECT context, WHERE clauses, and referenced CTEs."""
     seen: Set[str] = set()
@@ -522,8 +709,15 @@ def extract_dependency_values(
                 add_value(raw)
 
     # Gather from SELECT list aliases.
-    for expression in select_expression.expressions:
-        alias_or_name = (expression.alias_or_name or "").replace('"', "").strip().lower()
+    for idx, expression in enumerate(select_expression.expressions):
+        alias_raw = (expression.alias_or_name or "").replace('"', "").strip()
+        alias_or_name = alias_raw.lower()
+        if isinstance(expression, exp.Literal):
+            literal_text = strip_quotes(unmask_placeholders(expression.sql(dialect="postgres"), placeholder_map))
+            if alias_raw.lower() == literal_text.lower():
+                alias_or_name = ""
+        if not alias_or_name and expected_column_names and idx < len(expected_column_names):
+            alias_or_name = expected_column_names[idx]
         expr_node = expression.this if isinstance(expression, exp.Alias) else expression
         if alias_or_name == "insight_type" and isinstance(expr_node, exp.Literal):
             add_value(expr_node.sql(dialect="postgres"))
@@ -559,14 +753,22 @@ def extract_dependency_values(
                 continue
             visited.add(cte_name)
             cte_expression = cte_map[cte_name]
+            reference_names: Sequence[str] | None = None
             for inner_select, inner_cte_map in iter_select_statements(cte_expression, base_ctes=cte_map):
                 combined_map = dict(cte_map)
                 combined_map.update(inner_cte_map)
+                if reference_names is None:
+                    reference_names = _infer_select_column_names(
+                        inner_select,
+                        placeholder_map,
+                        combined_map,
+                    )
                 inner_values = extract_dependency_values(
                     inner_select,
                     placeholder_map,
                     combined_map,
                     visited,
+                    expected_column_names=reference_names,
                 )
                 for value in inner_values:
                     if value not in seen:
@@ -574,6 +776,31 @@ def extract_dependency_values(
                         ordered.append(value)
 
     return ordered
+
+
+def _infer_select_column_names(
+    select_expression: exp.Select,
+    placeholder_map: Dict[str, str],
+    cte_map: Dict[str, exp.Expression],
+) -> List[str]:
+    """Infer output column names for a SELECT statement."""
+    expanded = expand_select_expressions(
+        select_expression,
+        placeholder_map,
+        cte_map,
+        column_cache={},
+        visited_ctes=set(),
+    )
+
+    names: List[str] = []
+    for idx, expression in enumerate(expanded):
+        alias_or_name = (expression.alias_or_name or "").replace('"', "").strip()
+        if not alias_or_name and isinstance(expression, exp.Column):
+            alias_or_name = (expression.alias_or_name or expression.output_name or "").replace('"', "").strip()
+        if not alias_or_name:
+            alias_or_name = f"column_{idx}"
+        names.append(alias_or_name.lower())
+    return names
 
 
 def extract_value_combinations(
