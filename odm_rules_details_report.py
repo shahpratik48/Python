@@ -320,6 +320,25 @@ def build_rows_from_select(
     normalized_columns = [col.lower() for col in target_columns]
     select_items = list(select_expression.expressions)
 
+    profile_table = extract_profile_table(select_expression, placeholder_map)
+    where_logic, profile_columns = extract_where_context(select_expression, placeholder_map)
+
+    select_mappings: List[Tuple[str, exp.Expression | None]] = []
+    for idx, column_name in enumerate(normalized_columns):
+        expr = select_items[idx] if idx < len(select_items) else None
+        if expr is not None and isinstance(expr, exp.Alias):
+            expr = expr.this
+        select_mappings.append((column_name, expr))
+
+    base_defaults: Dict[str, str] = {column: "" for column in REPORT_COLUMNS}
+    base_defaults["profile_table"] = profile_table
+    base_defaults["file_path"] = source_file
+
+    parsed_rows: List[ParsedRow] = []
+
+    target_profile_columns = profile_columns or [""]
+    value_combinations = extract_value_combinations(select_expression, placeholder_map)
+
     if len(select_items) < len(target_columns):
         logging.warning(
             "Column/SELECT mismatch in %s: %d columns but %d select expressions.",
@@ -328,40 +347,24 @@ def build_rows_from_select(
             len(select_items),
         )
 
-    base_data: Dict[str, str] = {column: "" for column in REPORT_COLUMNS}
-    for idx, column_name in enumerate(normalized_columns):
-        if idx < len(select_items):
-            item = select_items[idx]
-            if isinstance(item, exp.Alias):
-                item = item.this
-            raw_value = unmask_placeholders(
-                item.sql(dialect="postgres"), placeholder_map
-            ).strip()
-            base_data[column_name] = normalize_value(column_name, raw_value)
-        else:
-            base_data[column_name] = ""
+    for combination in value_combinations:
+        row_base = base_defaults.copy()
+        for column_name, expr in select_mappings:
+            raw_value = evaluate_select_expression(expr, combination, placeholder_map)
+            row_base[column_name] = normalize_value(column_name, raw_value)
 
-    profile_table = extract_profile_table(select_expression, placeholder_map)
-    where_logic, profile_columns = extract_where_context(select_expression, placeholder_map)
-
-    base_data["profile_table"] = profile_table
-    base_data["file_path"] = source_file
-
-    parsed_rows: List[ParsedRow] = []
-
-    target_profile_columns = profile_columns or [""]
-    for profile_column in target_profile_columns:
-        row_data = base_data.copy()
-        row_data["profile_column"] = profile_column
-        row_data["logic"] = where_logic
-        report_data = {column: row_data.get(column, "") for column in REPORT_COLUMNS}
-        parsed_rows.append(
-            ParsedRow(
-                data=report_data,
-                source_statement=full_statement,
-                source_file=source_file,
+        for profile_column in target_profile_columns:
+            row_data = row_base.copy()
+            row_data["profile_column"] = profile_column
+            row_data["logic"] = where_logic
+            report_data = {column: row_data.get(column, "") for column in REPORT_COLUMNS}
+            parsed_rows.append(
+                ParsedRow(
+                    data=report_data,
+                    source_statement=full_statement,
+                    source_file=source_file,
+                )
             )
-        )
 
     return parsed_rows
 
@@ -400,6 +403,104 @@ def extract_where_context(
             profile_columns.append(column_sql)
 
     return where_clause, profile_columns
+
+
+def extract_value_combinations(
+    select_expression: exp.Select,
+    placeholder_map: Dict[str, str],
+) -> List[Dict[str, str]]:
+    """Return cartesian combinations of VALUES-based cross joins."""
+    value_tables: List[Tuple[str, List[str], List[List[str]]]] = []
+
+    for alias in select_expression.find_all(exp.Alias):
+        if not isinstance(alias.this, exp.Values):
+            continue
+
+        alias_name = (alias.alias or "").strip().lower()
+        if not alias_name:
+            continue
+
+        alias_columns_expr = alias.args.get("columns") or []
+        alias_columns: List[str] = [
+            unmask_placeholders(col.sql(dialect="postgres"), placeholder_map)
+            .strip()
+            .strip('"')
+            for col in alias_columns_expr
+        ]
+
+        rows: List[List[str]] = []
+        for tuple_expr in alias.this.expressions:
+            row_values: List[str] = []
+            for value_expr in tuple_expr.expressions:
+                value_text = unmask_placeholders(
+                    value_expr.sql(dialect="postgres"),
+                    placeholder_map,
+                ).strip()
+                if (
+                    len(value_text) >= 2
+                    and value_text[0] == value_text[-1]
+                    and value_text[0] in {"'", '"'}
+                ):
+                    value_text = value_text[1:-1]
+                row_values.append(value_text)
+            rows.append(row_values)
+
+        if alias_columns and rows:
+            value_tables.append((alias_name, alias_columns, rows))
+
+    if not value_tables:
+        return [dict()]
+
+    combinations: List[Dict[str, str]] = [dict()]
+    for alias_name, columns, rows in value_tables:
+        new_combinations: List[Dict[str, str]] = []
+        for combo in combinations:
+            for row in rows:
+                updated = combo.copy()
+                for idx, column_name in enumerate(columns):
+                    value = row[idx] if idx < len(row) else ""
+                    key = f"{alias_name}.{column_name}".lower()
+                    updated[key] = value
+                    updated[column_name.lower()] = value
+                new_combinations.append(updated)
+        combinations = new_combinations or combinations
+
+    return combinations or [dict()]
+
+
+def evaluate_select_expression(
+    expr: exp.Expression | None,
+    combination: Dict[str, str],
+    placeholder_map: Dict[str, str],
+) -> str:
+    """Evaluate a SELECT expression using known VALUES combinations."""
+    if expr is None:
+        return ""
+
+    if isinstance(expr, exp.Alias):
+        expr = expr.this
+
+    expr_sql = unmask_placeholders(expr.sql(dialect="postgres"), placeholder_map).strip()
+    lookup_key = expr_sql.lower()
+
+    if lookup_key in combination:
+        return combination[lookup_key]
+
+    if "." in lookup_key:
+        _, column_only = lookup_key.rsplit(".", 1)
+        if column_only in combination:
+            return combination[column_only]
+
+    if isinstance(expr, exp.Literal):
+        if (
+            len(expr_sql) >= 2
+            and expr_sql[0] == expr_sql[-1]
+            and expr_sql[0] in {"'", '"'}
+        ):
+            return expr_sql[1:-1]
+        return expr_sql
+
+    return expr_sql
 
 
 def fallback_build_rows_from_select(
