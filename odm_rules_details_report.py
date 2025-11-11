@@ -83,6 +83,42 @@ def unmask_placeholders(text: str, mapping: Dict[str, str]) -> str:
     return result
 
 
+def extract_insert_columns_from_text(sql_text: str) -> List[str]:
+    """Extract the column list from an INSERT statement using simple bracket matching."""
+    lowered = sql_text.lower()
+    select_idx = lowered.find("select")
+    if select_idx == -1:
+        return []
+
+    insert_segment = sql_text[:select_idx]
+    open_idx = insert_segment.find("(")
+    if open_idx == -1:
+        return []
+
+    depth = 0
+    close_idx = -1
+    for pos in range(open_idx, len(sql_text)):
+        char = sql_text[pos]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                close_idx = pos
+                break
+
+    if close_idx == -1:
+        return []
+
+    column_section = sql_text[open_idx + 1 : close_idx]
+    columns = [
+        col.strip().strip('"').strip()
+        for col in column_section.split(",")
+        if col.strip()
+    ]
+    return columns
+
+
 def collect_sql_file_paths(project: gitlab.v4.objects.Project, sql_root: str, ref: str) -> List[str]:
     """Recursively list SQL files under the provided path using the GitLab tree API."""
     stack = [sql_root]
@@ -128,19 +164,27 @@ def parse_insert_statement(statement: str, source_file: str) -> List[ParsedRow]:
         return []
 
     target_table = unmask_placeholders(expression.this.sql(dialect="postgres"), placeholder_map)
-    if "{{params.ODM_TABLE}}" not in target_table:
+    target_table_normalized = target_table.replace(" ", "").lower()
+    if "{{params.odm_table}}" not in target_table_normalized:
         return []
 
     columns_expr = expression.args.get("columns")
-    if not columns_expr:
-        logging.warning("Insert without explicit column list in %s; skipping.", source_file)
-        return []
+    target_columns: List[str] = []
 
-    column_items = columns_expr.expressions if hasattr(columns_expr, "expressions") else columns_expr
-    target_columns = [
-        unmask_placeholders(col.sql(dialect="postgres"), placeholder_map).strip('"').strip()
-        for col in column_items
-    ]
+    if columns_expr:
+        column_items = columns_expr.expressions if hasattr(columns_expr, "expressions") else columns_expr
+        target_columns = [
+            unmask_placeholders(col.sql(dialect="postgres"), placeholder_map).strip('"').strip()
+            for col in column_items
+        ]
+    else:
+        # Fallback to textual extraction when sqlglot does not return a column tuple.
+        target_columns = extract_insert_columns_from_text(
+            unmask_placeholders(statement, placeholder_map)
+        )
+        if not target_columns:
+            logging.warning("Insert without explicit column list in %s; skipping.", source_file)
+            return []
 
     payload = expression.args.get("expression")
     if payload is None:
