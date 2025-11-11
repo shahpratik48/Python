@@ -94,6 +94,14 @@ def normalize_value(column_name: str, value: str) -> str:
     return text
 
 
+def strip_quotes(value: str) -> str:
+    """Remove single/double quotes surrounding a literal value."""
+    text = (value or "").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        text = text[1:-1]
+    return text.strip()
+
+
 def extract_insert_columns_from_text(sql_text: str) -> List[str]:
     """Extract the column list from an INSERT statement using simple bracket matching."""
     lowered = sql_text.lower()
@@ -215,14 +223,26 @@ def parse_insert_statement(statement: str, source_file: str) -> List[ParsedRow]:
 
     rows: List[ParsedRow] = []
 
+    base_ctes: Dict[str, exp.Expression] = {}
+    insert_with = expression.args.get("with")
+    if isinstance(insert_with, exp.With):
+        for cte in insert_with.expressions:
+            cte_name = (cte.alias or cte.alias_or_name or "").lower()
+            if cte_name:
+                base_ctes[cte_name] = cte.this
+
     if isinstance(payload, exp.With):
+        for cte in payload.expressions:
+            cte_name = (cte.alias or cte.alias_or_name or "").lower()
+            if cte_name:
+                base_ctes[cte_name] = cte.this
         payload = payload.this
     if isinstance(payload, exp.Paren):
         payload = payload.this
 
-    select_statements = list(iter_select_statements(payload))
+    select_statements = list(iter_select_statements(payload, base_ctes=base_ctes))
     if select_statements:
-        for select_stmt in select_statements:
+        for select_stmt, cte_scope in select_statements:
             rows.extend(
                 build_rows_from_select(
                     target_columns,
@@ -230,6 +250,7 @@ def parse_insert_statement(statement: str, source_file: str) -> List[ParsedRow]:
                     placeholder_map,
                     full_statement,
                     source_file,
+                    cte_scope,
                 )
             )
     elif isinstance(payload, exp.Values):
@@ -313,34 +334,52 @@ def build_rows_from_values(
     return parsed_rows
 
 
-def iter_select_statements(expression: exp.Expression | None) -> List[exp.Select]:
-    """Yield SELECT statements from the provided expression, flattening set operations."""
+def iter_select_statements(
+    expression: exp.Expression | None,
+    base_ctes: Dict[str, exp.Expression] | None = None,
+) -> List[Tuple[exp.Select, Dict[str, exp.Expression]]]:
+    """Yield SELECT statements and their visible CTE map, flattening set operations."""
     if expression is None:
         return []
 
-    stack = [expression]
-    results: List[exp.Select] = []
+    initial_ctes = dict(base_ctes or {})
+    stack: List[Tuple[exp.Expression, Dict[str, exp.Expression]]] = [(expression, initial_ctes)]
+    results: List[Tuple[exp.Select, Dict[str, exp.Expression]]] = []
 
     while stack:
-        node = stack.pop()
+        node, cte_scope = stack.pop()
         if isinstance(node, exp.Paren):
-            stack.append(node.this)
+            stack.append((node.this, dict(cte_scope)))
             continue
         if isinstance(node, exp.With):
-            stack.append(node.this)
+            updated_scope = dict(cte_scope)
+            for cte in node.expressions:
+                cte_name = (cte.alias or cte.alias_or_name or "").lower()
+                if not cte_name:
+                    continue
+                updated_scope[cte_name] = cte.this
+            stack.append((node.this, updated_scope))
             continue
         if isinstance(node, exp.Subquery):
-            stack.append(node.this)
+            stack.append((node.this, dict(cte_scope)))
             continue
         if isinstance(node, (exp.Order, exp.Limit)):
-            stack.append(node.this)
+            stack.append((node.this, dict(cte_scope)))
             continue
         if isinstance(node, exp.Select):
-            results.append(node)
+            scope_for_select = dict(cte_scope)
+            with_clause = node.args.get("with")
+            if isinstance(with_clause, exp.With):
+                for cte in with_clause.expressions:
+                    cte_name = (cte.alias or cte.alias_or_name or "").lower()
+                    if not cte_name:
+                        continue
+                    scope_for_select[cte_name] = cte.this
+            results.append((node, scope_for_select))
             continue
         if isinstance(node, exp.SetOperation):
-            stack.append(node.right)
-            stack.append(node.left)
+            stack.append((node.right, dict(cte_scope)))
+            stack.append((node.left, dict(cte_scope)))
             continue
 
     return results
@@ -352,6 +391,7 @@ def build_rows_from_select(
     placeholder_map: Dict[str, str],
     full_statement: str,
     source_file: str,
+    cte_map: Dict[str, exp.Expression],
 ) -> List[ParsedRow]:
     """Extract report rows from an INSERT ... SELECT statement."""
     normalized_columns = [col.lower() for col in target_columns]
@@ -367,7 +407,7 @@ def build_rows_from_select(
             expr = expr.this
         select_mappings.append((column_name, expr))
 
-    dependency_values = extract_dependency_values(select_expression, placeholder_map)
+    dependency_values = extract_dependency_values(select_expression, placeholder_map, cte_map)
     dependency_text = ", ".join(dependency_values)
 
     base_defaults: Dict[str, str] = {column: "" for column in REPORT_COLUMNS}
@@ -452,29 +492,20 @@ def extract_where_context(
 def extract_dependency_values(
     select_expression: exp.Select,
     placeholder_map: Dict[str, str],
+    cte_map: Dict[str, exp.Expression],
+    visited_ctes: Set[str] | None = None,
 ) -> List[str]:
-    """Collect unique insight_type literals used in WHERE clause equality or IN filters."""
-    where_exp = select_expression.args.get("where")
-    if not where_exp:
-        return []
-
+    """Collect unique insight_type literals from SELECT context, WHERE clauses, and referenced CTEs."""
     seen: Set[str] = set()
     ordered: List[str] = []
 
-    def add_literal(expr: exp.Expression) -> None:
-        literal_sql = unmask_placeholders(expr.sql(dialect="postgres"), placeholder_map).strip()
-        if (
-            len(literal_sql) >= 2
-            and literal_sql[0] == literal_sql[-1]
-            and literal_sql[0] in {"'", '"'}
-        ):
-            literal_sql = literal_sql[1:-1]
-        literal_sql = literal_sql.strip()
-        if literal_sql and literal_sql not in seen:
-            seen.add(literal_sql)
-            ordered.append(literal_sql)
+    def add_value(raw_value: str) -> None:
+        literal = strip_quotes(unmask_placeholders(raw_value, placeholder_map))
+        if literal and literal not in seen:
+            seen.add(literal)
+            ordered.append(literal)
 
-    def is_insight_type(expr: exp.Expression | None) -> bool:
+    def is_insight_type_reference(expr: exp.Expression | None) -> bool:
         if expr is None:
             return False
         if isinstance(expr, exp.Column):
@@ -483,21 +514,64 @@ def extract_dependency_values(
             return normalized.endswith(".insight_type") or normalized == "insight_type"
         return False
 
-    for condition in where_exp.this.walk():
-        if isinstance(condition, exp.EQ):
-            left = condition.left
-            right = condition.right
-            if is_insight_type(left) and isinstance(right, exp.Expression):
-                if isinstance(right, exp.Literal):
-                    add_literal(right)
-            elif is_insight_type(right) and isinstance(left, exp.Expression):
-                if isinstance(left, exp.Literal):
-                    add_literal(left)
-        elif isinstance(condition, exp.In):
-            if is_insight_type(condition.this):
-                for option in condition.expressions:
-                    if isinstance(option, exp.Literal):
-                        add_literal(option)
+    # Gather dependency values from VALUES-based cross joins.
+    for combination in extract_value_combinations(select_expression, placeholder_map):
+        for key, raw in combination.items():
+            column_ref = key.replace('"', "").strip().lower().split(".")[-1]
+            if column_ref == "insight_type":
+                add_value(raw)
+
+    # Gather from SELECT list aliases.
+    for expression in select_expression.expressions:
+        alias_or_name = (expression.alias_or_name or "").replace('"', "").strip().lower()
+        expr_node = expression.this if isinstance(expression, exp.Alias) else expression
+        if alias_or_name == "insight_type" and isinstance(expr_node, exp.Literal):
+            add_value(expr_node.sql(dialect="postgres"))
+
+    # Gather from WHERE clause filters.
+    where_exp = select_expression.args.get("where")
+    if where_exp:
+        for condition in where_exp.this.walk():
+            if isinstance(condition, exp.EQ):
+                left = condition.left
+                right = condition.right
+                if is_insight_type_reference(left) and isinstance(right, exp.Literal):
+                    add_value(right.sql(dialect="postgres"))
+                elif is_insight_type_reference(right) and isinstance(left, exp.Literal):
+                    add_value(left.sql(dialect="postgres"))
+            elif isinstance(condition, exp.In):
+                if is_insight_type_reference(condition.this):
+                    for option in condition.expressions:
+                        if isinstance(option, exp.Literal):
+                            add_value(option.sql(dialect="postgres"))
+
+    # Explore referenced CTEs when joins target WITH clauses.
+    if cte_map:
+        visited = visited_ctes or set()
+        referenced_ctes: Set[str] = set()
+        for table in select_expression.find_all(exp.Table):
+            table_name = (table.name or "").lower()
+            if table_name in cte_map:
+                referenced_ctes.add(table_name)
+
+        for cte_name in referenced_ctes:
+            if cte_name in visited or cte_name not in cte_map:
+                continue
+            visited.add(cte_name)
+            cte_expression = cte_map[cte_name]
+            for inner_select, inner_cte_map in iter_select_statements(cte_expression, base_ctes=cte_map):
+                combined_map = dict(cte_map)
+                combined_map.update(inner_cte_map)
+                inner_values = extract_dependency_values(
+                    inner_select,
+                    placeholder_map,
+                    combined_map,
+                    visited,
+                )
+                for value in inner_values:
+                    if value not in seen:
+                        seen.add(value)
+                        ordered.append(value)
 
     return ordered
 
@@ -667,7 +741,15 @@ def fallback_build_rows_from_select(
         logging.warning("Fallback parse error in %s: %s", source_file, exc)
         return []
 
-    select_statements = list(iter_select_statements(select_expression))
+    base_ctes: Dict[str, exp.Expression] = {}
+    if isinstance(select_expression, exp.With):
+        for cte in select_expression.expressions:
+            cte_name = (cte.alias or cte.alias_or_name or "").lower()
+            if cte_name:
+                base_ctes[cte_name] = cte.this
+        select_expression = select_expression.this
+
+    select_statements = list(iter_select_statements(select_expression, base_ctes=base_ctes))
     if not select_statements:
         logging.warning(
             "Fallback parser produced %s instead of SELECT in %s; skipping.",
@@ -677,7 +759,7 @@ def fallback_build_rows_from_select(
         return []
 
     fallback_rows: List[ParsedRow] = []
-    for stmt in select_statements:
+    for stmt, cte_scope in select_statements:
         fallback_rows.extend(
             build_rows_from_select(
                 target_columns,
@@ -685,6 +767,7 @@ def fallback_build_rows_from_select(
                 placeholder_map,
                 full_statement,
                 source_file,
+                cte_scope,
             )
         )
 
