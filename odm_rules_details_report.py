@@ -49,6 +49,7 @@ REPORT_COLUMNS: Sequence[str] = (
     "insight_att_val",
     "profile_column",
     "logic",
+    "file_path",
 )
 
 PLACEHOLDER_PATTERN = re.compile(r"\{\{\s*([^\{\}]+?)\s*\}\}")
@@ -274,7 +275,10 @@ def build_rows_from_values(
 ) -> List[ParsedRow]:
     """Align column names and row values, trimming and normalizing for the report."""
     normalized_columns = [col.lower() for col in target_columns]
-    missing = [col for col in REPORT_COLUMNS if col not in normalized_columns and col != "logic"]
+    missing = [
+        col for col in REPORT_COLUMNS
+        if col not in normalized_columns and col not in {"logic", "file_path"}
+    ]
     if missing:
         logging.debug(
             "Columns missing from INSERT target in %s: %s",
@@ -293,6 +297,7 @@ def build_rows_from_values(
 
         report_data = {column: row_map.get(column, "") for column in REPORT_COLUMNS}
         report_data["logic"] = logic_sql.strip()
+        report_data["file_path"] = source_file
         parsed_rows.append(
             ParsedRow(
                 data=report_data,
@@ -340,6 +345,7 @@ def build_rows_from_select(
     where_logic, profile_columns = extract_where_context(select_expression, placeholder_map)
 
     base_data["profile_table"] = profile_table
+    base_data["file_path"] = source_file
 
     parsed_rows: List[ParsedRow] = []
 
