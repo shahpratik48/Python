@@ -83,6 +83,15 @@ def unmask_placeholders(text: str, mapping: Dict[str, str]) -> str:
     return result
 
 
+def normalize_value(column_name: str, value: str) -> str:
+    """Apply column-specific normalization rules."""
+    text = (value or "").strip()
+    if column_name in {"insight_type", "target_type"}:
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+            text = text[1:-1].strip()
+    return text
+
+
 def extract_insert_columns_from_text(sql_text: str) -> List[str]:
     """Extract the column list from an INSERT statement using simple bracket matching."""
     lowered = sql_text.lower()
@@ -276,10 +285,11 @@ def build_rows_from_values(
     parsed_rows: List[ParsedRow] = []
 
     for values in value_rows:
-        row_map = {
-            col.lower(): (values[idx] if idx < len(values) else "")
-            for idx, col in enumerate(target_columns)
-        }
+        row_map: Dict[str, str] = {}
+        for idx, col in enumerate(target_columns):
+            lower_col = col.lower()
+            raw_value = values[idx] if idx < len(values) else ""
+            row_map[lower_col] = normalize_value(lower_col, raw_value)
 
         report_data = {column: row_map.get(column, "") for column in REPORT_COLUMNS}
         report_data["logic"] = logic_sql.strip()
@@ -319,9 +329,10 @@ def build_rows_from_select(
             item = select_items[idx]
             if isinstance(item, exp.Alias):
                 item = item.this
-            base_data[column_name] = unmask_placeholders(
+            raw_value = unmask_placeholders(
                 item.sql(dialect="postgres"), placeholder_map
             ).strip()
+            base_data[column_name] = normalize_value(column_name, raw_value)
         else:
             base_data[column_name] = ""
 
