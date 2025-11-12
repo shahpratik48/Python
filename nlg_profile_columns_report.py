@@ -31,7 +31,8 @@ PATH_INPUT_CONFIG = "dags/nlg/src/config/input_data_config"
 PATH_SQL_MAPPING = "dags/nlg/src/sql_column_mapping"
 
 TARGET_SCHEMA = "sandbox_prj_smart_insights"
-TARGET_TABLE = "nlg_profile_columns_auto_task"
+TARGET_TABLE_INPUT = "nlg_profile_input_config_auto_task"
+TARGET_TABLE_SQL = "nlg_profile_sql_mapping_auto_task"
 
 SQL_OWNER = "erd_gpdb_prj_smart_insights"
 SQL_READ_ROLE = "erd_gpdb_prj_smart_insights_ro"
@@ -44,6 +45,7 @@ PROFILE_TABLE_KEYS = [
     "profile_tbl_name",
 ]
 JOIN_KEY_KEYS = ["joining_key", "join_key", "joining_keys", "join_keys"]
+TARGET_TYPE_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
 
 LOGGER = logging.getLogger(__name__)
 
@@ -53,6 +55,16 @@ def configure_logging():
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
+
+
+def normalize_target_type(candidate, fallback=None):
+    if isinstance(candidate, str):
+        stripped = candidate.strip()
+        if stripped and TARGET_TYPE_PATTERN.fullmatch(stripped):
+            return stripped
+    if isinstance(fallback, str) and TARGET_TYPE_PATTERN.fullmatch(fallback.strip()):
+        return fallback.strip()
+    return None
 
 
 def fetch_file_content(project, file_path, ref):
@@ -109,20 +121,21 @@ def deduplicate(rows, key_fields):
 def search_profile_map(node, fallback_target=None):
     rows = []
     if isinstance(node, dict):
-        current_target = node.get("target_type") or fallback_target
+        explicit_target = node.get("target_type")
+        normalized_target = normalize_target_type(explicit_target, fallback_target)
+        target_value = normalized_target or fallback_target
         profile_table = first_non_empty(node, PROFILE_TABLE_KEYS)
         joining_key = first_non_empty(node, JOIN_KEY_KEYS)
-        if profile_table or joining_key:
+        if (profile_table or joining_key) and target_value:
             row = {
-                "target_type": serialise_value(current_target)
-                or serialise_value(fallback_target),
+                "target_type": target_value,
                 "profile_table": serialise_value(profile_table),
                 "joining_key": serialise_value(joining_key),
             }
-            if row["target_type"]:
-                rows.append(row)
+            rows.append(row)
         for key, value in node.items():
-            new_fallback = node.get("target_type") or key or fallback_target
+            key_fallback = normalize_target_type(key, target_value)
+            new_fallback = normalized_target or key_fallback or target_value
             rows.extend(search_profile_map(value, fallback_target=new_fallback))
     elif isinstance(node, list):
         for item in node:
@@ -213,7 +226,14 @@ def collect_input_config_rows(project, ref, base_path):
         data = load_structured_file(project, file_path, ref)
         if data is None:
             continue
-        target_type = find_explicit_target(data) or PurePosixPath(file_path).stem
+        path_obj = PurePosixPath(file_path)
+        target_type = normalize_target_type(path_obj.stem, path_obj.stem)
+        if target_type is None:
+            LOGGER.warning(
+                "Skipping input config file %s; unable to determine target_type.",
+                file_path,
+            )
+            continue
         for tag_path, logic, columns in extract_logic_entries(data):
             if should_skip_tag(tag_path):
                 continue
@@ -221,12 +241,12 @@ def collect_input_config_rows(project, ref, base_path):
             for column in columns:
                 rows.append(
                     {
-                        "target_type": serialise_value(target_type),
+                        "target_type": target_type,
                         "config_tag": tag,
                         "config_tag_path": tag_path,
                         "config_profile_column": column,
                         "config_logic": logic,
-                        "config_filename": PurePosixPath(file_path).name,
+                        "config_filename": path_obj.name,
                         "config_file_path": file_path,
                     }
                 )
@@ -242,13 +262,20 @@ def collect_sql_mapping_rows(project, ref, base_path):
         path_obj = PurePosixPath(file_path)
         if len(path_obj.parts) <= len(base_parts):
             continue
-        target_type = path_obj.parts[len(base_parts)]
+        target_folder = path_obj.parts[len(base_parts)]
+        target_type = normalize_target_type(target_folder, target_folder)
+        if target_type is None:
+            LOGGER.warning(
+                "Skipping SQL mapping file %s; unable to determine target_type from folder.",
+                file_path,
+            )
+            continue
         data = load_structured_file(project, file_path, ref)
         if data is None:
             continue
         explicit_target = find_explicit_target(data)
-        if explicit_target:
-            target_type = explicit_target
+        normalized_explicit = normalize_target_type(explicit_target, target_type)
+        target_type = normalized_explicit or target_type
         insight_type = path_obj.stem
         for tag_path, logic, columns in extract_logic_entries(data):
             if should_skip_tag(tag_path):
@@ -257,7 +284,7 @@ def collect_sql_mapping_rows(project, ref, base_path):
             for column in columns:
                 rows.append(
                     {
-                        "target_type": serialise_value(target_type),
+                        "target_type": target_type,
                         "insight_type": insight_type,
                         "sql_tag": tag,
                         "sql_tag_path": tag_path,
@@ -277,7 +304,7 @@ def ensure_dataframe(rows, columns):
     return df
 
 
-def build_report_dataframe(project, ref):
+def build_report_dataframes(project, ref, report_timestamp):
     profile_map_rows = collect_profile_map(project, ref, PATH_PROFILE_MAP)
     input_config_rows = collect_input_config_rows(project, ref, PATH_INPUT_CONFIG)
     sql_mapping_rows = collect_sql_mapping_rows(project, ref, PATH_SQL_MAPPING)
@@ -311,13 +338,13 @@ def build_report_dataframe(project, ref):
         ],
     )
 
-    merged = df_profile.merge(df_config, on="target_type", how="outer")
-    merged = merged.merge(df_sql, on="target_type", how="outer")
+    df_input = df_profile.merge(df_config, on="target_type", how="outer")
+    df_sql_merged = df_profile.merge(df_sql, on="target_type", how="outer")
 
-    report_timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    merged["current_timestamp"] = report_timestamp
+    df_input["current_time_stamp"] = report_timestamp
+    df_sql_merged["current_time_stamp"] = report_timestamp
 
-    preferred_order = [
+    input_columns = [
         "target_type",
         "profile_table",
         "joining_key",
@@ -327,6 +354,17 @@ def build_report_dataframe(project, ref):
         "config_logic",
         "config_filename",
         "config_file_path",
+        "current_time_stamp",
+    ]
+    input_remaining = [
+        col for col in df_input.columns if col not in input_columns
+    ]
+    df_input = df_input[input_columns + input_remaining]
+
+    sql_columns = [
+        "target_type",
+        "profile_table",
+        "joining_key",
         "insight_type",
         "sql_tag",
         "sql_tag_path",
@@ -334,13 +372,14 @@ def build_report_dataframe(project, ref):
         "sql_logic",
         "filename_under_sql_column_mapping",
         "file_path_under_sql_column_mapping",
-        "current_timestamp",
+        "current_time_stamp",
     ]
-    ordered_cols = [col for col in preferred_order if col in merged.columns]
-    remaining_cols = [col for col in merged.columns if col not in ordered_cols]
-    merged = merged[ordered_cols + remaining_cols]
+    sql_remaining = [
+        col for col in df_sql_merged.columns if col not in sql_columns
+    ]
+    df_sql_merged = df_sql_merged[sql_columns + sql_remaining]
 
-    return merged
+    return df_input, df_sql_merged
 
 
 def load_dataframe_to_greenplum(df, db_config, schema, table_name):
@@ -412,6 +451,13 @@ def load_dataframe_to_greenplum(df, db_config, schema, table_name):
             )
             cur.execute(grant_sql)
 
+    LOGGER.info(
+        "Successfully loaded %d rows into %s.%s.",
+        len(df_for_db),
+        schema,
+        table_name,
+    )
+
 
 def main():
     configure_logging()
@@ -429,16 +475,26 @@ def main():
         BRANCH,
     )
 
-    report_df = build_report_dataframe(project, BRANCH)
-    LOGGER.info("Built report dataframe with %d rows.", len(report_df))
-
     current_ts = datetime.datetime.utcnow()
+    report_timestamp = current_ts.strftime("%Y-%m-%d %H:%M:%S")
+
+    input_df, sql_df = build_report_dataframes(project, BRANCH, report_timestamp)
+    LOGGER.info(
+        "Built dataframes: input_config rows=%d, sql_mapping rows=%d.",
+        len(input_df),
+        len(sql_df),
+    )
+
     timestamp_str = current_ts.strftime("%Y%m%d%H%M%S")
     output_file = f"nlg_profile_columns_{timestamp_str}.xlsx"
-    report_df.to_excel(output_file, index=False)
+    with pd.ExcelWriter(output_file) as writer:
+        input_df.to_excel(writer, sheet_name="Input_config", index=False)
+        sql_df.to_excel(writer, sheet_name="sql_mapping", index=False)
     LOGGER.info(
-        "Report saved to %s at UTC timestamp %s.",
+        "Workbook saved to %s with sheets Input_config (%d rows) and sql_mapping (%d rows) at UTC timestamp %s.",
         output_file,
+        len(input_df),
+        len(sql_df),
         current_ts.isoformat(),
     )
 
@@ -456,12 +512,17 @@ def main():
     }
 
     load_dataframe_to_greenplum(
-        report_df, db_config, TARGET_SCHEMA, TARGET_TABLE
+        input_df, db_config, TARGET_SCHEMA, TARGET_TABLE_INPUT
+    )
+    load_dataframe_to_greenplum(
+        sql_df, db_config, TARGET_SCHEMA, TARGET_TABLE_SQL
     )
     LOGGER.info(
-        "Greenplum table %s.%s refreshed and privileges applied.",
+        "Greenplum tables refreshed: %s.%s and %s.%s.",
         TARGET_SCHEMA,
-        TARGET_TABLE,
+        TARGET_TABLE_INPUT,
+        TARGET_SCHEMA,
+        TARGET_TABLE_SQL,
     )
     LOGGER.info("NLG profile columns report generation pipeline finished successfully.")
 
