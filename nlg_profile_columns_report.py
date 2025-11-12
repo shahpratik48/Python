@@ -9,6 +9,7 @@ import datetime
 import getpass
 import io
 import json
+import logging
 import re
 from pathlib import PurePosixPath
 
@@ -43,6 +44,15 @@ PROFILE_TABLE_KEYS = [
     "profile_tbl_name",
 ]
 JOIN_KEY_KEYS = ["joining_key", "join_key", "joining_keys", "join_keys"]
+
+LOGGER = logging.getLogger(__name__)
+
+
+def configure_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
 
 
 def fetch_file_content(project, file_path, ref):
@@ -335,6 +345,12 @@ def build_report_dataframe(project, ref):
 
 def load_dataframe_to_greenplum(df, db_config, schema, table_name):
     df_for_db = df.fillna("").astype(str)
+    LOGGER.info(
+        "Preparing to load %d rows into %s.%s.",
+        len(df_for_db),
+        schema,
+        table_name,
+    )
 
     conn_params = {
         "host": db_config["host"],
@@ -348,6 +364,7 @@ def load_dataframe_to_greenplum(df, db_config, schema, table_name):
         conn.autocommit = True
 
         with conn.cursor() as cur:
+            LOGGER.info("Dropping table %s.%s if it exists.", schema, table_name)
             drop_sql = sql.SQL("DROP TABLE IF EXISTS {}.{}").format(
                 sql.Identifier(schema), sql.Identifier(table_name)
             )
@@ -357,6 +374,7 @@ def load_dataframe_to_greenplum(df, db_config, schema, table_name):
                 sql.SQL("{} TEXT").format(sql.Identifier(column))
                 for column in df_for_db.columns
             )
+            LOGGER.info("Creating table %s.%s with %d columns.", schema, table_name, len(df_for_db.columns))
             create_sql = sql.SQL(
                 "CREATE TABLE {}.{} ({}) DISTRIBUTED RANDOMLY"
             ).format(sql.Identifier(schema), sql.Identifier(table_name), columns_ddl)
@@ -375,6 +393,11 @@ def load_dataframe_to_greenplum(df, db_config, schema, table_name):
             cur.copy_expert(copy_sql.as_string(cur), buffer)
 
         with conn.cursor() as cur:
+            LOGGER.info(
+                "Applying ownership and grants to table %s.%s.",
+                schema,
+                table_name,
+            )
             alter_sql = sql.SQL("ALTER TABLE {}.{} OWNER TO {}").format(
                 sql.Identifier(schema),
                 sql.Identifier(table_name),
@@ -391,23 +414,38 @@ def load_dataframe_to_greenplum(df, db_config, schema, table_name):
 
 
 def main():
+    configure_logging()
+    LOGGER.info("Starting NLG profile columns report generation pipeline.")
+
     private_token = getpass.getpass("Enter your private token: ").strip()
     if not private_token:
         raise ValueError("GitLab private token is required.")
 
     gl = gitlab.Gitlab(GITLAB_URL, private_token=private_token)
     project = gl.projects.get(NLG_PROJECT_PATH)
+    LOGGER.info(
+        "Connected to GitLab project '%s' on branch '%s'.",
+        NLG_PROJECT_PATH,
+        BRANCH,
+    )
 
     report_df = build_report_dataframe(project, BRANCH)
+    LOGGER.info("Built report dataframe with %d rows.", len(report_df))
 
-    timestamp = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    output_file = f"nlg_profile_columns_{timestamp}.xlsx"
+    current_ts = datetime.datetime.utcnow()
+    timestamp_str = current_ts.strftime("%Y%m%d%H%M%S")
+    output_file = f"nlg_profile_columns_{timestamp_str}.xlsx"
     report_df.to_excel(output_file, index=False)
-    print(f"Report saved to {output_file}")
+    LOGGER.info(
+        "Report saved to %s at UTC timestamp %s.",
+        output_file,
+        current_ts.isoformat(),
+    )
 
     db_password = getpass.getpass("Enter Password for DB User: ").strip()
     if not db_password:
         raise ValueError("Database password is required.")
+    LOGGER.info("Database credentials captured; preparing to load data into Greenplum.")
 
     db_config = {
         "host": "greenplum-rdsp.zur.swissbank.com",
@@ -420,9 +458,12 @@ def main():
     load_dataframe_to_greenplum(
         report_df, db_config, TARGET_SCHEMA, TARGET_TABLE
     )
-    print(
-        f"Table {TARGET_SCHEMA}.{TARGET_TABLE} refreshed and privileges applied."
+    LOGGER.info(
+        "Greenplum table %s.%s refreshed and privileges applied.",
+        TARGET_SCHEMA,
+        TARGET_TABLE,
     )
+    LOGGER.info("NLG profile columns report generation pipeline finished successfully.")
 
 
 if __name__ == "__main__":
