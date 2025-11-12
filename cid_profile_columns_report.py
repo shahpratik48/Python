@@ -3,10 +3,13 @@ Generate a CID profile columns report by parsing YAML configs stored in GitLab.
 
 Steps performed:
 1. Authenticate to GitLab and download all YAML files under
-   `dags/nlg/src/config/input_data_config_dummy` on the specified branch.
-2. Parse each YAML document looking for expressions that contain MD5 logic.
-   For every MD5 usage, extract the associated target_type, tag, logic, and
-   the profile columns referenced inside the MD5 expression.
+   `dags/nlg/src/config/input_data_config_dummy` as well as the profile map YAML
+   at `dags/nlg/src/config/odm_profile_map/profile_tbl.yaml` on the specified branch.
+2. Parse each YAML document looking for expressions that contain MD5 logic, skipping
+   any logic strings that reference HTTPS URLs. Extract the associated target_type,
+   tag, logic, and the profile columns referenced inside each MD5 expression, and
+   augment the rows with profile table metadata (profile table and joining key) from
+   the profile map file.
 3. Persist the extracted metadata to an XLSX report file named with the current
    timestamp.
 4. Load the XLSX content into the Greenplum table
@@ -14,7 +17,8 @@ Steps performed:
    existing data.
 
 The output columns are:
-    target_type, tag, cid_profile_column, logic, current_timestamp, filepath, filename
+    target_type, profile table, joining Key, tag, cid_profile_column, logic,
+    current_timestamp, filepath, filename
 """
 
 from __future__ import annotations
@@ -24,9 +28,9 @@ import datetime
 import getpass
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, List, Sequence
+from typing import Any, Dict, List, Sequence
 
 import gitlab  # type: ignore
 import pandas as pd
@@ -43,6 +47,8 @@ NLG_PROJECT_PATH = (
 )
 BRANCH = "nlg-master"
 CONFIG_BASE_PATH = "dags/nlg/src/config/input_data_config_dummy"
+PROFILE_MAP_BASE_PATH = "dags/nlg/src/config/odm_profile_map"
+PROFILE_MAP_FILE_PATH = f"{PROFILE_MAP_BASE_PATH}/profile_tbl.yaml"
 
 OUTPUT_TIMESTAMP_FORMAT = "%Y-%m-%d_%H%M%S"
 OUTPUT_FILE_TEMPLATE = "cid_profile_columns_{timestamp}.xlsx"
@@ -50,6 +56,18 @@ OUTPUT_FILE_TEMPLATE = "cid_profile_columns_{timestamp}.xlsx"
 TARGET_SCHEMA = "sandbox_prj_smart_insights"
 TARGET_TABLE = "cid_profile_columns_auto_task"
 TARGET_TABLE_FQN = f"{TARGET_SCHEMA}.{TARGET_TABLE}"
+
+OUTPUT_COLUMNS = [
+    "target_type",
+    "profile table",
+    "joining Key",
+    "tag",
+    "cid_profile_column",
+    "logic",
+    "current_timestamp",
+    "filepath",
+    "filename",
+]
 
 
 SQL_KEYWORDS = {
@@ -137,8 +155,16 @@ BARE_IDENTIFIER_PATTERN = re.compile(r'"?([A-Za-z_][\w$]*)"?')
 
 
 @dataclass
+class ProfileInfo:
+    profile_table: str | None = None
+    joining_key: str | None = None
+
+
+@dataclass
 class Row:
     target_type: str
+    profile_table: str | None
+    joining_key: str | None
     tag: str
     cid_profile_column: str
     logic: str
@@ -149,6 +175,8 @@ class Row:
     def as_tuple(self) -> tuple[Any, ...]:
         return (
             self.target_type,
+            self.profile_table,
+            self.joining_key,
             self.tag,
             self.cid_profile_column,
             self.logic,
@@ -169,6 +197,17 @@ def main() -> None:
     file_paths = fetch_yaml_file_paths(project, CONFIG_BASE_PATH, BRANCH)
     print(f"Found {len(file_paths)} YAML files to process.")
 
+    profile_tree = project.repository_tree(
+        path=PROFILE_MAP_BASE_PATH,
+        ref=BRANCH,
+        get_all=True,
+        recursive=True,
+    )
+    print(f"Discovered {len(profile_tree)} items under {PROFILE_MAP_BASE_PATH}.")
+
+    profile_map = load_profile_table_mapping(project, PROFILE_MAP_FILE_PATH, BRANCH)
+    print(f"Loaded profile table details for {len(profile_map)} target types.")
+
     now = datetime.datetime.now()
     timestamp_label = now.strftime(OUTPUT_TIMESTAMP_FORMAT)
     output_filename = OUTPUT_FILE_TEMPLATE.format(timestamp=timestamp_label)
@@ -186,6 +225,7 @@ def main() -> None:
                 target_type=target_type,
                 filepath=file_path,
                 current_timestamp=now,
+                profile_info_map=profile_map,
             )
             records.extend(extracted)
 
@@ -193,16 +233,15 @@ def main() -> None:
         print("No MD5-based profile columns were found in any YAML file.")
         return
 
-    columns_order = [
-        "target_type",
-        "tag",
-        "cid_profile_column",
-        "logic",
-        "current_timestamp",
-        "filepath",
-        "filename",
-    ]
-    df = pd.DataFrame([row.as_tuple() for row in records], columns=columns_order)
+    df = pd.DataFrame([asdict(row) for row in records])
+    df.rename(
+        columns={
+            "profile_table": "profile table",
+            "joining_key": "joining Key",
+        },
+        inplace=True,
+    )
+    df = df[OUTPUT_COLUMNS]
     df.sort_values(["target_type", "tag", "cid_profile_column"], inplace=True)
     df.drop_duplicates(inplace=True)
 
@@ -235,13 +274,104 @@ def load_file_from_gitlab(project: Any, file_path: str, ref: str) -> str:
     return content_bytes.decode("utf-8")
 
 
+def load_profile_table_mapping(project: Any, file_path: str, ref: str) -> Dict[str, ProfileInfo]:
+    mapping: Dict[str, ProfileInfo] = {}
+    try:
+        yaml_text = load_file_from_gitlab(project, file_path, ref)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Unable to load profile map file {file_path}: {exc}")
+        return mapping
+
+    for document in yaml.safe_load_all(yaml_text):
+        if document is None:
+            continue
+        for entry in collect_profile_table_entries(document):
+            target_type_raw = entry.get("target_type")
+            if target_type_raw is None:
+                continue
+            target_type = str(target_type_raw).strip()
+            if not target_type:
+                continue
+            key = target_type.lower()
+            info = mapping.setdefault(key, ProfileInfo())
+            profile_table_val = entry.get("profile_table")
+            joining_key_val = entry.get("joining_key")
+            if profile_table_val:
+                info.profile_table = str(profile_table_val).strip()
+            if joining_key_val:
+                info.joining_key = str(joining_key_val).strip()
+
+    return mapping
+
+
+def collect_profile_table_entries(node: Any) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+
+    def traverse(current: Any) -> None:
+        if isinstance(current, dict):
+            normalized = {normalize_key(str(k)): k for k in current.keys()}
+            if "targettype" in normalized:
+                target_type_key = normalized["targettype"]
+                target_type_value = current.get(target_type_key)
+
+                profile_table_value = None
+                for candidate in (
+                    "profiletable",
+                    "profiletablename",
+                    "profiletable_name",
+                    "profiletbl",
+                ):
+                    if candidate in normalized:
+                        profile_table_value = current.get(normalized[candidate])
+                        if profile_table_value is not None:
+                            break
+
+                joining_key_value = None
+                for candidate in (
+                    "joiningkey",
+                    "joiningkeys",
+                    "joining_key",
+                    "joinkey",
+                ):
+                    if candidate in normalized:
+                        joining_key_value = current.get(normalized[candidate])
+                        if joining_key_value is not None:
+                            break
+
+                if target_type_value is not None:
+                    entries.append(
+                        {
+                            "target_type": target_type_value,
+                            "profile_table": profile_table_value,
+                            "joining_key": joining_key_value,
+                        }
+                    )
+
+            for value in current.values():
+                traverse(value)
+        elif isinstance(current, list):
+            for item in current:
+                traverse(item)
+
+    traverse(node)
+    return entries
+
+
+def normalize_key(key: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", key.lower())
+
+
 def extract_md5_rows(
     document: Any,
     target_type: str,
     filepath: str,
     current_timestamp: datetime.datetime,
+    profile_info_map: Dict[str, ProfileInfo],
 ) -> List[Row]:
     rows: List[Row] = []
+    info = profile_info_map.get(target_type.lower())
+    profile_table = info.profile_table if info else None
+    joining_key = info.joining_key if info else None
 
     def walker(node: Any, parent_keys: Sequence[str]) -> None:
         if isinstance(node, dict):
@@ -253,10 +383,14 @@ def extract_md5_rows(
         elif isinstance(node, str) and "MD5" in node.upper():
             tag = determine_tag(parent_keys)
             logic = node.strip()
+            if "https" in logic.lower():
+                return
             for column in extract_profile_columns(logic):
                 rows.append(
                     Row(
                         target_type=target_type,
+                        profile_table=profile_table,
+                        joining_key=joining_key,
                         tag=tag,
                         cid_profile_column=column,
                         logic=logic,
@@ -362,30 +496,29 @@ def load_dataframe_to_greenplum(df: pd.DataFrame, password: str) -> None:
         )
         cur.execute(drop_statement)
 
-        create_statement = sql.SQL(
-            """
-            CREATE TABLE {schema}.{table} (
-                target_type TEXT,
-                tag TEXT,
-                cid_profile_column TEXT,
-                logic TEXT,
-                current_timestamp TIMESTAMP,
-                filepath TEXT,
-                filename TEXT
+        column_definitions = []
+        for column in OUTPUT_COLUMNS:
+            data_type = sql.SQL("TIMESTAMP") if column == "current_timestamp" else sql.SQL("TEXT")
+            column_definitions.append(
+                sql.SQL("{} {}").format(sql.Identifier(column), data_type)
             )
-            """
+        create_statement = sql.SQL(
+            "CREATE TABLE {schema}.{table} (\n                {columns}\n            )"
         ).format(
             schema=sql.Identifier(TARGET_SCHEMA),
             table=sql.Identifier(TARGET_TABLE),
+            columns=sql.SQL(",\n                ").join(column_definitions),
         )
         cur.execute(create_statement)
 
-        rows = list(df.itertuples(index=False, name=None))
+        rows = list(df[OUTPUT_COLUMNS].itertuples(index=False, name=None))
+        insert_columns = [sql.Identifier(col) for col in OUTPUT_COLUMNS]
         insert_statement = sql.SQL(
-            "INSERT INTO {schema}.{table} (target_type, tag, cid_profile_column, logic, current_timestamp, filepath, filename) VALUES %s"
+            "INSERT INTO {schema}.{table} ({columns}) VALUES %s"
         ).format(
             schema=sql.Identifier(TARGET_SCHEMA),
             table=sql.Identifier(TARGET_TABLE),
+            columns=sql.SQL(", ").join(insert_columns),
         )
         insert_sql = insert_statement.as_string(cur)
         execute_values(cur, insert_sql, rows)
