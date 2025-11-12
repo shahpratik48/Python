@@ -37,78 +37,7 @@ TARGET_TABLE_SQL = "nlg_profile_sql_mapping_auto_task"
 SQL_OWNER = "erd_gpdb_prj_smart_insights"
 SQL_READ_ROLE = "erd_gpdb_prj_smart_insights_ro"
 
-B_ALIAS_PATTERN = re.compile(r'\bb\.(?:"([^"]+)"|([A-Za-z0-9_]+))', re.IGNORECASE)
-BARE_COLUMN_PATTERN = re.compile(
-    r'(?<![\w\.])(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))(?!\s*\()', re.IGNORECASE
-)
-SQL_RESERVED_WORDS = {
-    "AS",
-    "AND",
-    "OR",
-    "NOT",
-    "NULL",
-    "TRUE",
-    "FALSE",
-    "CASE",
-    "WHEN",
-    "THEN",
-    "ELSE",
-    "END",
-    "COALESCE",
-    "CAST",
-    "DISTINCT",
-    "OVER",
-    "PARTITION",
-    "BY",
-    "ORDER",
-    "LIMIT",
-    "OFFSET",
-    "LIKE",
-    "ILIKE",
-    "BETWEEN",
-    "IN",
-    "IS",
-    "ON",
-    "USING",
-    "JOIN",
-    "LEFT",
-    "RIGHT",
-    "INNER",
-    "OUTER",
-    "FULL",
-    "SELECT",
-    "FROM",
-    "WHERE",
-    "GROUP",
-    "HAVING",
-    "UNION",
-    "ALL",
-    "WITH",
-    "VALUES",
-    "INSERT",
-    "UPDATE",
-    "DELETE",
-    "CREATE",
-    "TABLE",
-    "VIEW",
-    "CURRENT_DATE",
-    "CURRENT_TIMESTAMP",
-    "DATE",
-    "TIMESTAMP",
-    "TIME",
-    "INTERVAL",
-    "TEXT",
-    "CHAR",
-    "VARCHAR",
-    "NUMERIC",
-    "INTEGER",
-    "SMALLINT",
-    "BIGINT",
-    "DECIMAL",
-    "DOUBLE",
-    "PRECISION",
-    "REAL",
-}
+COLUMN_PATTERN = re.compile(r'\bb\.(?:"([^"]+)"|([A-Za-z0-9_]+))', re.IGNORECASE)
 PROFILE_TABLE_KEYS = [
     "profile_table",
     "profile_tbl",
@@ -222,47 +151,16 @@ def collect_profile_map(project, ref, file_path):
     return deduplicate(rows, ["target_type", "profile_table", "joining_key"])
 
 
-def is_reserved_word(token):
-    return token.upper() in SQL_RESERVED_WORDS
-
-
-def find_profile_columns(expression):
+def find_b_columns(expression):
     columns = []
     seen = set()
-
-    for quoted, unquoted in B_ALIAS_PATTERN.findall(expression):
+    for quoted, unquoted in COLUMN_PATTERN.findall(expression):
         column = quoted or unquoted
         if column:
             key = column.lower()
             if key not in seen:
                 seen.add(key)
                 columns.append(column)
-
-    for match in BARE_COLUMN_PATTERN.finditer(expression):
-        column = match.group(1) or match.group(2)
-        if not column:
-            continue
-
-        if column.lower() in {"b", "a", "c"}:
-            continue
-
-        upper_token = column.upper()
-        if is_reserved_word(upper_token):
-            continue
-
-        start = match.start()
-        if start >= 2 and expression[start - 2 : start] == "::":
-            continue
-
-        prefix = expression[:start]
-        if re.search(r"\bAS\s*$", prefix, re.IGNORECASE):
-            continue
-
-        key = column.lower()
-        if key not in seen:
-            seen.add(key)
-            columns.append(column)
-
     return columns
 
 
@@ -281,7 +179,7 @@ def extract_logic_entries(node, prefix=None):
             logic = node.strip()
             if not logic:
                 return entries
-            columns = find_profile_columns(logic)
+            columns = find_b_columns(logic)
             if columns:
                 entries.append((prefix, logic, columns))
     return entries
