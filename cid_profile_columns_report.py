@@ -5,11 +5,11 @@ Steps performed:
 1. Authenticate to GitLab and download all YAML files under
    `dags/nlg/src/config/input_data_config_dummy` as well as the profile map YAML
    at `dags/nlg/src/config/odm_profile_map/profile_tbl.yaml` on the specified branch.
-2. Parse each YAML document looking for expressions that contain MD5 logic, skipping
-   any logic strings that reference HTTPS URLs. Extract the associated target_type,
-   tag, logic, and the profile columns referenced inside each MD5 expression, and
-   augment the rows with profile table metadata (profile table and joining key) from
-   the profile map file.
+2. Parse each YAML document looking for expressions that contain MD5 logic while
+   ignoring HTTP/HTTPS URL fragments when determining profile columns. Extract the
+   associated target_type, tag, logic, and the profile columns referenced inside each
+   MD5 expression, and augment the rows with profile table metadata (profile table and
+   joining key) from the profile map file.
 3. Persist the extracted metadata to an XLSX report file named with the current
    timestamp.
 4. Load the XLSX content into the Greenplum table
@@ -152,6 +152,11 @@ ALIAS_COLUMN_PATTERN = re.compile(
     r'(?:"?([A-Za-z_][\w$]*)"?\.)"?([A-Za-z_][\w$]*)"?', re.IGNORECASE
 )
 BARE_IDENTIFIER_PATTERN = re.compile(r'"?([A-Za-z_][\w$]*)"?')
+
+
+def contains_http(value: str) -> bool:
+    lowered = value.lower()
+    return "http://" in lowered or "https://" in lowered
 
 
 @dataclass
@@ -383,8 +388,6 @@ def extract_md5_rows(
         elif isinstance(node, str) and "MD5" in node.upper():
             tag = determine_tag(parent_keys)
             logic = node.strip()
-            if "https" in logic.lower():
-                return
             for column in extract_profile_columns(logic):
                 rows.append(
                     Row(
@@ -419,6 +422,8 @@ def extract_profile_columns(logic: str) -> List[str]:
         alias_cols = extract_alias_columns(md5_argument)
         for col in alias_cols:
             if col not in seen:
+                if contains_http(col):
+                    continue
                 columns.append(col)
                 seen.add(col)
                 local_found = True
@@ -432,6 +437,8 @@ def extract_profile_columns(logic: str) -> List[str]:
                 continue
             if ident.isdigit():
                 continue
+            if contains_http(ident):
+                continue
             if ident not in seen:
                 columns.append(ident)
                 seen.add(ident)
@@ -439,7 +446,7 @@ def extract_profile_columns(logic: str) -> List[str]:
 
         if not local_found:
             cleaned = " ".join(md5_argument.split())
-            if cleaned and cleaned not in seen:
+            if cleaned and cleaned not in seen and not contains_http(cleaned):
                 columns.append(cleaned)
                 seen.add(cleaned)
 
