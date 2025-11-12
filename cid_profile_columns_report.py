@@ -152,6 +152,7 @@ ALIAS_COLUMN_PATTERN = re.compile(
     r'(?:"?([A-Za-z_][\w$]*)"?\.)"?([A-Za-z_][\w$]*)"?', re.IGNORECASE
 )
 BARE_IDENTIFIER_PATTERN = re.compile(r'"?([A-Za-z_][\w$]*)"?')
+STRING_LITERAL_PATTERN = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"")
 
 
 def contains_http(value: str) -> bool:
@@ -429,7 +430,8 @@ def extract_profile_columns(logic: str) -> List[str]:
                 local_found = True
 
         stripped_argument = ALIAS_COLUMN_PATTERN.sub(lambda m: m.group(2), md5_argument)
-        for ident in BARE_IDENTIFIER_PATTERN.findall(stripped_argument):
+        without_strings = STRING_LITERAL_PATTERN.sub(" ", stripped_argument)
+        for ident in BARE_IDENTIFIER_PATTERN.findall(without_strings):
             if not ident:
                 continue
             upper_ident = ident.upper()
@@ -445,7 +447,7 @@ def extract_profile_columns(logic: str) -> List[str]:
                 local_found = True
 
         if not local_found:
-            cleaned = " ".join(md5_argument.split())
+            cleaned = " ".join(STRING_LITERAL_PATTERN.sub(" ", md5_argument).split())
             if cleaned and cleaned not in seen and not contains_http(cleaned):
                 columns.append(cleaned)
                 seen.add(cleaned)
