@@ -227,27 +227,55 @@ def main() -> None:
         print("No MD5-based profile columns were found in any YAML file.")
         return
 
-    df = pd.DataFrame([asdict(row) for row in records])
-    df.rename(
+    md5_df = pd.DataFrame([asdict(row) for row in records])
+    md5_df.rename(
         columns={
             "profile_table": "profile table",
             "joining_key": "joining Key",
         },
         inplace=True,
     )
-    for column in ("profile table", "joining Key"):
-        if column not in df.columns:
-            df[column] = None
+    for column in OUTPUT_COLUMNS:
+        if column not in md5_df.columns:
+            md5_df[column] = None
+    md5_df["target_type_lower"] = md5_df["target_type"].str.lower()
 
-    df = df[OUTPUT_COLUMNS]
-    df.sort_values(["target_type", "tag", "cid_profile_column", "logic"], inplace=True)
-    df.drop_duplicates(subset=["target_type", "tag", "cid_profile_column"], keep="first", inplace=True)
+    profile_df = build_profile_metadata_dataframe(profile_map, now)
 
-    print(f"Writing {len(df)} rows to {output_path}")
-    df.to_excel(output_path, index=False)
+    merged_df = md5_df.merge(
+        profile_df,
+        how="outer",
+        on="target_type_lower",
+        suffixes=("", "_profile"),
+    )
+
+    merged_df["target_type"] = merged_df["target_type"].combine_first(
+        merged_df.get("target_type_profile")
+    )
+
+    for column in OUTPUT_COLUMNS:
+        profile_col = f"{column}_profile"
+        if profile_col in merged_df.columns:
+            merged_df[column] = merged_df[column].combine_first(merged_df[profile_col])
+            merged_df.drop(columns=profile_col, inplace=True)
+
+    merged_df.drop(columns=["target_type_profile"], inplace=True, errors="ignore")
+    merged_df.drop(columns=["target_type_lower"], inplace=True, errors="ignore")
+
+    merged_df["current_timestamp"] = merged_df["current_timestamp"].fillna(now)
+    merged_df["filepath"] = merged_df["filepath"].fillna(PROFILE_MAP_FILE_PATH)
+    merged_df["filename"] = merged_df["filename"].fillna(Path(PROFILE_MAP_FILE_PATH).name)
+
+    merged_df = merged_df.where(pd.notna(merged_df), None)
+    merged_df = merged_df[OUTPUT_COLUMNS]
+    merged_df.sort_values(["target_type", "tag", "cid_profile_column", "logic"], inplace=True)
+    merged_df.drop_duplicates(subset=["target_type", "tag", "cid_profile_column"], keep="first", inplace=True)
+
+    print(f"Writing {len(merged_df)} rows to {output_path}")
+    merged_df.to_excel(output_path, index=False)
 
     password = getpass.getpass("Enter password for DB user ds_rdsp_dev: ")
-    load_dataframe_to_greenplum(df, password)
+    load_dataframe_to_greenplum(merged_df, password)
     print(f"Data successfully loaded into {TARGET_TABLE_FQN}.")
 
 
@@ -300,6 +328,47 @@ def load_profile_table_mapping(project: Any, file_path: str, ref: str) -> Dict[s
                 info.joining_key = str(joining_key_val).strip()
 
     return mapping
+
+
+def build_profile_metadata_dataframe(
+    profile_map: Dict[str, ProfileInfo],
+    timestamp: datetime.datetime,
+) -> pd.DataFrame:
+    if not profile_map:
+        return pd.DataFrame(
+            columns=[
+                "target_type_lower",
+                "target_type",
+                "profile table",
+                "joining Key",
+                "tag",
+                "cid_profile_column",
+                "logic",
+                "current_timestamp",
+                "filepath",
+                "filename",
+            ]
+        )
+
+    records = []
+    map_filename = Path(PROFILE_MAP_FILE_PATH).name
+    for key, info in profile_map.items():
+        records.append(
+            {
+                "target_type_lower": key,
+                "target_type": info.target_type,
+                "profile table": info.profile_table,
+                "joining Key": info.joining_key,
+                "tag": None,
+                "cid_profile_column": None,
+                "logic": None,
+                "current_timestamp": timestamp,
+                "filepath": PROFILE_MAP_FILE_PATH,
+                "filename": map_filename,
+            }
+        )
+
+    return pd.DataFrame.from_records(records)
 
 
 def collect_profile_table_entries(node: Any) -> List[Dict[str, Any]]:
