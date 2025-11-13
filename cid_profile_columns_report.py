@@ -240,42 +240,46 @@ def main() -> None:
             md5_df[column] = None
     md5_df["target_type_lower"] = md5_df["target_type"].str.lower()
 
-    profile_df = build_profile_metadata_dataframe(profile_map, now)
+    profile_meta_df = build_profile_metadata_dataframe(profile_map)
 
-    merged_df = md5_df.merge(
-        profile_df,
-        how="outer",
-        on="target_type_lower",
-        suffixes=("", "_profile"),
-    )
+    if not profile_meta_df.empty:
+        md5_df = md5_df.merge(profile_meta_df, how="left", on="target_type_lower")
+        md5_df["target_type"] = md5_df["target_type"].combine_first(md5_df.pop("target_type_profile"))
+        md5_df["profile table"] = md5_df["profile table"].combine_first(md5_df.pop("profile_table_profile"))
+        md5_df["joining Key"] = md5_df["joining Key"].combine_first(md5_df.pop("joining_key_profile"))
 
-    merged_df["target_type"] = merged_df["target_type"].combine_first(
-        merged_df.get("target_type_profile")
-    )
+        md5_keys = set(md5_df["target_type_lower"].dropna())
+        missing_meta = profile_meta_df[
+            ~profile_meta_df["target_type_lower"].isin(md5_keys)
+        ]
+        if not missing_meta.empty:
+            append_df = pd.DataFrame(
+                {
+                    "target_type": missing_meta["target_type_profile"],
+                    "tag": None,
+                    "cid_profile_column": None,
+                    "logic": None,
+                    "current_timestamp": now,
+                    "filepath": PROFILE_MAP_FILE_PATH,
+                    "filename": Path(PROFILE_MAP_FILE_PATH).name,
+                    "profile table": missing_meta["profile_table_profile"],
+                    "joining Key": missing_meta["joining_key_profile"],
+                    "target_type_lower": missing_meta["target_type_lower"],
+                }
+            )
+            md5_df = pd.concat([md5_df, append_df], ignore_index=True)
 
-    for column in OUTPUT_COLUMNS:
-        profile_col = f"{column}_profile"
-        if profile_col in merged_df.columns:
-            merged_df[column] = merged_df[column].combine_first(merged_df[profile_col])
-            merged_df.drop(columns=profile_col, inplace=True)
+    md5_df.drop(columns=["target_type_lower"], inplace=True)
+    md5_df = md5_df.where(pd.notna(md5_df), None)
+    md5_df = md5_df[OUTPUT_COLUMNS]
+    md5_df.sort_values(["target_type", "tag", "cid_profile_column", "logic"], inplace=True)
+    md5_df.drop_duplicates(subset=["target_type", "tag", "cid_profile_column"], keep="first", inplace=True)
 
-    merged_df.drop(columns=["target_type_profile"], inplace=True, errors="ignore")
-    merged_df.drop(columns=["target_type_lower"], inplace=True, errors="ignore")
-
-    merged_df["current_timestamp"] = merged_df["current_timestamp"].fillna(now)
-    merged_df["filepath"] = merged_df["filepath"].fillna(PROFILE_MAP_FILE_PATH)
-    merged_df["filename"] = merged_df["filename"].fillna(Path(PROFILE_MAP_FILE_PATH).name)
-
-    merged_df = merged_df.where(pd.notna(merged_df), None)
-    merged_df = merged_df[OUTPUT_COLUMNS]
-    merged_df.sort_values(["target_type", "tag", "cid_profile_column", "logic"], inplace=True)
-    merged_df.drop_duplicates(subset=["target_type", "tag", "cid_profile_column"], keep="first", inplace=True)
-
-    print(f"Writing {len(merged_df)} rows to {output_path}")
-    merged_df.to_excel(output_path, index=False)
+    print(f"Writing {len(md5_df)} rows to {output_path}")
+    md5_df.to_excel(output_path, index=False)
 
     password = getpass.getpass("Enter password for DB user ds_rdsp_dev: ")
-    load_dataframe_to_greenplum(merged_df, password)
+    load_dataframe_to_greenplum(md5_df, password)
     print(f"Data successfully loaded into {TARGET_TABLE_FQN}.")
 
 
@@ -330,41 +334,25 @@ def load_profile_table_mapping(project: Any, file_path: str, ref: str) -> Dict[s
     return mapping
 
 
-def build_profile_metadata_dataframe(
-    profile_map: Dict[str, ProfileInfo],
-    timestamp: datetime.datetime,
-) -> pd.DataFrame:
+def build_profile_metadata_dataframe(profile_map: Dict[str, ProfileInfo]) -> pd.DataFrame:
     if not profile_map:
         return pd.DataFrame(
             columns=[
                 "target_type_lower",
-                "target_type",
-                "profile table",
-                "joining Key",
-                "tag",
-                "cid_profile_column",
-                "logic",
-                "current_timestamp",
-                "filepath",
-                "filename",
+                "target_type_profile",
+                "profile_table_profile",
+                "joining_key_profile",
             ]
         )
 
     records = []
-    map_filename = Path(PROFILE_MAP_FILE_PATH).name
     for key, info in profile_map.items():
         records.append(
             {
                 "target_type_lower": key,
-                "target_type": info.target_type,
-                "profile table": info.profile_table,
-                "joining Key": info.joining_key,
-                "tag": None,
-                "cid_profile_column": None,
-                "logic": None,
-                "current_timestamp": timestamp,
-                "filepath": PROFILE_MAP_FILE_PATH,
-                "filename": map_filename,
+                "target_type_profile": info.target_type,
+                "profile_table_profile": info.profile_table,
+                "joining_key_profile": info.joining_key,
             }
         )
 
