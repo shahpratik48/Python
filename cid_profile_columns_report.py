@@ -149,7 +149,7 @@ SQL_KEYWORDS = {
 
 
 ALIAS_COLUMN_PATTERN = re.compile(
-    r'(?:"?([A-Za-z_][\w$]*)"?\.)"?([A-Za-z_][\w$]*)"?', re.IGNORECASE
+    r'(?:"?([A-Za-z_][\w$]*)"?\.)?"?([A-Za-z_][\w$]*)"?', re.IGNORECASE
 )
 BARE_IDENTIFIER_PATTERN = re.compile(r'"?([A-Za-z_][\w$]*)"?')
 STRING_LITERAL_PATTERN = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"")
@@ -461,11 +461,13 @@ def extract_profile_columns(logic: str) -> List[str]:
     for md5_argument in extract_md5_arguments(logic):
         local_found = False
         alias_matches = extract_alias_columns(md5_argument)
-        alias_names = {
-            normalize_column_name(alias)
-            for alias, _ in alias_matches
-            if alias is not None and normalize_column_name(alias)
-        }
+        alias_names: set[str] = set()
+        for alias, _ in alias_matches:
+            if alias is None:
+                continue
+            normalized_alias = normalize_column_name(alias)
+            if normalized_alias:
+                alias_names.add(normalized_alias)
 
         for alias, col in alias_matches:
             normalized = normalize_column_name(col)
@@ -474,6 +476,8 @@ def extract_profile_columns(logic: str) -> List[str]:
             if is_url_token(normalized):
                 continue
             if normalized in alias_names:
+                continue
+            if normalized.upper() in SQL_KEYWORDS:
                 continue
             columns.append(normalized)
             seen.add(normalized)
@@ -521,7 +525,7 @@ def extract_profile_columns(logic: str) -> List[str]:
 
             if not fallback_added:
                 cleaned = normalize_column_name(" ".join(cleaned_expr.split()))
-                if cleaned and cleaned not in seen and not is_url_token(cleaned):
+                if cleaned and cleaned not in seen and not is_url_token(cleaned) and cleaned.upper() not in SQL_KEYWORDS:
                     columns.append(cleaned)
                     seen.add(cleaned)
 
