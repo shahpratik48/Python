@@ -255,7 +255,15 @@ def main() -> None:
     md5_df["filename"] = md5_df["filename"].fillna(Path(PROFILE_MAP_FILE_PATH).name)
 
     md5_df.drop(columns=["target_type_lower"], inplace=True)
-    md5_df = md5_df.where(pd.notna(md5_df), None)
+
+    for column in md5_df.columns:
+        if column == "current_timestamp":
+            continue
+        md5_df[column] = md5_df[column].where(md5_df[column].notna(), None)
+
+    md5_df["current_timestamp"] = md5_df["current_timestamp"].apply(
+        lambda ts: ts.to_pydatetime() if isinstance(ts, pd.Timestamp) else (now if ts is None else ts)
+    )
     md5_df = md5_df[OUTPUT_COLUMNS]
     md5_df.sort_values(["target_type", "tag", "cid_profile_column", "logic"], inplace=True)
     md5_df.drop_duplicates(subset=["target_type", "tag", "cid_profile_column"], keep="first", inplace=True)
