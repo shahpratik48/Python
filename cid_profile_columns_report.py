@@ -8,8 +8,8 @@ Steps performed:
 2. Parse each YAML document looking for expressions that contain MD5 logic while
    ignoring HTTP/HTTPS URL fragments when determining profile columns. Extract the
    associated target_type, tag, logic, and the profile columns referenced inside each
-   MD5 expression, then left-join the results with the profile map metadata (profile
-   table and joining key), leaving those fields blank when no mapping exists.
+   MD5 expression, and enrich each row with profile table metadata when available,
+   leaving those fields blank when no mapping exists.
 3. Persist the extracted metadata to an XLSX report file named with the current
    timestamp.
 4. Load the XLSX content into the Greenplum table
@@ -176,6 +176,8 @@ class Row:
     current_timestamp: datetime.datetime
     filepath: str
     filename: str
+    profile_table: str | None = None
+    joining_key: str | None = None
 
 
 def main() -> None:
@@ -217,6 +219,7 @@ def main() -> None:
                 target_type=target_type,
                 filepath=file_path,
                 current_timestamp=now,
+                profile_info_map=profile_map,
             )
             records.extend(extracted)
 
@@ -225,17 +228,16 @@ def main() -> None:
         return
 
     df = pd.DataFrame([asdict(row) for row in records])
-    df["target_type_key"] = df["target_type"].str.lower()
-
-    profile_df = build_profile_metadata_dataframe(profile_map)
-    df = df.merge(profile_df, how="left", on="target_type_key", copy=False)
-    df.drop(columns=["target_type_key"], inplace=True)
-
+    df.rename(
+        columns={
+            "profile_table": "profile table",
+            "joining_key": "joining Key",
+        },
+        inplace=True,
+    )
     for column in ("profile table", "joining Key"):
         if column not in df.columns:
             df[column] = None
-        else:
-            df[column] = df[column].where(df[column].notna(), None)
 
     df = df[OUTPUT_COLUMNS]
     df.sort_values(["target_type", "tag", "cid_profile_column", "logic"], inplace=True)
@@ -300,23 +302,6 @@ def load_profile_table_mapping(project: Any, file_path: str, ref: str) -> Dict[s
     return mapping
 
 
-def build_profile_metadata_dataframe(profile_map: Dict[str, ProfileInfo]) -> pd.DataFrame:
-    if not profile_map:
-        return pd.DataFrame(columns=["target_type_key", "profile table", "joining Key"])
-
-    records = []
-    for key, info in profile_map.items():
-        records.append(
-            {
-                "target_type_key": key,
-                "profile table": info.profile_table,
-                "joining Key": info.joining_key,
-            }
-        )
-
-    return pd.DataFrame.from_records(records)
-
-
 def collect_profile_table_entries(node: Any) -> List[Dict[str, Any]]:
     entries: List[Dict[str, Any]] = []
 
@@ -379,8 +364,12 @@ def extract_md5_rows(
     target_type: str,
     filepath: str,
     current_timestamp: datetime.datetime,
+    profile_info_map: Dict[str, ProfileInfo],
 ) -> List[Row]:
     rows: List[Row] = []
+    info = profile_info_map.get(target_type.lower())
+    profile_table = info.profile_table if info else None
+    joining_key = info.joining_key if info else None
 
     def walker(node: Any, parent_keys: Sequence[str]) -> None:
         if isinstance(node, dict):
@@ -402,6 +391,8 @@ def extract_md5_rows(
                         current_timestamp=current_timestamp,
                         filepath=filepath,
                         filename=os.path.basename(filepath),
+                        profile_table=profile_table,
+                        joining_key=joining_key,
                     )
                 )
 
