@@ -155,9 +155,9 @@ BARE_IDENTIFIER_PATTERN = re.compile(r'"?([A-Za-z_][\w$]*)"?')
 STRING_LITERAL_PATTERN = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"")
 
 
-def contains_http(value: str) -> bool:
+def is_url_token(value: str) -> bool:
     lowered = value.lower()
-    return "http://" in lowered or "https://" in lowered
+    return lowered in {"http", "https"} or lowered.startswith("http://") or lowered.startswith("https://")
 
 
 @dataclass
@@ -248,8 +248,8 @@ def main() -> None:
         inplace=True,
     )
     df = df[OUTPUT_COLUMNS]
-    df.sort_values(["target_type", "tag", "cid_profile_column"], inplace=True)
-    df.drop_duplicates(inplace=True)
+    df.sort_values(["target_type", "tag", "cid_profile_column", "logic"], inplace=True)
+    df.drop_duplicates(subset=["target_type", "tag", "cid_profile_column"], keep="first", inplace=True)
 
     print(f"Writing {len(df)} rows to {output_path}")
     df.to_excel(output_path, index=False)
@@ -423,7 +423,7 @@ def extract_profile_columns(logic: str) -> List[str]:
         alias_cols = extract_alias_columns(md5_argument)
         for col in alias_cols:
             if col not in seen:
-                if contains_http(col):
+                if is_url_token(col):
                     continue
                 columns.append(col)
                 seen.add(col)
@@ -439,7 +439,7 @@ def extract_profile_columns(logic: str) -> List[str]:
                 continue
             if ident.isdigit():
                 continue
-            if contains_http(ident):
+            if is_url_token(ident):
                 continue
             if ident not in seen:
                 columns.append(ident)
@@ -448,7 +448,7 @@ def extract_profile_columns(logic: str) -> List[str]:
 
         if not local_found:
             cleaned = " ".join(STRING_LITERAL_PATTERN.sub(" ", md5_argument).split())
-            if cleaned and cleaned not in seen and not contains_http(cleaned):
+            if cleaned and cleaned not in seen and not is_url_token(cleaned):
                 columns.append(cleaned)
                 seen.add(cleaned)
 
