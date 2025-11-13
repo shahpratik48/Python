@@ -160,6 +160,15 @@ def is_url_token(value: str) -> bool:
     return lowered in {"http", "https"} or lowered.startswith("http://") or lowered.startswith("https://")
 
 
+def normalize_column_name(name: str) -> str:
+    if name is None:
+        return ""
+    cleaned = name.strip().strip('"')
+    if "." in cleaned:
+        cleaned = cleaned.split(".")[-1]
+    return cleaned.strip('"')
+
+
 @dataclass
 class ProfileInfo:
     target_type: str
@@ -471,28 +480,33 @@ def extract_profile_columns(logic: str) -> List[str]:
         local_found = False
         alias_cols = extract_alias_columns(md5_argument)
         for col in alias_cols:
-            if col not in seen:
-                if is_url_token(col):
-                    continue
-                columns.append(col)
-                seen.add(col)
-                local_found = True
+            normalized = normalize_column_name(col)
+            if not normalized or normalized in seen:
+                continue
+            if is_url_token(normalized):
+                continue
+            columns.append(normalized)
+            seen.add(normalized)
+            local_found = True
 
         stripped_argument = ALIAS_COLUMN_PATTERN.sub(lambda m: m.group(2), md5_argument)
         without_strings = STRING_LITERAL_PATTERN.sub(" ", stripped_argument)
         for ident in BARE_IDENTIFIER_PATTERN.findall(without_strings):
             if not ident:
                 continue
-            upper_ident = ident.upper()
+            normalized = normalize_column_name(ident)
+            if not normalized:
+                continue
+            upper_ident = normalized.upper()
             if upper_ident in SQL_KEYWORDS:
                 continue
-            if ident.isdigit():
+            if normalized.isdigit():
                 continue
-            if is_url_token(ident):
+            if is_url_token(normalized):
                 continue
-            if ident not in seen:
-                columns.append(ident)
-                seen.add(ident)
+            if normalized not in seen:
+                columns.append(normalized)
+                seen.add(normalized)
                 local_found = True
 
         if not local_found:
