@@ -417,9 +417,6 @@ def extract_md5_rows(
     profile_info_map: Dict[str, ProfileInfo],
 ) -> List[Row]:
     rows: List[Row] = []
-    info = profile_info_map.get(target_type.lower())
-    profile_table = info.profile_table if info else None
-    joining_key = info.joining_key if info else None
 
     def walker(node: Any, parent_keys: Sequence[str]) -> None:
         if isinstance(node, dict):
@@ -432,19 +429,20 @@ def extract_md5_rows(
             tag = determine_tag(parent_keys)
             logic = node.strip()
             for column in extract_profile_columns(logic):
-                rows.append(
-                    Row(
-                        target_type=target_type,
-                        tag=tag,
-                        cid_profile_column=column,
-                        logic=logic,
-                        current_timestamp=current_timestamp,
-                        filepath=filepath,
-                        filename=os.path.basename(filepath),
-                        profile_table=profile_table,
-                        joining_key=joining_key,
-                    )
+                row_kwargs = dict(
+                    target_type=target_type,
+                    tag=tag,
+                    cid_profile_column=column,
+                    logic=logic,
+                    current_timestamp=current_timestamp,
+                    filepath=filepath,
+                    filename=os.path.basename(filepath),
                 )
+                info = profile_info_map.get(target_type.lower())
+                if info:
+                    row_kwargs["profile_table"] = info.profile_table
+                    row_kwargs["joining_key"] = info.joining_key
+                rows.append(Row(**row_kwargs))
 
     walker(document, [])
     return rows
