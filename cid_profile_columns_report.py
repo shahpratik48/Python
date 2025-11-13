@@ -8,8 +8,8 @@ Steps performed:
 2. Parse each YAML document looking for expressions that contain MD5 logic while
    ignoring HTTP/HTTPS URL fragments when determining profile columns. Extract the
    associated target_type, tag, logic, and the profile columns referenced inside each
-   MD5 expression, and enrich each row with profile table metadata when available,
-   leaving those fields blank when no mapping exists.
+   MD5 expression (normalizing away table aliases), and enrich each row with profile
+   table metadata when available, leaving those fields blank when no mapping exists.
 3. Persist the extracted metadata to an XLSX report file named with the current
    timestamp.
 4. Load the XLSX content into the Greenplum table
@@ -17,7 +17,7 @@ Steps performed:
    existing data.
 
 The output columns are:
-    target_type, profile table, joining Key, tag, cid_profile_column, logic,
+    target_type, profile_table, joining_key, tag, cid_profile_column, logic,
     current_timestamp, filepath, filename
 """
 
@@ -59,8 +59,8 @@ TARGET_TABLE_FQN = f"{TARGET_SCHEMA}.{TARGET_TABLE}"
 
 OUTPUT_COLUMNS = [
     "target_type",
-    "profile table",
-    "joining Key",
+    "profile_table",
+    "joining_key",
     "tag",
     "cid_profile_column",
     "logic",
@@ -163,10 +163,10 @@ def is_url_token(value: str) -> bool:
 def normalize_column_name(name: str) -> str:
     if name is None:
         return ""
-    cleaned = name.strip().strip('"')
+    cleaned = name.strip().strip('"').strip("'")
     if "." in cleaned:
         cleaned = cleaned.split(".")[-1]
-    return cleaned.strip('"')
+    return cleaned.strip('"').strip("'")
 
 
 @dataclass
@@ -237,13 +237,6 @@ def main() -> None:
         return
 
     md5_df = pd.DataFrame([asdict(row) for row in records])
-    md5_df.rename(
-        columns={
-            "profile_table": "profile table",
-            "joining_key": "joining Key",
-        },
-        inplace=True,
-    )
     for column in OUTPUT_COLUMNS:
         if column not in md5_df.columns:
             md5_df[column] = None
@@ -254,8 +247,8 @@ def main() -> None:
     if not profile_meta_df.empty:
         md5_df = md5_df.merge(profile_meta_df, how="left", on="target_type_lower")
         md5_df["target_type"] = md5_df["target_type"].combine_first(md5_df.pop("target_type_profile"))
-        md5_df["profile table"] = md5_df["profile table"].combine_first(md5_df.pop("profile_table_profile"))
-        md5_df["joining Key"] = md5_df["joining Key"].combine_first(md5_df.pop("joining_key_profile"))
+        md5_df["profile_table"] = md5_df["profile_table"].combine_first(md5_df.pop("profile_table_profile"))
+        md5_df["joining_key"] = md5_df["joining_key"].combine_first(md5_df.pop("joining_key_profile"))
 
         md5_keys = set(md5_df["target_type_lower"].dropna())
         missing_meta = profile_meta_df[
@@ -271,8 +264,8 @@ def main() -> None:
                     "current_timestamp": now,
                     "filepath": PROFILE_MAP_FILE_PATH,
                     "filename": Path(PROFILE_MAP_FILE_PATH).name,
-                    "profile table": missing_meta["profile_table_profile"],
-                    "joining Key": missing_meta["joining_key_profile"],
+                    "profile_table": missing_meta["profile_table_profile"],
+                    "joining_key": missing_meta["joining_key_profile"],
                     "target_type_lower": missing_meta["target_type_lower"],
                 }
             )
@@ -510,10 +503,26 @@ def extract_profile_columns(logic: str) -> List[str]:
                 local_found = True
 
         if not local_found:
-            cleaned = " ".join(STRING_LITERAL_PATTERN.sub(" ", md5_argument).split())
-            if cleaned and cleaned not in seen and not is_url_token(cleaned):
-                columns.append(cleaned)
-                seen.add(cleaned)
+            cleaned_expr = STRING_LITERAL_PATTERN.sub(" ", md5_argument)
+            fallback_added = False
+            for ident in BARE_IDENTIFIER_PATTERN.findall(cleaned_expr):
+                if not ident:
+                    continue
+                normalized = normalize_column_name(ident)
+                if not normalized or normalized in seen:
+                    continue
+                upper_ident = normalized.upper()
+                if upper_ident in SQL_KEYWORDS or normalized.isdigit() or is_url_token(normalized):
+                    continue
+                columns.append(normalized)
+                seen.add(normalized)
+                fallback_added = True
+
+            if not fallback_added:
+                cleaned = normalize_column_name(" ".join(cleaned_expr.split()))
+                if cleaned and cleaned not in seen and not is_url_token(cleaned):
+                    columns.append(cleaned)
+                    seen.add(cleaned)
 
     return columns
 
