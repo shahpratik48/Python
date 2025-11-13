@@ -245,31 +245,10 @@ def main() -> None:
     profile_meta_df = build_profile_metadata_dataframe(profile_map)
 
     if not profile_meta_df.empty:
-        md5_df = md5_df.merge(profile_meta_df, how="left", on="target_type_lower")
+        md5_df = md5_df.merge(profile_meta_df, how="outer", on="target_type_lower")
         md5_df["target_type"] = md5_df["target_type"].combine_first(md5_df.pop("target_type_profile"))
         md5_df["profile_table"] = md5_df["profile_table"].combine_first(md5_df.pop("profile_table_profile"))
         md5_df["joining_key"] = md5_df["joining_key"].combine_first(md5_df.pop("joining_key_profile"))
-
-        md5_keys = set(md5_df["target_type_lower"].dropna())
-        missing_meta = profile_meta_df[
-            ~profile_meta_df["target_type_lower"].isin(md5_keys)
-        ]
-        if not missing_meta.empty:
-            append_df = pd.DataFrame(
-                {
-                    "target_type": missing_meta["target_type_profile"],
-                    "tag": None,
-                    "cid_profile_column": None,
-                    "logic": None,
-                    "current_timestamp": now,
-                    "filepath": PROFILE_MAP_FILE_PATH,
-                    "filename": Path(PROFILE_MAP_FILE_PATH).name,
-                    "profile_table": missing_meta["profile_table_profile"],
-                    "joining_key": missing_meta["joining_key_profile"],
-                    "target_type_lower": missing_meta["target_type_lower"],
-                }
-            )
-            md5_df = pd.concat([md5_df, append_df], ignore_index=True)
 
     md5_df.drop(columns=["target_type_lower"], inplace=True)
     md5_df = md5_df.where(pd.notna(md5_df), None)
