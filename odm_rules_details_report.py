@@ -48,7 +48,7 @@ REPORT_COLUMNS: Sequence[str] = (
     "insight_category",
     "insight_att_name",
     "insight_att_val",
-    "profile_column",
+    "rule_column",
     "logic",
     "file_path",
     "dependency",
@@ -95,6 +95,14 @@ def normalize_value(column_name: str, value: str) -> str:
         if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
             text = text[1:-1].strip()
     return text
+
+
+def normalize_report_column_name(column_name: str) -> str:
+    """Normalize report column names to match expected output schema."""
+    normalized = (column_name or "").strip().lower()
+    if normalized == "profile_column":
+        return "rule_column"
+    return normalized
 
 
 def strip_quotes(value: str) -> str:
@@ -325,7 +333,7 @@ def build_rows_from_values(
     source_file: str,
 ) -> List[ParsedRow]:
     """Align column names and row values, trimming and normalizing for the report."""
-    normalized_columns = [col.lower() for col in target_columns]
+    normalized_columns = [normalize_report_column_name(col) for col in target_columns]
     missing = [
         col for col in REPORT_COLUMNS
         if col not in normalized_columns and col not in {"logic", "file_path"}
@@ -342,9 +350,9 @@ def build_rows_from_values(
     for values in value_rows:
         row_map: Dict[str, str] = {}
         for idx, col in enumerate(target_columns):
-            lower_col = col.lower()
+            normalized_col = normalize_report_column_name(col)
             raw_value = values[idx] if idx < len(values) else ""
-            row_map[lower_col] = normalize_value(lower_col, raw_value)
+            row_map[normalized_col] = normalize_value(normalized_col, raw_value)
 
         report_data = {column: row_map.get(column, "") for column in REPORT_COLUMNS}
         report_data["logic"] = logic_sql.strip()
@@ -585,7 +593,7 @@ def build_rows_from_select(
     cte_map: Dict[str, exp.Expression],
 ) -> List[ParsedRow]:
     """Extract report rows from an INSERT ... SELECT statement."""
-    normalized_columns = [col.lower() for col in target_columns]
+    normalized_columns = [normalize_report_column_name(col) for col in target_columns]
     select_items = expand_select_expressions(
         select_expression,
         placeholder_map,
@@ -599,7 +607,8 @@ def build_rows_from_select(
 
     alias_map: Dict[str, List[exp.Expression]] = {}
     for expr in select_items:
-        key = (expr.alias_or_name or "").replace('"', "").strip().lower()
+        raw_key = (expr.alias_or_name or "").replace('"', "").strip()
+        key = normalize_report_column_name(raw_key)
         if key:
             value_expr = expr.this if isinstance(expr, exp.Alias) else expr
             alias_map.setdefault(key, []).append(value_expr)
@@ -627,7 +636,7 @@ def build_rows_from_select(
 
     parsed_rows: List[ParsedRow] = []
 
-    target_profile_columns = profile_columns or [""]
+    target_rule_columns = profile_columns or [""]
     value_combinations = extract_value_combinations(select_expression, placeholder_map)
 
     if len(select_items) < len(target_columns):
@@ -644,11 +653,17 @@ def build_rows_from_select(
             raw_value = evaluate_select_expression(expr, combination, placeholder_map)
             row_base[column_name] = normalize_value(column_name, raw_value)
 
-        for profile_column in target_profile_columns:
+        for rule_column in target_rule_columns:
             row_data = row_base.copy()
-            row_data["profile_column"] = profile_column
+            row_data["rule_column"] = rule_column
             row_data["logic"] = where_logic
-            row_data["dependency"] = dependency_text
+            insight_key = normalize_insight_type_key(row_data.get("insight_type", ""))
+            filtered_dependencies = [
+                value
+                for value in dependency_values
+                if normalize_insight_type_key(value) != insight_key and value
+            ]
+            row_data["dependency"] = ", ".join(filtered_dependencies)
             row_data["profile_table"] = normalize_profile_table_value(row_data.get("profile_table", ""))
             report_data = {column: row_data.get(column, "") for column in REPORT_COLUMNS}
             parsed_rows.append(
@@ -1071,7 +1086,7 @@ def upload_dataframe_to_db(df: pd.DataFrame, db_password: str) -> None:
         "password": db_password,
     }
 
-    table_fqn = "sandbox_prj_smart_insights.odm_rule_details_auto_task"
+    table_fqn = "sandbox_prj_smart_insights.odm_rule_metadata_auto_refresh"
     owner_role = "erd_gpdb_prj_smart_insights"
     reader_role = "erd_gpdb_prj_smart_insights_ro"
 
