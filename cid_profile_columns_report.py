@@ -471,12 +471,20 @@ def extract_profile_columns(logic: str) -> List[str]:
     seen: set[str] = set()
     for md5_argument in extract_md5_arguments(logic):
         local_found = False
-        alias_cols = extract_alias_columns(md5_argument)
-        for col in alias_cols:
+        alias_matches = extract_alias_columns(md5_argument)
+        alias_names = {
+            normalize_column_name(alias)
+            for alias, _ in alias_matches
+            if alias is not None and normalize_column_name(alias)
+        }
+
+        for alias, col in alias_matches:
             normalized = normalize_column_name(col)
             if not normalized or normalized in seen:
                 continue
             if is_url_token(normalized):
+                continue
+            if normalized in alias_names:
                 continue
             columns.append(normalized)
             seen.add(normalized)
@@ -489,6 +497,8 @@ def extract_profile_columns(logic: str) -> List[str]:
                 continue
             normalized = normalize_column_name(ident)
             if not normalized:
+                continue
+            if normalized in alias_names:
                 continue
             upper_ident = normalized.upper()
             if upper_ident in SQL_KEYWORDS:
@@ -510,6 +520,8 @@ def extract_profile_columns(logic: str) -> List[str]:
                     continue
                 normalized = normalize_column_name(ident)
                 if not normalized or normalized in seen:
+                    continue
+                if normalized in alias_names:
                     continue
                 upper_ident = normalized.upper()
                 if upper_ident in SQL_KEYWORDS or normalized.isdigit() or is_url_token(normalized):
@@ -554,11 +566,11 @@ def extract_md5_arguments(logic: str) -> List[str]:
     return arguments
 
 
-def extract_alias_columns(md5_argument: str) -> List[str]:
-    columns: List[str] = []
-    for _, column in ALIAS_COLUMN_PATTERN.findall(md5_argument):
-        columns.append(column)
-    return columns
+def extract_alias_columns(md5_argument: str) -> List[tuple[str | None, str]]:
+    matches: List[tuple[str | None, str]] = []
+    for alias, column in ALIAS_COLUMN_PATTERN.findall(md5_argument):
+        matches.append((alias or None, column))
+    return matches
 
 
 def load_dataframe_to_greenplum(df: pd.DataFrame, password: str) -> None:
