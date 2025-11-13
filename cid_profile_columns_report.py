@@ -250,6 +250,10 @@ def main() -> None:
         md5_df["profile_table"] = md5_df["profile_table"].combine_first(md5_df.pop("profile_table_profile"))
         md5_df["joining_key"] = md5_df["joining_key"].combine_first(md5_df.pop("joining_key_profile"))
 
+    md5_df["current_timestamp"] = md5_df["current_timestamp"].fillna(now)
+    md5_df["filepath"] = md5_df["filepath"].fillna(PROFILE_MAP_FILE_PATH)
+    md5_df["filename"] = md5_df["filename"].fillna(Path(PROFILE_MAP_FILE_PATH).name)
+
     md5_df.drop(columns=["target_type_lower"], inplace=True)
     md5_df = md5_df.where(pd.notna(md5_df), None)
     md5_df = md5_df[OUTPUT_COLUMNS]
