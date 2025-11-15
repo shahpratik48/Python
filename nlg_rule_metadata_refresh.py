@@ -454,9 +454,7 @@ def main() -> None:
                 before_dedupe - len(merged_df),
                 len(merged_df),
             )
-        final_ts = pd.Timestamp.now()
-        if final_ts.tzinfo is not None:
-            final_ts = final_ts.tz_convert(None)
+        final_ts = pd.Timestamp.now(tz=None).to_pydatetime()
         merged_df[CURRENT_TS_COLUMN] = final_ts
         output_path = materialize_xlsx(merged_df, timestamp_str)
         logger.info("Report available at %s", output_path)
