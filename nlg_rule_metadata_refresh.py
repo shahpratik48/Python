@@ -17,6 +17,7 @@ Steps
 from __future__ import annotations
 
 import base64
+import logging
 import getpass
 import json
 import re
@@ -29,6 +30,11 @@ import pandas as pd
 import psycopg2
 import yaml
 from psycopg2.extras import execute_values
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+)
 
 # --------------------------------------------------------------------------------------
 # GitLab repo configuration
@@ -72,6 +78,8 @@ OVERRIDES = {
     "fl_recruitment": ("fl_rec_profile_curr_ikg", "fl_rec_profile_key"),
     "fl_ubs_fa": ("fl_fa_profile_curr_ikg", "f1_fa_profile_key"),
 }
+
+logger = logging.getLogger(__name__)
 
 
 def prompt_token(prompt: str) -> str:
@@ -156,16 +164,19 @@ def build_profile_dataframe(project: gitlab.v4.objects.Project) -> pd.DataFrame:
         raise ValueError(f"No profile metadata extracted from {profile_path}.")
     df = pd.DataFrame(rows)
     df["target_type"] = df["target_type"].str.strip().str.lower()
+    logger.info("Loaded %s profile rows from %s", len(df), profile_path)
     return df
 
 
 def gather_rule_files(project: gitlab.v4.objects.Project) -> List[Dict[str, Any]]:
     tree = project.repository_tree(path=PATH_RULES, ref=BRANCH, recursive=True, get_all=True)
-    return [
+    files = [
         node
         for node in tree
         if node.get("type") == "blob" and Path(node["path"]).suffix.lower() in RULE_FILE_EXTS
     ]
+    logger.info("Discovered %s candidate rule files under %s", len(files), PATH_RULES)
+    return files
 
 
 def safe_yaml_load(text: str) -> Any:
@@ -222,6 +233,7 @@ def extract_rule_tags(node: Any) -> List[Tuple[str, str]]:
 def build_rules_dataframe(project: gitlab.v4.objects.Project, run_ts: pd.Timestamp) -> pd.DataFrame:
     records: List[Dict[str, Any]] = []
     files = gather_rule_files(project)
+    logger.info("Scanning %s rule files for tag definitions", len(files))
     for node in files:
         path = node["path"]
         relative = path[len(PATH_RULES) + 1 :]
@@ -249,9 +261,12 @@ def build_rules_dataframe(project: gitlab.v4.objects.Project, run_ts: pd.Timesta
             )
 
     if records:
-        return pd.DataFrame(records)
+        df = pd.DataFrame(records)
+        logger.info("Extracted %s rule tag rows", len(df))
+        return df
 
     # Ensure downstream merge still works by returning an empty frame with expected columns.
+    logger.info("No rule tag rows extracted; returning empty DataFrame")
     return pd.DataFrame(
         columns=[
             "target_type",
@@ -267,6 +282,7 @@ def build_rules_dataframe(project: gitlab.v4.objects.Project, run_ts: pd.Timesta
 
 def merge_datasets(profile_df: pd.DataFrame, rules_df: pd.DataFrame) -> pd.DataFrame:
     merged = profile_df.merge(rules_df, on="target_type", how="outer")
+    logger.info("Merged dataset contains %s rows", len(merged))
     return merged
 
 
@@ -277,11 +293,18 @@ def apply_overrides(df: pd.DataFrame) -> None:
         mask = df["target_type"].str.lower() == target
         df.loc[mask, "profile_table"] = profile_tbl
         df.loc[mask, "joining_key"] = join_key
+        if mask.any():
+            logger.info(
+                "Applied override for target_type '%s' (%s rows)",
+                target,
+                int(mask.sum()),
+            )
 
 
 def materialize_xlsx(df: pd.DataFrame, timestamp: str) -> Path:
     output_file = OUTPUT_TEMPLATE.format(timestamp=timestamp)
     output_path = Path(output_file).resolve()
+    logger.info("Writing XLSX report to %s", output_path)
     df.to_excel(output_path, index=False)
     return output_path
 
@@ -306,6 +329,12 @@ def refresh_greenplum_table(df: pd.DataFrame, db_password: str) -> None:
     connect_kwargs = {k: v for k, v in DB_CONFIG.items() if k in {"host", "port", "dbname", "user"}}
     connect_kwargs["password"] = db_password
 
+    logger.info(
+        "Refreshing %s.%s with %s records",
+        schema,
+        table,
+        len(payload),
+    )
     ddl = f"DROP TABLE IF EXISTS {schema}.{table};"
     create = f"""
         CREATE TABLE {schema}.{table} (
@@ -333,12 +362,16 @@ def refresh_greenplum_table(df: pd.DataFrame, db_password: str) -> None:
                 execute_values(cur, insert_sql, payload)
             cur.execute(owner)
             cur.execute(grant)
+    logger.info("Greenplum table %s.%s refreshed successfully", schema, table)
 
 
 def main() -> None:
     try:
+        logger.info("Starting NLG rule metadata refresh run")
         token = prompt_token("Enter your private token: ")
+        logger.info("Authenticating to GitLab project %s", NLG_PROJECT_PATH)
         project = gitlab_project(token)
+        logger.info("Authenticated to GitLab project %s", NLG_PROJECT_PATH)
 
         run_ts = pd.Timestamp.utcnow()
         timestamp_str = run_ts.strftime(TIMESTAMP_FMT)
@@ -353,18 +386,22 @@ def main() -> None:
 
         apply_overrides(merged_df)
         output_path = materialize_xlsx(merged_df, timestamp_str)
-
-        print(f"Wrote report: {output_path}")
+        logger.info("Report available at %s", output_path)
 
         db_password = prompt_token("Enter Password for DB User: ")
+        logger.info(
+            "Refreshing Greenplum table using user '%s' on host '%s'",
+            DB_CONFIG["user"],
+            DB_CONFIG["host"],
+        )
         refresh_greenplum_table(merged_df, db_password)
 
-        print(
-            f"Table {DB_CONFIG['schema']}.{DB_CONFIG['table']} refreshed successfully "
-            f"({len(merged_df)} rows)."
+        logger.info(
+            "Run finished successfully with %s merged rows",
+            len(merged_df),
         )
     except Exception as exc:  # noqa: BLE001
-        print(f"Error: {exc}", file=sys.stderr)
+        logger.exception("Run failed: %s", exc)
         sys.exit(1)
 
 
