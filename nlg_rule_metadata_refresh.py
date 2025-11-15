@@ -30,6 +30,7 @@ import gitlab
 import pandas as pd
 import psycopg2
 import yaml
+from pandas.api.types import is_datetime64tz_dtype
 from psycopg2.extras import execute_values
 
 logging.basicConfig(
@@ -342,7 +343,10 @@ def materialize_xlsx(df: pd.DataFrame, timestamp: str) -> Path:
 
 def refresh_greenplum_table(df: pd.DataFrame, db_password: str) -> None:
     df = df.copy()
-    df[CURRENT_TS_COLUMN] = pd.to_datetime(df[CURRENT_TS_COLUMN]).dt.to_pydatetime()
+    df[CURRENT_TS_COLUMN] = pd.to_datetime(df[CURRENT_TS_COLUMN], errors="coerce")
+    if is_datetime64tz_dtype(df[CURRENT_TS_COLUMN]):
+        df[CURRENT_TS_COLUMN] = df[CURRENT_TS_COLUMN].dt.tz_localize(None)
+    df[CURRENT_TS_COLUMN] = df[CURRENT_TS_COLUMN].fillna(pd.Timestamp.now()).dt.to_pydatetime()
     schema = DB_CONFIG["schema"]
     table = DB_CONFIG["table"]
     columns = [
@@ -404,7 +408,7 @@ def main() -> None:
         project = gitlab_project(token)
         logger.info("Authenticated to GitLab project %s", NLG_PROJECT_PATH)
 
-        run_ts = pd.Timestamp.utcnow()
+        run_ts = pd.Timestamp.now()
         timestamp_str = run_ts.strftime(TIMESTAMP_FMT)
 
         profile_df = build_profile_dataframe(project)
@@ -416,6 +420,10 @@ def main() -> None:
         merged_df[CURRENT_TS_COLUMN] = pd.to_datetime(
             merged_df[CURRENT_TS_COLUMN], errors="coerce"
         ).fillna(run_ts)
+        if is_datetime64tz_dtype(merged_df[CURRENT_TS_COLUMN]):
+            merged_df[CURRENT_TS_COLUMN] = (
+                merged_df[CURRENT_TS_COLUMN].dt.tz_localize(None)
+            )
 
         profile_table_map = (
             profile_df.dropna(subset=["profile_table", "target_type"])
