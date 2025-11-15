@@ -23,6 +23,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
 import gitlab
@@ -45,8 +46,7 @@ NLG_PROJECT_PATH = (
     "staat-ds-genesis/genesis-platform/nlg-dags"
 )
 BRANCH = "nlg-master"
-PATH_PROFILE_MAP = "dags/nlg/src/config/odm_profile_map"
-PROFILE_FILE_NAME = "profile_tbl.yaml"
+PROFILE_FILE_PATH = "dags/nlg/src/config/odm_profile_map/profile_tbl.yaml"
 PATH_RULES = "dags/nlg/src/rules"
 
 # --------------------------------------------------------------------------------------
@@ -74,6 +74,17 @@ DB_CONFIG = {
 # --------------------------------------------------------------------------------------
 RULE_FILE_EXTS = {".yaml", ".yml", ".json"}
 RULE_TAG_PATTERN = re.compile(r"\{([^{}]+)\}")
+CURRENT_TS_COLUMN = "current_timestamp"
+DEDUP_COLUMNS = [
+    "target_type",
+    "profile_table",
+    "joining_key",
+    "insight_type",
+    "rule_tag",
+    "rule_tag_value",
+    "filepath",
+    "filename",
+]
 OVERRIDES = {
     "fl_recruitment": ("fl_rec_profile_curr_ikg", "fl_rec_profile_key"),
     "fl_ubs_fa": ("fl_fa_profile_curr_ikg", "f1_fa_profile_key"),
@@ -107,6 +118,15 @@ def normalize_target_type(value: Any) -> Optional[str]:
     return text or None
 
 
+def _first_matching_key(entry: Dict[str, Any], keywords: List[str]) -> Optional[Any]:
+    if isinstance(entry, dict):
+        for key, value in entry.items():
+            lower = str(key).lower()
+            if all(keyword in lower for keyword in keywords):
+                return value
+    return None
+
+
 def parse_profile_entries(data: Any) -> List[Dict[str, Optional[str]]]:
     """
     Attempt to normalize profile metadata into a list of {target_type, profile_table, joining_key}.
@@ -125,9 +145,14 @@ def parse_profile_entries(data: Any) -> List[Dict[str, Optional[str]]]:
             lowered.get("profile_table")
             or lowered.get("profiletbl")
             or lowered.get("profiletblname")
+            or lowered.get("profile_table_name")
+            or _first_matching_key(entry, ["profile", "table"])
         )
-        joining_key = lowered.get("joining_key") or lowered.get("joiningkey") or lowered.get(
-            "join_key"
+        joining_key = (
+            lowered.get("joining_key")
+            or lowered.get("joiningkey")
+            or lowered.get("join_key")
+            or _first_matching_key(entry, ["key"])
         )
         rows.append(
             {
@@ -156,7 +181,7 @@ def parse_profile_entries(data: Any) -> List[Dict[str, Optional[str]]]:
 
 
 def build_profile_dataframe(project: gitlab.v4.objects.Project) -> pd.DataFrame:
-    profile_path = f"{PATH_PROFILE_MAP}/{PROFILE_FILE_NAME}"
+    profile_path = PROFILE_FILE_PATH
     content = fetch_file_text(project, profile_path)
     yaml_payload = yaml.safe_load(content)
     rows = parse_profile_entries(yaml_payload)
@@ -233,6 +258,7 @@ def extract_rule_tags(node: Any) -> List[Tuple[str, str]]:
 def build_rules_dataframe(project: gitlab.v4.objects.Project, run_ts: pd.Timestamp) -> pd.DataFrame:
     records: List[Dict[str, Any]] = []
     files = gather_rule_files(project)
+    seen_values: Dict[Tuple[str, str, str], set] = defaultdict(set)
     logger.info("Scanning %s rule files for tag definitions", len(files))
     for node in files:
         path = node["path"]
@@ -248,15 +274,20 @@ def build_rules_dataframe(project: gitlab.v4.objects.Project, run_ts: pd.Timesta
         content = fetch_file_text(project, path)
         document = parse_rule_document(content, Path(path).suffix.lower())
         for rule_tag, rule_value in extract_rule_tags(document):
+            target_key = target_type.lower()
+            dedupe_key = (target_key, insight_type, rule_tag)
+            if rule_value in seen_values[dedupe_key]:
+                continue
+            seen_values[dedupe_key].add(rule_value)
             records.append(
                 {
-                    "target_type": target_type.lower(),
+                    "target_type": target_key,
                     "insight_type": insight_type,
                     "rule_tag": rule_tag,
                     "rule_tag_value": rule_value,
                     "filepath": path,
                     "filename": file_name,
-                    "current_date_time": run_ts,
+                    CURRENT_TS_COLUMN: run_ts,
                 }
             )
 
@@ -275,7 +306,7 @@ def build_rules_dataframe(project: gitlab.v4.objects.Project, run_ts: pd.Timesta
             "rule_tag_value",
             "filepath",
             "filename",
-            "current_date_time",
+            CURRENT_TS_COLUMN,
         ]
     )
 
@@ -311,7 +342,7 @@ def materialize_xlsx(df: pd.DataFrame, timestamp: str) -> Path:
 
 def refresh_greenplum_table(df: pd.DataFrame, db_password: str) -> None:
     df = df.copy()
-    df["current_date_time"] = pd.to_datetime(df["current_date_time"]).dt.to_pydatetime()
+    df[CURRENT_TS_COLUMN] = pd.to_datetime(df[CURRENT_TS_COLUMN]).dt.to_pydatetime()
     schema = DB_CONFIG["schema"]
     table = DB_CONFIG["table"]
     columns = [
@@ -323,7 +354,7 @@ def refresh_greenplum_table(df: pd.DataFrame, db_password: str) -> None:
         "rule_tag_value",
         "filepath",
         "filename",
-        "current_date_time",
+        CURRENT_TS_COLUMN,
     ]
     payload = list(df[columns].where(pd.notnull(df), None).itertuples(index=False, name=None))
     connect_kwargs = {k: v for k, v in DB_CONFIG.items() if k in {"host", "port", "dbname", "user"}}
@@ -346,7 +377,7 @@ def refresh_greenplum_table(df: pd.DataFrame, db_password: str) -> None:
             rule_tag_value TEXT,
             filepath TEXT,
             filename TEXT,
-            current_date_time TIMESTAMP
+            {CURRENT_TS_COLUMN} TIMESTAMP
         );
     """
     owner = f"ALTER TABLE {schema}.{table} OWNER TO {DB_CONFIG['owner']};"
@@ -380,11 +411,41 @@ def main() -> None:
         rules_df = build_rules_dataframe(project, run_ts)
 
         merged_df = merge_datasets(profile_df, rules_df)
-        if "current_date_time" not in merged_df:
-            merged_df["current_date_time"] = run_ts
-        merged_df["current_date_time"] = merged_df["current_date_time"].fillna(run_ts)
+        if CURRENT_TS_COLUMN not in merged_df:
+            merged_df[CURRENT_TS_COLUMN] = run_ts
+        merged_df[CURRENT_TS_COLUMN] = pd.to_datetime(
+            merged_df[CURRENT_TS_COLUMN], errors="coerce"
+        ).fillna(run_ts)
+
+        profile_table_map = (
+            profile_df.dropna(subset=["profile_table", "target_type"])
+            .drop_duplicates(subset=["target_type"], keep="last")
+            .set_index("target_type")["profile_table"]
+            .to_dict()
+        )
+        joining_key_map = (
+            profile_df.dropna(subset=["joining_key", "target_type"])
+            .drop_duplicates(subset=["target_type"], keep="last")
+            .set_index("target_type")["joining_key"]
+            .to_dict()
+        )
+        merged_df["profile_table"] = merged_df["profile_table"].fillna(
+            merged_df["target_type"].map(profile_table_map)
+        )
+        merged_df["joining_key"] = merged_df["joining_key"].fillna(
+            merged_df["target_type"].map(joining_key_map)
+        )
 
         apply_overrides(merged_df)
+
+        before_dedupe = len(merged_df)
+        merged_df = merged_df.drop_duplicates(subset=DEDUP_COLUMNS).reset_index(drop=True)
+        if len(merged_df) != before_dedupe:
+            logger.info(
+                "Removed %s duplicate rows (kept %s)",
+                before_dedupe - len(merged_df),
+                len(merged_df),
+            )
         output_path = materialize_xlsx(merged_df, timestamp_str)
         logger.info("Report available at %s", output_path)
 
