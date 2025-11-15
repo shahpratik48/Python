@@ -31,6 +31,7 @@ import pandas as pd
 import psycopg2
 import yaml
 from pandas.api.types import is_datetime64tz_dtype
+from psycopg2 import sql
 from psycopg2.extras import execute_values
 
 logging.basicConfig(
@@ -318,11 +319,6 @@ def merge_datasets(profile_df: pd.DataFrame, rules_df: pd.DataFrame) -> pd.DataF
     return merged
 
 
-def quote_ident(identifier: str) -> str:
-    safe = str(identifier).replace('"', '""')
-    return f'"{safe}"'
-
-
 def apply_overrides(df: pd.DataFrame) -> None:
     if df.empty:
         return
@@ -379,7 +375,6 @@ def refresh_greenplum_table(df: pd.DataFrame, db_password: str) -> None:
         table,
         len(payload),
     )
-    fq_table = f"{quote_ident(schema)}.{quote_ident(table)}"
     column_defs = [
         ("target_type", "TEXT"),
         ("profile_table", "TEXT"),
@@ -391,27 +386,42 @@ def refresh_greenplum_table(df: pd.DataFrame, db_password: str) -> None:
         ("filename", "TEXT"),
         (CURRENT_TS_COLUMN, "TIMESTAMP"),
     ]
-    ddl = f"DROP TABLE IF EXISTS {fq_table};"
-    columns_sql = ",\n    ".join(
-        f"{quote_ident(col)} {datatype}" for col, datatype in column_defs
+    drop_stmt = sql.SQL("DROP TABLE IF EXISTS {}.{}").format(
+        sql.Identifier(schema), sql.Identifier(table)
     )
-    create = f"CREATE TABLE {fq_table} (\n    {columns_sql}\n);"
-    owner = f"ALTER TABLE {fq_table} OWNER TO {quote_ident(DB_CONFIG['owner'])};"
-    grant = f"GRANT SELECT ON {fq_table} TO {quote_ident(DB_CONFIG['read_role'])};"
+    column_sql = sql.SQL(", ").join(
+        sql.SQL("{} {}").format(sql.Identifier(col), sql.SQL(dtype))
+        for col, dtype in column_defs
+    )
+    create_stmt = sql.SQL("CREATE TABLE {}.{} ({})").format(
+        sql.Identifier(schema), sql.Identifier(table), column_sql
+    )
+    owner_stmt = sql.SQL("ALTER TABLE {}.{} OWNER TO {}").format(
+        sql.Identifier(schema),
+        sql.Identifier(table),
+        sql.Identifier(DB_CONFIG["owner"]),
+    )
+    grant_stmt = sql.SQL("GRANT SELECT ON {}.{} TO {}").format(
+        sql.Identifier(schema),
+        sql.Identifier(table),
+        sql.Identifier(DB_CONFIG["read_role"]),
+    )
 
     with psycopg2.connect(**connect_kwargs) as conn:
         conn.autocommit = True
         with conn.cursor() as cur:
-            cur.execute(ddl)
-            cur.execute(create)
+            cur.execute(drop_stmt)
+            cur.execute(create_stmt)
             if payload:
-                insert_sql = (
-                    f"INSERT INTO {fq_table} "
-                    f"({', '.join(quote_ident(col) for col in columns)}) VALUES %s"
+                insert_stmt = sql.SQL("INSERT INTO {}.{} ({}) VALUES %s").format(
+                    sql.Identifier(schema),
+                    sql.Identifier(table),
+                    sql.SQL(", ").join(sql.Identifier(col) for col in columns),
                 )
-                execute_values(cur, insert_sql, payload)
-            cur.execute(owner)
-            cur.execute(grant)
+                insert_query = insert_stmt.as_string(cur)
+                execute_values(cur, insert_query, payload)
+            cur.execute(owner_stmt)
+            cur.execute(grant_stmt)
     logger.info("Greenplum table %s.%s refreshed successfully", schema, table)
 
 
