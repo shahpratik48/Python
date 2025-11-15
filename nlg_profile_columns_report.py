@@ -387,6 +387,7 @@ def build_report_dataframes(project, ref, report_timestamp):
         col for col in df_input.columns if col not in input_columns
     ]
     df_input = df_input[input_columns + input_remaining]
+    df_input = apply_profile_overrides(df_input)
 
     sql_columns = [
         "target_type",
@@ -405,6 +406,7 @@ def build_report_dataframes(project, ref, report_timestamp):
         col for col in df_sql_merged.columns if col not in sql_columns
     ]
     df_sql_merged = df_sql_merged[sql_columns + sql_remaining]
+    df_sql_merged = apply_profile_overrides(df_sql_merged)
 
     return df_input, df_sql_merged
 
