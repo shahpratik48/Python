@@ -24,7 +24,7 @@ import re
 import sys
 from pathlib import Path
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import gitlab
 import pandas as pd
@@ -318,6 +318,11 @@ def merge_datasets(profile_df: pd.DataFrame, rules_df: pd.DataFrame) -> pd.DataF
     return merged
 
 
+def quote_ident(identifier: str) -> str:
+    safe = str(identifier).replace('"', '""')
+    return f'"{safe}"'
+
+
 def apply_overrides(df: pd.DataFrame) -> None:
     if df.empty:
         return
@@ -337,7 +342,7 @@ def materialize_xlsx(df: pd.DataFrame, timestamp: str) -> Path:
     output_file = OUTPUT_TEMPLATE.format(timestamp=timestamp)
     output_path = Path(output_file).resolve()
     logger.info("Writing XLSX report to %s", output_path)
-    df.to_excel(output_path, index=False)
+    df.to_excel(str(output_path), index=False)
     return output_path
 
 
@@ -360,8 +365,12 @@ def refresh_greenplum_table(df: pd.DataFrame, db_password: str) -> None:
         "filename",
         CURRENT_TS_COLUMN,
     ]
-    payload = list(df[columns].where(pd.notnull(df), None).itertuples(index=False, name=None))
-    connect_kwargs = {k: v for k, v in DB_CONFIG.items() if k in {"host", "port", "dbname", "user"}}
+    payload = list(
+        df[columns].where(pd.notnull(df), None).itertuples(index=False, name=None)
+    )
+    connect_kwargs = {
+        k: v for k, v in DB_CONFIG.items() if k in {"host", "port", "dbname", "user"}
+    }
     connect_kwargs["password"] = db_password
 
     logger.info(
@@ -370,22 +379,25 @@ def refresh_greenplum_table(df: pd.DataFrame, db_password: str) -> None:
         table,
         len(payload),
     )
-    ddl = f"DROP TABLE IF EXISTS {schema}.{table};"
-    create = f"""
-        CREATE TABLE {schema}.{table} (
-            target_type TEXT,
-            profile_table TEXT,
-            joining_key TEXT,
-            insight_type TEXT,
-            rule_tag TEXT,
-            rule_tag_value TEXT,
-            filepath TEXT,
-            filename TEXT,
-            {CURRENT_TS_COLUMN} TIMESTAMP
-        );
-    """
-    owner = f"ALTER TABLE {schema}.{table} OWNER TO {DB_CONFIG['owner']};"
-    grant = f"GRANT SELECT ON {schema}.{table} TO {DB_CONFIG['read_role']};"
+    fq_table = f"{quote_ident(schema)}.{quote_ident(table)}"
+    column_defs = [
+        ("target_type", "TEXT"),
+        ("profile_table", "TEXT"),
+        ("joining_key", "TEXT"),
+        ("insight_type", "TEXT"),
+        ("rule_tag", "TEXT"),
+        ("rule_tag_value", "TEXT"),
+        ("filepath", "TEXT"),
+        ("filename", "TEXT"),
+        (CURRENT_TS_COLUMN, "TIMESTAMP"),
+    ]
+    ddl = f"DROP TABLE IF EXISTS {fq_table};"
+    columns_sql = ",\n    ".join(
+        f"{quote_ident(col)} {datatype}" for col, datatype in column_defs
+    )
+    create = f"CREATE TABLE {fq_table} (\n    {columns_sql}\n);"
+    owner = f"ALTER TABLE {fq_table} OWNER TO {quote_ident(DB_CONFIG['owner'])};"
+    grant = f"GRANT SELECT ON {fq_table} TO {quote_ident(DB_CONFIG['read_role'])};"
 
     with psycopg2.connect(**connect_kwargs) as conn:
         conn.autocommit = True
@@ -393,7 +405,10 @@ def refresh_greenplum_table(df: pd.DataFrame, db_password: str) -> None:
             cur.execute(ddl)
             cur.execute(create)
             if payload:
-                insert_sql = f"INSERT INTO {schema}.{table} ({', '.join(columns)}) VALUES %s"
+                insert_sql = (
+                    f"INSERT INTO {fq_table} "
+                    f"({', '.join(quote_ident(col) for col in columns)}) VALUES %s"
+                )
                 execute_values(cur, insert_sql, payload)
             cur.execute(owner)
             cur.execute(grant)
