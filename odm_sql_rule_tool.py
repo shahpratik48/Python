@@ -215,8 +215,8 @@ def ensure_feature_branch(project, base_branch: str = BASE_BRANCH) -> str:
 
 def get_file_content(project, file_path: str, ref: str) -> str:
     file_obj = project.files.get(file_path=file_path, ref=ref)
-    decoded = base64.b64decode(file_obj.content).decode(file_obj.encoding or "utf-8")
-    return decoded
+    decoded_bytes = base64.b64decode(file_obj.content)
+    return decoded_bytes.decode("utf-8")
 
 
 def determine_modified_filename(
@@ -290,7 +290,6 @@ def write_gitlab_file(
             "file_path": file_path,
             "branch": branch,
             "content": content,
-            "encoding": "text",
             "commit_message": commit_message,
         }
     )
