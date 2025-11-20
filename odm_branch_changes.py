@@ -103,6 +103,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=int,
         help="Optional limit on the number of branches processed (useful for testing).",
     )
+    parser.add_argument(
+        "--straight-compare",
+        action="store_true",
+        help=(
+            "Use a straight diff (two-dot) instead of the default merge-base diff "
+            "(three-dot). Leave unset to include only files changed on the branch "
+            "relative to the base."
+        ),
+    )
     args, unknown = parser.parse_known_args(argv)
     if unknown:
         if running_inside_ipykernel():
@@ -183,6 +192,7 @@ def collect_branch_changes(
     base_branch: str,
     branches: Iterable[str],
     filter_fragment: Optional[str],
+    straight_compare: bool,
 ) -> Tuple[pd.DataFrame, List[Tuple[str, Exception]]]:
     records = []
     errors: List[Tuple[str, Exception]] = []
@@ -191,7 +201,9 @@ def collect_branch_changes(
         print(f"[{idx}] Processing {branch} ...")
         try:
             comparison = project.repository_compare(
-                base_branch, branch, straight=True
+                base_branch,
+                branch,
+                straight=straight_compare,
             )
         except Exception as exc:  # gitlab.GitlabGetError or others
             print(f"    ⚠️  Skipping {branch}: {exc}")
@@ -251,6 +263,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.base_branch,
         branches,
         filter_fragment=filter_fragment,
+        straight_compare=args.straight_compare,
     )
 
     if df_changes.empty:

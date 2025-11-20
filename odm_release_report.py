@@ -121,6 +121,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=int,
         help="Process at most N branches (useful for dry runs or debugging).",
     )
+    parser.add_argument(
+        "--straight-compare",
+        action="store_true",
+        help=(
+            "Use a straight diff (two-dot) when comparing branches. By default a "
+            "merge-base diff is used so only files changed on the branch are reported."
+        ),
+    )
     args, unknown = parser.parse_known_args(argv)
     if unknown:
         if running_inside_ipykernel():
@@ -256,9 +264,14 @@ def gather_compare_diffs(
     project,
     base_branch: str,
     branch_name: str,
+    straight_compare: bool,
 ) -> Optional[dict]:
     try:
-        comparison = project.repository_compare(base_branch, branch_name, straight=True)
+        comparison = project.repository_compare(
+            base_branch,
+            branch_name,
+            straight=straight_compare,
+        )
         return comparison
     except gitlab.GitlabGetError as exc:
         print(f"    ⚠️  Compare failed for {branch_name}: {exc}")
@@ -335,6 +348,7 @@ def collect_branch_changes(
     df_issue_branches: pd.DataFrame,
     branch_lookup: Dict[str, gitlab.v4.objects.Branch],
     filter_fragment: Optional[str],
+    straight_compare: bool,
     max_branches: Optional[int] = None,
 ) -> Tuple[pd.DataFrame, List[str]]:
     records: List[Dict[str, Optional[str]]] = []
@@ -373,7 +387,12 @@ def collect_branch_changes(
 
         branch_meta.update(branch_commit_meta(branch_obj))
 
-        comparison = gather_compare_diffs(odm_project, base_branch, branch_name)
+        comparison = gather_compare_diffs(
+            odm_project,
+            base_branch,
+            branch_name,
+            straight_compare=straight_compare,
+        )
         diffs = comparison.get("diffs", []) if comparison else []
 
         filtered_diffs = [
@@ -509,6 +528,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         df_issue_branches=df_issue_branches,
         branch_lookup=odm_branch_lookup,
         filter_fragment=path_filter,
+        straight_compare=args.straight_compare,
         max_branches=args.max_branches,
     )
 
