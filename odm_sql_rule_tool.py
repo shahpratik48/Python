@@ -8,14 +8,14 @@ Features
 * Scans every SQL file under `dags/odm/script/sql` on `odm-master`.
 * Pulls rule metadata for requested insight types from Postgres.
 * Displays logic/rule_column pairs in a friendly table and exports them to Excel.
-* Prompts for a rule_column update, creates a feature branch, and writes a
-  modified SQL copy (e.g. `si_acc_bookshift_model_modified_1.sql`) with the
-  requested value change inside the INSERT ... WHERE clause.
-* Saves the modified SQL both to GitLab (new branch) and to the local workspace
-  for immediate inspection.
+* Prompts for which insight_type should change, captures a replacement WHERE
+  clause fragment, and updates the corresponding SQL file in a freshly-created
+  branch.
+* Saves the modified SQL both to GitLab (overwriting the existing file in the
+  new branch) and to the local workspace for immediate inspection.
 
-The script is interactive and is intended to be executed from a secure, network
-enabled environment that can reach both GitLab and the target Postgres cluster.
+The script is interactive and should be executed from a secure, network-enabled
+environment that can reach both GitLab and the target Postgres cluster.
 """
 
 from __future__ import annotations
@@ -57,6 +57,10 @@ SCHEMA_TEMPLATE_PATTERN = re.compile(
 )
 TABLE_TEMPLATE_PATTERN = re.compile(
     r"\{\{\s*params\.odm_table.*?\}\}", re.IGNORECASE | re.DOTALL
+)
+CLAUSE_BOUNDARY_PATTERN = re.compile(
+    r"\b(group\s+by|order\s+by|limit|offset|union|intersect|except|having)\b",
+    re.IGNORECASE,
 )
 
 
@@ -165,35 +169,29 @@ def display_metadata(df: pd.DataFrame) -> None:
         print(group[cols_to_show].to_string(index=False))
 
 
-def prompt_rule_change(df: pd.DataFrame) -> Tuple[str, str, str]:
-    if df.empty:
-        raise ValueError(
-            "Cannot proceed with rule change because no metadata rows were returned."
-        )
-    if "insight_type" not in df.columns or "rule_column" not in df.columns:
-        raise ValueError(
-            "Result set must contain 'insight_type' and 'rule_column' columns."
-        )
-    change_target = input(
-        'Enter "rule_column to be changed" in format insight_type.rule_column: '
-    ).strip()
-    if "." not in change_target:
-        raise ValueError("Input must be in format insight_type.rule_column")
-    insight_type, rule_column = [part.strip() for part in change_target.split(".", 1)]
-    if insight_type not in set(df["insight_type"]):
-        raise ValueError(
-            f'Insight type "{insight_type}" not found in metadata results.'
-        )
-    if rule_column not in set(
-        df.loc[df["insight_type"] == insight_type, "rule_column"]
-    ):
-        raise ValueError(
-            f'Rule column "{rule_column}" not associated with insight type "{insight_type}".'
-        )
-    new_value = input('Enter "value to be changed": ').strip()
-    if not new_value:
-        raise ValueError("A replacement value is required.")
-    return (insight_type, rule_column, new_value)
+def prompt_target_insight_type(df: pd.DataFrame) -> str:
+    if df.empty or "insight_type" not in df.columns:
+        raise ValueError("Cannot select an insight_type because no metadata was returned.")
+    available = sorted(df["insight_type"].unique())
+    print("\nAvailable insight types:")
+    for item in available:
+        print(f" - {item}")
+    selection = input("Which insight_type should be changed? ").strip()
+    if not selection:
+        raise ValueError("You must specify an insight_type to change.")
+    if selection not in available:
+        raise ValueError(f'Insight type "{selection}" is not present in the metadata results.')
+    return selection
+
+
+def prompt_where_clause_replacement() -> str:
+    new_clause = input('What to change? Provide the replacement for the WHERE clause: ').strip()
+    if not new_clause:
+        raise ValueError("A replacement WHERE clause is required.")
+    lowered = new_clause.lower()
+    if lowered.startswith("where "):
+        new_clause = new_clause.split(" ", 1)[1].strip()
+    return new_clause
 
 
 def ensure_feature_branch(project, base_branch: str = BASE_BRANCH) -> str:
@@ -218,38 +216,6 @@ def get_file_content(project, file_path: str, ref: str) -> str:
     file_obj = project.files.get(file_path=file_path, ref=ref)
     decoded_bytes = base64.b64decode(file_obj.content)
     return decoded_bytes.decode("utf-8")
-
-
-def determine_modified_filename(
-    project, branch: str, original_path: str, insight_type: str
-) -> str:
-    directory = str(PurePosixPath(original_path).parent)
-    index = 1
-    while True:
-        candidate_name = f"{insight_type}_modified_{index}.sql"
-        candidate_path = (
-            candidate_name if directory == "." else f"{directory}/{candidate_name}"
-        )
-        try:
-            project.files.get(file_path=candidate_path, ref=branch)
-            index += 1
-            continue
-        except gl_exceptions.GitlabGetError as err:
-            if err.response_code == 404:
-                return candidate_path
-            raise
-
-
-def format_sql_literal(value: str) -> str:
-    if re.fullmatch(r"-?\d+(\.\d+)?", value):
-        return value
-    if value.upper() in {"TRUE", "FALSE", "NULL"}:
-        return value.upper()
-    if (value.startswith("'") and value.endswith("'")) or (
-        value.startswith('"') and value.endswith('"')
-    ):
-        return value
-    return f"'{value}'"
 
 
 def _find_statement_end(sql_text: str, start_idx: int) -> int:
@@ -294,45 +260,49 @@ def locate_insert_block(sql_text: str) -> Tuple[str, int, int]:
         search_start = end_idx
 
 
-def apply_rule_change(sql_text: str, rule_column: str, new_value: str) -> str:
+def apply_where_change(sql_text: str, new_where_clause: str) -> str:
     insert_block, start_idx, end_idx = locate_insert_block(sql_text)
-
-    column_pattern = re.compile(
-        rf"({re.escape(rule_column)}\s*(?:=|<>|>=|<=|>|<)\s*)([^\s)]+)",
-        re.IGNORECASE,
-    )
-    formatted_value = format_sql_literal(new_value)
-    updated_block, replacements = column_pattern.subn(
-        rf"\1{formatted_value}", insert_block, count=1
-    )
-    if replacements == 0:
+    where_match = re.search(r"\bwhere\b", insert_block, re.IGNORECASE)
+    if not where_match:
         raise ValueError(
-            f"Rule column {rule_column} not found inside the INSERT statement."
+            "No WHERE clause found inside the INSERT statement targeting the ODM table."
         )
+
+    clause_start = where_match.end()
+    remainder = insert_block[clause_start:]
+    boundary_match = CLAUSE_BOUNDARY_PATTERN.search(remainder)
+    if boundary_match:
+        clause_end = clause_start + boundary_match.start()
+    else:
+        semicolon_idx = insert_block.find(";", clause_start)
+        clause_end = semicolon_idx if semicolon_idx != -1 else len(insert_block)
+
+    sanitized_clause = new_where_clause.strip()
+    replacement = f" WHERE {sanitized_clause} "
+    updated_block = (
+        insert_block[: where_match.start()] + replacement + insert_block[clause_end:]
+    )
     return sql_text[:start_idx] + updated_block + sql_text[end_idx:]
 
 
-def write_gitlab_file(
+def update_gitlab_file(
     project,
     branch: str,
     file_path: str,
     content: str,
     commit_message: str,
 ) -> None:
-    project.files.create(
-        {
-            "file_path": file_path,
-            "branch": branch,
-            "content": content,
-            "commit_message": commit_message,
-        }
-    )
-    print(f"Wrote {file_path} to branch {branch}.")
+    file_obj = project.files.get(file_path=file_path, ref=branch)
+    file_obj.content = content
+    file_obj.save(branch=branch, commit_message=commit_message)
+    print(f"Updated {file_path} on branch {branch}.")
 
 
 def export_local_sql(file_name: str, content: str) -> Path:
     LOCAL_SQL_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-    export_path = LOCAL_SQL_EXPORT_DIR / Path(file_name).name
+    relative_path = Path(file_name)
+    export_path = (LOCAL_SQL_EXPORT_DIR / relative_path).resolve()
+    export_path.parent.mkdir(parents=True, exist_ok=True)
     export_path.write_text(content, encoding="utf-8")
     print(f"Local copy saved to {export_path.resolve()}")
     return export_path
@@ -357,38 +327,34 @@ def main():
         display_metadata(metadata_df)
         export_metadata(metadata_df)
 
-        insight_type, rule_column, new_value = prompt_rule_change(metadata_df)
+        target_insight = prompt_target_insight_type(metadata_df)
+        new_where_clause = prompt_where_clause_replacement()
 
-        matching_paths = sql_index.get(insight_type)
+        matching_paths = sql_index.get(target_insight)
         if not matching_paths:
             raise ValueError(
-                f"No SQL file found for insight_type {insight_type} under {SQL_PATH}."
+                f"No SQL file found for insight_type {target_insight} under {SQL_PATH}."
             )
         if len(matching_paths) > 1:
             print(
-                f"Multiple SQL files found for {insight_type}. "
+                f"Multiple SQL files found for {target_insight}. "
                 f"Choosing the first match: {matching_paths[0]}"
             )
         original_path = matching_paths[0]
 
         feature_branch = ensure_feature_branch(project, base_branch=BASE_BRANCH)
         sql_text = get_file_content(project, original_path, ref=feature_branch)
-        updated_sql = apply_rule_change(sql_text, rule_column, new_value)
+        updated_sql = apply_where_change(sql_text, new_where_clause)
 
-        new_file_path = determine_modified_filename(
-            project, branch=feature_branch, original_path=original_path, insight_type=insight_type
-        )
-        commit_message = (
-            f"[Automated] Adjust {rule_column} for {insight_type} to {new_value}"
-        )
-        write_gitlab_file(
+        commit_message = f"[Automated] Update WHERE clause for {target_insight}"
+        update_gitlab_file(
             project,
             branch=feature_branch,
-            file_path=new_file_path,
+            file_path=original_path,
             content=updated_sql,
             commit_message=commit_message,
         )
-        export_local_sql(new_file_path, updated_sql)
+        export_local_sql(original_path, updated_sql)
 
         print(
             "\nDone. Review the new branch in GitLab, validate the SQL, and create a merge request when ready."
