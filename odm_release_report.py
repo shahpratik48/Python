@@ -52,6 +52,14 @@ DEFAULT_TOKEN_ENV = "GITLAB_PRIVATE_TOKEN"
 # ------------------------------------------------------------------------------- #
 
 
+def running_inside_ipykernel() -> bool:
+    """Detect whether the script is running inside an IPython kernel."""
+    launcher = Path(sys.argv[0]).name if sys.argv else ""
+    if "ipykernel_launcher" in launcher:
+        return True
+    return any("ipykernel_launcher" in arg for arg in sys.argv[1:])
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Produce an Excel export of all files changed per ODM branch."
@@ -113,7 +121,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=int,
         help="Process at most N branches (useful for dry runs or debugging).",
     )
-    return parser.parse_args(argv)
+    args, unknown = parser.parse_known_args(argv)
+    if unknown:
+        if running_inside_ipykernel():
+            print(
+                f"Ignoring unrecognized arguments from IPython: {' '.join(unknown)}",
+                file=sys.stderr,
+            )
+        else:
+            parser.error(f"unrecognized arguments: {' '.join(unknown)}")
+    return args
 
 
 def resolve_private_token(env_var: str) -> str:
