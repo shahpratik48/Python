@@ -45,7 +45,7 @@ BRANCH_PREFIX = "odm-branch-created-by-script-"
 LOCAL_SQL_EXPORT_DIR = Path("generated_sql")
 
 DB_CONFIG = {
-    "host": "greenulum-rdso.zur_swissbank.com",
+    "host": "greenplum-rdsp.zur.swissbank.com",
     "port": 5432,
     "dbname": "gprdsp",
     "user": "ds_rdsp_dev",
@@ -53,8 +53,9 @@ DB_CONFIG = {
 }
 RULE_METADATA_TABLE = "sandbox_prj_smart_insights.odm_rule_metadata_auto_refresh"
 
+INSERT_TARGET_PATTERN = r"(?:Ilparams\.IKG_SCHEMPOI|{{\s*params\.IKG_SCHEMA\s*}})"
 INSERT_BLOCK_PATTERN = re.compile(
-    r"(INSERT\s+INTO\s+Ilparams\.IKG_SCHEMPOI\.{{params\.ODM_TABLE}}\b.*?;)",
+    rf"(INSERT\s+INTO\s+{INSERT_TARGET_PATTERN}\.{{\s*params\.ODM_TABLE\s*}}\b.*?;)",
     re.IGNORECASE | re.DOTALL,
 )
 
