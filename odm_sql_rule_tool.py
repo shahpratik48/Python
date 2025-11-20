@@ -53,9 +53,15 @@ DB_CONFIG = {
 }
 RULE_METADATA_TABLE = "sandbox_prj_smart_insights.odm_rule_metadata_auto_refresh"
 
-INSERT_TARGET_PATTERN = r"(?:Ilparams\.IKG_SCHEMPOI|{{\s*params\.IKG_SCHEMA\s*}})"
+INSERT_TARGET_PATTERN = (
+    r"(?:"
+    r"(?:Ilparams\.IKG_SCHEMPOI\s*\.\s*{{\s*params\.odm_table\s*}})"
+    r"|"
+    r"(?:{{\s*params\.ikg_schema\s*}}\s*\.\s*{{\s*params\.odm_table\s*}})"
+    r")"
+)
 INSERT_BLOCK_PATTERN = re.compile(
-    rf"(INSERT\s+INTO\s+{INSERT_TARGET_PATTERN}\.{{\s*params\.ODM_TABLE\s*}}\b.*?;)",
+    rf"(INSERT\s+INTO\s+{INSERT_TARGET_PATTERN}\b.*?;)",
     re.IGNORECASE | re.DOTALL,
 )
 
