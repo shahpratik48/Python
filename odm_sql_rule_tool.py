@@ -52,7 +52,12 @@ DB_CONFIG = {
     "schema": "sandbox_prj_smart_insights",
 }
 RULE_METADATA_TABLE = "sandbox_prj_smart_insights.odm_rule_metadata_auto_refresh"
-TARGET_INSERT_KEYS = ("ilparams.ikg_schempoi", "{{params.ikg_schema}}")
+SCHEMA_TEMPLATE_PATTERN = re.compile(
+    r"\{\{\s*params\.ikg_schema.*?\}\}", re.IGNORECASE | re.DOTALL
+)
+TABLE_TEMPLATE_PATTERN = re.compile(
+    r"\{\{\s*params\.odm_table.*?\}\}", re.IGNORECASE | re.DOTALL
+)
 
 
 def prompt_private_token() -> str:
@@ -263,6 +268,16 @@ def _find_statement_end(sql_text: str, start_idx: int) -> int:
     return len(sql_text)
 
 
+def _is_target_insert(statement: str) -> bool:
+    lowered = statement.lower()
+    if "ilparams.ikg_schempoi" in lowered and TABLE_TEMPLATE_PATTERN.search(statement):
+        return True
+    return bool(
+        SCHEMA_TEMPLATE_PATTERN.search(statement)
+        and TABLE_TEMPLATE_PATTERN.search(statement)
+    )
+
+
 def locate_insert_block(sql_text: str) -> Tuple[str, int, int]:
     lowered = sql_text.lower()
     search_start = 0
@@ -274,8 +289,7 @@ def locate_insert_block(sql_text: str) -> Tuple[str, int, int]:
             )
         end_idx = _find_statement_end(sql_text, idx)
         statement = sql_text[idx:end_idx]
-        normalized = re.sub(r"\s+", "", statement.lower())
-        if any(key in normalized for key in TARGET_INSERT_KEYS) and "{{params.odm_table}}" in normalized:
+        if _is_target_insert(statement):
             return statement, idx, end_idx
         search_start = end_idx
 
