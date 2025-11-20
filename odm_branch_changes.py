@@ -285,4 +285,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    exit_code = main()
+    if running_inside_ipykernel():
+        if exit_code not in (0, None):
+            print(f"Script finished with exit code {exit_code}", file=sys.stderr)
+    else:
+        sys.exit(exit_code)
