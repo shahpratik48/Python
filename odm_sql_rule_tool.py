@@ -52,18 +52,7 @@ DB_CONFIG = {
     "schema": "sandbox_prj_smart_insights",
 }
 RULE_METADATA_TABLE = "sandbox_prj_smart_insights.odm_rule_metadata_auto_refresh"
-
-INSERT_TARGET_PATTERN = (
-    r"(?:"
-    r"(?:Ilparams\.IKG_SCHEMPOI\s*\.\s*{{\s*params\.odm_table\s*}})"
-    r"|"
-    r"(?:{{\s*params\.ikg_schema\s*}}\s*\.\s*{{\s*params\.odm_table\s*}})"
-    r")"
-)
-INSERT_BLOCK_PATTERN = re.compile(
-    rf"(INSERT\s+INTO\s+{INSERT_TARGET_PATTERN}\b.*?;)",
-    re.IGNORECASE | re.DOTALL,
-)
+TARGET_INSERT_KEYS = ("ilparams.ikg_schempoi", "{{params.ikg_schema}}")
 
 
 def prompt_private_token() -> str:
@@ -258,15 +247,41 @@ def format_sql_literal(value: str) -> str:
     return f"'{value}'"
 
 
-def apply_rule_change(
-    sql_text: str, rule_column: str, new_value: str
-) -> str:
-    insert_match = INSERT_BLOCK_PATTERN.search(sql_text)
-    if not insert_match:
-        raise ValueError(
-            "Could not find INSERT INTO Ilparams.IKG_SCHEMPOI.{{params.ODM_TABLE}} statement."
-        )
-    insert_block = insert_match.group(1)
+def _find_statement_end(sql_text: str, start_idx: int) -> int:
+    in_single = False
+    in_double = False
+    i = start_idx
+    while i < len(sql_text):
+        ch = sql_text[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == ";" and not in_single and not in_double:
+            return i + 1
+        i += 1
+    return len(sql_text)
+
+
+def locate_insert_block(sql_text: str) -> Tuple[str, int, int]:
+    lowered = sql_text.lower()
+    search_start = 0
+    while True:
+        idx = lowered.find("insert into", search_start)
+        if idx == -1:
+            raise ValueError(
+                "Could not find INSERT INTO statement targeting ODM table."
+            )
+        end_idx = _find_statement_end(sql_text, idx)
+        statement = sql_text[idx:end_idx]
+        normalized = re.sub(r"\s+", "", statement.lower())
+        if any(key in normalized for key in TARGET_INSERT_KEYS) and "{{params.odm_table}}" in normalized:
+            return statement, idx, end_idx
+        search_start = end_idx
+
+
+def apply_rule_change(sql_text: str, rule_column: str, new_value: str) -> str:
+    insert_block, start_idx, end_idx = locate_insert_block(sql_text)
 
     column_pattern = re.compile(
         rf"({re.escape(rule_column)}\s*(?:=|<>|>=|<=|>|<)\s*)([^\s)]+)",
@@ -280,9 +295,7 @@ def apply_rule_change(
         raise ValueError(
             f"Rule column {rule_column} not found inside the INSERT statement."
         )
-    return (
-        sql_text[: insert_match.start()] + updated_block + sql_text[insert_match.end() :]
-    )
+    return sql_text[:start_idx] + updated_block + sql_text[end_idx:]
 
 
 def write_gitlab_file(
