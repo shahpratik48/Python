@@ -39,13 +39,11 @@ import base64
 import datetime as dt
 import json
 import logging
-import os
 import re
-import sys
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import gitlab
 import networkx as nx
@@ -116,13 +114,14 @@ class PlaceholderNormalizer:
 @dataclass
 class TableRef:
     schema: Optional[str]
-    table: str
+    table: Optional[str]
     alias: Optional[str]
     is_cte: bool = False
 
     def label(self) -> str:
         schema_part = self.schema or ""
-        return f"{schema_part}.{self.table}" if schema_part else self.table
+        base = self.table or ""
+        return f"{schema_part}.{base}" if schema_part else base
 
 
 @dataclass
@@ -180,6 +179,12 @@ class GreenplumMetadata:
             LOGGER.warning("Failed to connect to Greenplum metadata: %s", exc)
             return None
 
+    def ensure_connection(self) -> None:
+        if not self.enabled or not self._connect():
+            raise RuntimeError(
+                "Unable to establish a connection to Greenplum metadata. Verify credentials and network access."
+            )
+
     def close(self) -> None:
         if self._conn and not self._conn.closed:
             self._conn.close()
@@ -230,30 +235,56 @@ class GreenplumMetadata:
 
         return self._cache[key]
 
+    def _schema_candidates(self, schema_name: Optional[str]) -> List[Optional[str]]:
+        if schema_name and schema_name.startswith("{{"):
+            return [None]
+        if schema_name:
+            return [schema_name]
+        return list(self.schemas)
+
+    def column_exists(
+        self,
+        schema: Optional[str],
+        table: Optional[str],
+        column: Optional[str],
+    ) -> bool:
+        if not self.enabled or not table or not column:
+            return False
+        column_lower = column.lower()
+        for schema_candidate in self._schema_candidates(schema):
+            columns = self._fetch_columns(schema_candidate, table)
+            if column_lower in columns:
+                return True
+        return False
+
     def resolve(
         self,
-        column: str,
+        column: Optional[str],
         candidates: Sequence[TableRef],
+        preferred: Optional[TableRef] = None,
     ) -> Tuple[Optional[str], Optional[str]]:
         """Return (schema, table) for the column across candidate tables."""
-        if not self.enabled:
+        if not self.enabled or not column:
+            if preferred:
+                return preferred.schema, preferred.table
             return None, None
+
         column_lower = column.lower()
-        for table_ref in candidates:
+        ordered: List[TableRef] = []
+        if preferred:
+            ordered.append(preferred)
+        ordered.extend([t for t in candidates if t is not preferred])
+
+        for table_ref in ordered:
             if table_ref.is_cte or not table_ref.table:
                 continue
-            schema_candidates: List[Optional[str]]
-            placeholder_schema = table_ref.schema or ""
-            if placeholder_schema.startswith("{{"):
-                schema_candidates = [None]
-            elif table_ref.schema:
-                schema_candidates = [table_ref.schema]
-            else:
-                schema_candidates = list(self.schemas)
-            for schema_name in schema_candidates:
-                columns = self._fetch_columns(schema_name, table_ref.table)
+            for schema_candidate in self._schema_candidates(table_ref.schema):
+                columns = self._fetch_columns(schema_candidate, table_ref.table)
                 if column_lower in columns:
-                    return schema_name or table_ref.schema, table_ref.table
+                    return schema_candidate or table_ref.schema, table_ref.table
+
+        if preferred:
+            return preferred.schema, preferred.table
         return None, None
 
 
@@ -483,7 +514,7 @@ class SQLLineageParser:
 
         cte_names = self._collect_cte_names(qualified)
         tables = self._collect_tables(qualified, cte_names, normalizer)
-        downstream_tables = {table.table for table in tables if not table.is_cte}
+        downstream_tables = {table.table for table in tables if not table.is_cte and table.table}
 
         target_schema = normalizer.restore_identifier(target_table_expr.db)
         target_table_name = normalizer.restore_identifier(target_table_expr.name)
@@ -565,21 +596,17 @@ class SQLLineageParser:
         for column in columns:
             column_name = normalizer.restore_identifier(column.name)
             table_name = normalizer.restore_identifier(column.table)
-            schema_name = None
-            if table_name:
-                matching_table = self._match_table_ref(table_name, tables)
-                if matching_table:
-                    schema_name = matching_table.schema
-                    table_output = matching_table.table
-                else:
-                    table_output = table_name
-            else:
-                schema_name, table_output = self.metadata.resolve(
-                    column_name or "",
-                    tables,
-                )
-                if table_output is None:
-                    table_output = "__UNKNOWN__"
+            preferred_table = self._match_table_ref(table_name, tables) if table_name else None
+            schema_name, table_output = self.metadata.resolve(
+                column_name,
+                tables,
+                preferred=preferred_table,
+            )
+            if not table_output and preferred_table:
+                schema_name = preferred_table.schema
+                table_output = preferred_table.table
+            if not table_output:
+                table_output = table_name or "__UNKNOWN__"
             sources.append((schema_name, table_output, column_name))
         return sources
 
@@ -634,7 +661,7 @@ class LineageExporter:
                 for record in self.records
             ]
         )
-        with pd.ExcelWriter(path, engine="xlwt") as writer:
+        with pd.ExcelWriter(str(path), engine="xlwt") as writer:
             df.to_excel(writer, index=False, sheet_name="column_lineage")
 
     def _to_json(self, path: Path) -> None:
@@ -656,12 +683,16 @@ class LineageExporter:
     def _to_gexf(self, path: Path) -> None:
         graph = nx.MultiDiGraph()
         for record in self.records:
-            target_node = f"{record.target_schema or ''}.{record.target_table}".strip(".")
-            source_node = (
-                f"{record.source_schema or ''}.{record.source_table}".strip(".")
-                if record.source_table
-                else None
+            target_node = (
+                f"{record.target_schema or ''}.{record.target_table}".strip(".")
+                if record.target_table
+                else record.target_schema
             )
+            if not target_node:
+                target_node = record.target_table or "__TARGET__"
+            source_node = None
+            if record.source_table:
+                source_node = f"{record.source_schema or ''}.{record.source_table}".strip(".") or record.source_table
             graph.add_node(
                 target_node,
                 schema=record.target_schema,
@@ -681,7 +712,7 @@ class LineageExporter:
                     logic=record.logic,
                     sql_file=record.sql_file,
                 )
-        nx.write_gexf(graph, path)
+        nx.write_gexf(graph, str(path))
 
 
 def _split_exclude_folders(exclude: Optional[str]) -> List[str]:
@@ -741,6 +772,14 @@ def run(
         password=greenplum_password,
         schemas=schemas,
     )
+    if not metadata.enabled:
+        raise typer.BadParameter(
+            "Greenplum credentials (host, db, user, password, and schema list) are required for lineage disambiguation."
+        )
+    try:
+        metadata.ensure_connection()
+    except RuntimeError as exc:
+        raise typer.BadParameter(str(exc))
 
     cache_dir = Path.cwd() / ".ikg_sql_cache"
     fetcher = GitLabSQLFetcher(
