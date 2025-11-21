@@ -704,7 +704,12 @@ def run(
     branch: str = typer.Option("ikg-master", envvar="BRANCH"),
     sql_folder: str = typer.Option(..., envvar="SQL_FOLDER"),
     exclude_folder: Optional[str] = typer.Option("", envvar="EXCLUDE_FOLDER"),
-    token: str = typer.Option(..., envvar="TOKEN", prompt=True, hide_input=True),
+    token: str = typer.Option(
+        ...,
+        envvar="TOKEN",
+        prompt="GitLab private token",
+        hide_input=True,
+    ),
     start_table: str = typer.Option(..., envvar="START_TABLE", prompt=True),
     output_dir: Path = typer.Option(Path.cwd(), envvar="OUTPUT_DIR"),
     log_level: str = typer.Option("INFO", envvar="LOG_LEVEL"),
@@ -712,7 +717,12 @@ def run(
     greenplum_port: Optional[int] = typer.Option(5432, envvar="GREENPLUM_PORT"),
     greenplum_db: Optional[str] = typer.Option(None, envvar="GREENPLUM_DB"),
     greenplum_user: Optional[str] = typer.Option(None, envvar="GREENPLUM_USER"),
-    greenplum_password: Optional[str] = typer.Option(None, envvar="GREENPLUM_PASSWORD"),
+    greenplum_password: Optional[str] = typer.Option(
+        None,
+        envvar="GREENPLUM_PASSWORD",
+        prompt="Greenplum password (press enter to skip)",
+        hide_input=True,
+    ),
     greenplum_schema: Optional[str] = typer.Option(None, envvar="GREENPLUM_SCHEMA"),
     preferred_start_subfolder: str = typer.Option("ikg_create_profiles"),
 ) -> None:
@@ -722,6 +732,7 @@ def run(
     LOGGER.info("Starting lineage extraction for table '%s'", start_table)
     exclude_folders = _split_exclude_folders(exclude_folder)
     schemas = _split_schemas(greenplum_schema)
+    greenplum_password = greenplum_password or None
     metadata = GreenplumMetadata(
         host=greenplum_host,
         port=greenplum_port,
@@ -753,6 +764,7 @@ def run(
         LOGGER.warning("No lineage records generated.")
     exporter = LineageExporter(records, output_dir, start_table)
     outputs = exporter.export()
+    LOGGER.info("Exported %d lineage rows", len(records))
     LOGGER.info("Lineage exports created:")
     for fmt, path in outputs.items():
         LOGGER.info("  %s -> %s", fmt.upper(), path)
