@@ -11,8 +11,8 @@ Features
 * Handles templated schema placeholders such as ``{{params.IKG_SCHEMA}}`` by normalizing
   them for parsing yet restoring the placeholders in the final outputs.
 * Resolves missing table qualifiers for columns by consulting Greenplum metadata.
-* Produces XLS, JSON, and GEXF exports that capture target/source schema-table-column
-  lineage with the transformation logic and SQL file path.
+* Produces XLS, JSON, GEXF, and indented tree exports that capture target/source
+  schema-table-column lineage with the transformation logic and SQL file path.
 
 Usage
 -----
@@ -117,6 +117,7 @@ class TableRef:
     table: Optional[str]
     alias: Optional[str]
     is_cte: bool = False
+    is_temp: bool = False
 
     def label(self) -> str:
         schema_part = self.schema or ""
@@ -276,7 +277,7 @@ class GreenplumMetadata:
         ordered.extend([t for t in candidates if t is not preferred])
 
         for table_ref in ordered:
-            if table_ref.is_cte or not table_ref.table:
+            if table_ref.is_cte or table_ref.is_temp or not table_ref.table:
                 continue
             for schema_candidate in self._schema_candidates(table_ref.schema):
                 columns = self._fetch_columns(schema_candidate, table_ref.table)
@@ -386,13 +387,20 @@ class SQLLineageParser:
         self.records: List[LineageRecord] = []
         self._processed_tables: Set[str] = set()
         self._table_dependencies: Dict[str, Set[str]] = defaultdict(set)
+        self._table_display_names: Dict[str, str] = {}
+        self._remember_display_name(start_table, None)
 
     @property
     def dependencies(self) -> Dict[str, Set[str]]:
         return self._table_dependencies
 
+    @property
+    def display_names(self) -> Dict[str, str]:
+        return self._table_display_names.copy()
+
     def extract(self) -> List[LineageRecord]:
         queue: deque[str] = deque([self.start_table.lower()])
+        queued: Set[str] = {self.start_table.lower()}
         while queue:
             table = queue.popleft()
             if table in self._processed_tables:
@@ -405,11 +413,12 @@ class SQLLineageParser:
                 continue
             file_records, downstream_tables = self._parse_file(sql_path, table)
             self.records.extend(file_records)
-            self._table_dependencies[table].update(downstream_tables)
             self._processed_tables.add(table)
             for downstream in downstream_tables:
-                if downstream.lower() not in self._processed_tables:
-                    queue.append(downstream.lower())
+                dep_key = downstream.lower()
+                if dep_key not in self._processed_tables and dep_key not in queued:
+                    queue.append(dep_key)
+                    queued.add(dep_key)
         return self.records
 
     def _resolve_table_path(self, table: str) -> Optional[Path]:
@@ -514,18 +523,48 @@ class SQLLineageParser:
 
         cte_names = self._collect_cte_names(qualified)
         tables = self._collect_tables(qualified, cte_names, normalizer)
-        downstream_tables = {table.table for table in tables if not table.is_cte and table.table}
+        downstream_tables = {
+            table.table
+            for table in tables
+            if not table.is_cte and not table.is_temp and table.table
+        }
 
         target_schema = normalizer.restore_identifier(target_table_expr.db)
-        target_table_name = normalizer.restore_identifier(target_table_expr.name)
-        logic_records: List[LineageRecord] = []
+        target_table_name = self._extract_table_name(target_table_expr, normalizer)
+        self._remember_display_name(target_table_name, target_schema)
+
+        nested_records, nested_dependencies = self._process_nested_structures(
+            qualified,
+            sql_path,
+            normalizer,
+        )
+        logic_records: List[LineageRecord] = list(nested_records)
+        downstream_tables.update(nested_dependencies)
+
         for projection in qualified.expressions:
-            alias = projection.alias_or_name or projection.name
-            if not alias:
-                alias = projection.sql(dialect=self.dialect)
-            alias = normalizer.restore(alias)
-            logic_sql = normalizer.restore(projection.this.sql(dialect=self.dialect) if hasattr(projection, "this") else projection.sql(dialect=self.dialect))
+            logic_sql = normalizer.restore(
+                projection.this.sql(dialect=self.dialect)
+                if hasattr(projection, "this")
+                else projection.sql(dialect=self.dialect)
+            )
             source_refs = self._extract_sources(projection, tables, normalizer)
+            deduped_refs: List[Tuple[Optional[str], Optional[str], Optional[str]]] = []
+            seen_refs: Set[Tuple[Optional[str], Optional[str], Optional[str]]] = set()
+            for ref in source_refs:
+                key = (ref[0], ref[1], ref[2])
+                if key in seen_refs:
+                    continue
+                seen_refs.add(key)
+                deduped_refs.append(ref)
+            source_refs = deduped_refs
+
+            alias = projection.alias_or_name or projection.name
+            alias = normalizer.restore(alias) if alias else alias
+            if not alias and source_refs and source_refs[0][2]:
+                alias = source_refs[0][2]
+            if not alias:
+                alias = logic_sql
+
             if not source_refs:
                 record = LineageRecord(
                     target_schema=target_schema,
@@ -551,6 +590,7 @@ class SQLLineageParser:
                         sql_file=str(sql_path),
                     )
                     logic_records.append(record)
+        self._register_dependencies(target_table_name or sql_path.stem, target_schema, downstream_tables)
         return logic_records, downstream_tables
 
     @staticmethod
@@ -573,15 +613,42 @@ class SQLLineageParser:
             schema = normalizer.restore_identifier(table.db)
             alias = normalizer.restore_identifier(table.alias)
             is_cte = base_name.lower() in cte_names if base_name else False
-            tables.append(
-                TableRef(
-                    schema=schema,
-                    table=base_name or table.alias_or_name,
-                    alias=alias,
-                    is_cte=is_cte,
-                )
+            table_ref = TableRef(
+                schema=schema,
+                table=base_name or table.alias_or_name,
+                alias=alias,
+                is_cte=is_cte,
             )
+            tables.append(table_ref)
+            self._remember_display_name(table_ref.table, table_ref.schema)
+        tables.extend(self._collect_subquery_refs(select_expr, normalizer))
         return tables
+
+    def _collect_subquery_refs(
+        self,
+        select_expr: exp.Select,
+        normalizer: PlaceholderNormalizer,
+    ) -> List[TableRef]:
+        refs: List[TableRef] = []
+        seen: Set[str] = set()
+        for subquery in select_expr.find_all(exp.Subquery):
+            alias = normalizer.restore_identifier(subquery.alias)
+            if not alias:
+                continue
+            key = alias.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            table_ref = TableRef(
+                schema=None,
+                table=alias,
+                alias=alias,
+                is_cte=False,
+                is_temp=True,
+            )
+            refs.append(table_ref)
+            self._remember_display_name(alias, None)
+        return refs
 
     def _extract_sources(
         self,
@@ -620,6 +687,99 @@ class SQLLineageParser:
                 return table_ref
         return None
 
+    def _process_nested_structures(
+        self,
+        select_expr: exp.Select,
+        sql_path: Path,
+        normalizer: PlaceholderNormalizer,
+    ) -> Tuple[List[LineageRecord], Set[str]]:
+        records: List[LineageRecord] = []
+        dependencies: Set[str] = set()
+        processed: Set[str] = set()
+
+        cte_clause = select_expr.args.get("with") or select_expr.args.get("with_")
+        if cte_clause:
+            for cte in cte_clause.expressions:
+                alias = normalizer.restore_identifier(cte.alias_or_name)
+                if not alias:
+                    continue
+                key = alias.lower()
+                if key in processed:
+                    continue
+                processed.add(key)
+                inner = cte.this
+                if isinstance(inner, exp.Select):
+                    table_expr = self._make_table_expr(alias)
+                    nested_records, nested_deps = self._process_select(inner, table_expr, sql_path, normalizer)
+                    records.extend(nested_records)
+                    dependencies.update(nested_deps)
+
+        for subquery in select_expr.find_all(exp.Subquery):
+            alias = normalizer.restore_identifier(subquery.alias)
+            if not alias:
+                continue
+            key = alias.lower()
+            if key in processed:
+                continue
+            processed.add(key)
+            if isinstance(subquery.this, exp.Select):
+                table_expr = self._make_table_expr(alias)
+                nested_records, nested_deps = self._process_select(subquery.this, table_expr, sql_path, normalizer)
+                records.extend(nested_records)
+                dependencies.update(nested_deps)
+
+        return records, dependencies
+
+    @staticmethod
+    def _make_table_expr(name: str) -> exp.Table:
+        return exp.to_table(name)
+
+    def _extract_table_name(
+        self,
+        table_expr: exp.Table,
+        normalizer: PlaceholderNormalizer,
+    ) -> Optional[str]:
+
+        if not table_expr:
+            return None
+        alias = table_expr.alias_or_name
+        if alias:
+            return normalizer.restore_identifier(alias)
+        if table_expr.name:
+            return normalizer.restore_identifier(table_expr.name)
+        if table_expr.this:
+            return normalizer.restore_identifier(str(table_expr.this))
+        return None
+
+    def _register_dependencies(
+        self,
+        target_table: Optional[str],
+        target_schema: Optional[str],
+        downstream_tables: Set[str],
+    ) -> None:
+        if not target_table:
+            return
+        key = target_table.lower()
+        self._remember_display_name(target_table, target_schema)
+        for dep in downstream_tables:
+            if not dep:
+                continue
+            dep_key = dep.lower()
+            self._table_dependencies[key].add(dep_key)
+
+    def _remember_display_name(self, table: Optional[str], schema: Optional[str]) -> None:
+        if not table:
+            return
+        key = table.lower()
+        label = self._format_display_name(schema, table)
+        self._table_display_names.setdefault(key, label)
+
+    @staticmethod
+    def _format_display_name(schema: Optional[str], table: str) -> str:
+        if schema:
+            return f"{schema}.{table}"
+        return table
+
 
 class LineageExporter:
     def __init__(
@@ -627,10 +787,14 @@ class LineageExporter:
         records: Sequence[LineageRecord],
         output_dir: Path,
         start_table: str,
+        dependencies: Dict[str, Set[str]],
+        display_names: Dict[str, str],
     ) -> None:
         self.records = records
         self.output_dir = output_dir
         self.start_table = start_table
+        self.dependencies = {k: set(v) for k, v in dependencies.items()}
+        self.display_names = display_names.copy()
         self.output_dir.mkdir(parents=True, exist_ok=True)
         now = dt.datetime.now()
         self.timestamp = now.strftime("%Y%m%d_%H%M%S")
@@ -640,10 +804,12 @@ class LineageExporter:
         xls_path = self.output_dir / f"{base_name}.xls"
         json_path = self.output_dir / f"{base_name}.json"
         gexf_path = self.output_dir / f"{base_name}.gexf"
+        tree_path = self.output_dir / f"{base_name}_tree.txt"
         self._to_excel(xls_path)
         self._to_json(json_path)
         self._to_gexf(gexf_path)
-        return {"xls": xls_path, "json": json_path, "gexf": gexf_path}
+        self._to_tree(tree_path)
+        return {"xls": xls_path, "json": json_path, "gexf": gexf_path, "tree": tree_path}
 
     def _to_excel(self, path: Path) -> None:
         df = pd.DataFrame(
@@ -713,6 +879,25 @@ class LineageExporter:
                     sql_file=record.sql_file,
                 )
         nx.write_gexf(graph, str(path))
+
+    def _to_tree(self, path: Path) -> None:
+        lines: List[str] = []
+        visited: Set[str] = set()
+
+        def dfs(node_key: str, depth: int) -> None:
+            label = self.display_names.get(node_key, node_key)
+            prefix = "  " * depth + f"- {label}"
+            if node_key in visited:
+                lines.append(f"{prefix} (revisited)")
+                return
+            lines.append(prefix)
+            visited.add(node_key)
+            for child in sorted(self.dependencies.get(node_key, [])):
+                dfs(child, depth + 1)
+
+        start_key = self.start_table.lower()
+        dfs(start_key, 0)
+        path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def _split_exclude_folders(exclude: Optional[str]) -> List[str]:
@@ -801,7 +986,13 @@ def run(
     records = parser.extract()
     if not records:
         LOGGER.warning("No lineage records generated.")
-    exporter = LineageExporter(records, output_dir, start_table)
+    exporter = LineageExporter(
+        records,
+        output_dir,
+        start_table,
+        parser.dependencies,
+        parser.display_names,
+    )
     outputs = exporter.export()
     LOGGER.info("Exported %d lineage rows", len(records))
     LOGGER.info("Lineage exports created:")
