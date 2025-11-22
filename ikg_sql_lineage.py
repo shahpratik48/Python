@@ -412,6 +412,9 @@ class SQLLineageParser:
         self,
         column: str,
     ) -> Tuple[List[LineageRecord], Dict[str, Set[str]]]:
+        column = (column or "").strip()
+        if column in ("*", "all", ""):
+            return list(self.records), {k: set(v) for k, v in self._table_dependencies.items()}
         explorer = ColumnLineageExplorer(self.records, self._canonical_key)
         start_schema = self.start_schema
         start_table = self.start_table
