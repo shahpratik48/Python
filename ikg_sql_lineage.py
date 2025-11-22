@@ -787,14 +787,14 @@ class LineageExporter:
         records: Sequence[LineageRecord],
         output_dir: Path,
         start_table: str,
-        dependencies: Dict[str, Set[str]],
-        display_names: Dict[str, str],
+        dependencies: Optional[Dict[str, Set[str]]] = None,
+        display_names: Optional[Dict[str, str]] = None,
     ) -> None:
         self.records = records
         self.output_dir = output_dir
         self.start_table = start_table
-        self.dependencies = {k: set(v) for k, v in dependencies.items()}
-        self.display_names = display_names.copy()
+        self.dependencies = {k: set(v) for k, v in (dependencies or {}).items()}
+        self.display_names = (display_names or {}).copy()
         self.output_dir.mkdir(parents=True, exist_ok=True)
         now = dt.datetime.now()
         self.timestamp = now.strftime("%Y%m%d_%H%M%S")
