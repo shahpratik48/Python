@@ -11,25 +11,27 @@ Features
 * Handles templated schema placeholders such as ``{{params.IKG_SCHEMA}}`` by normalizing
   them for parsing yet restoring the placeholders in the final outputs.
 * Resolves missing table qualifiers for columns by consulting Greenplum metadata.
+* Accepts a `--lineage-column` argument to focus on a single target column's lineage.
 * Produces XLS, JSON, GEXF, and indented tree exports that capture target/source
   schema-table-column lineage with the transformation logic and SQL file path.
 
 Usage
 -----
 ```
-python ikg_sql_lineage.py run \
-    --gitlab-url https://devcloud.ubs.net \
-    --project-id ubs/gwma/.../ikg-dags \
-    --branch ikg-master \
-    --sql-folder dags/ikg/scripts/sql \
-    --exclude-folder "ikg_new fa_shhp_map" \
-    --token <PRIVATE_TOKEN> \
-    --start-table account_profile_curr_ikg \
-    --greenplum-host greenplum-rdsp.zur.swissbank.com \
-    --greenplum-db gprdsp \
-    --greenplum-user ds_rdsp_dev \
-    --greenplum-password <PASSWORD> \
-    --greenplum-schema "core_wma_shared,core_model,core_ikg,core_etl"
+    python ikg_sql_lineage.py run \
+        --gitlab-url https://devcloud.ubs.net \
+        --project-id ubs/gwma/.../ikg-dags \
+        --branch ikg-master \
+        --sql-folder dags/ikg/scripts/sql \
+        --exclude-folder "ikg_new fa_shhp_map" \
+        --token <PRIVATE_TOKEN> \
+        --start-table account_profile_curr_ikg \
+        --lineage-column col1 \
+        --greenplum-host greenplum-rdsp.zur.swissbank.com \
+        --greenplum-db gprdsp \
+        --greenplum-user ds_rdsp_dev \
+        --greenplum-password <PASSWORD> \
+        --greenplum-schema "core_wma_shared,core_model,core_ikg,core_etl"
 ```
 """
 
@@ -405,6 +407,17 @@ class SQLLineageParser:
     @property
     def root_key(self) -> Optional[str]:
         return self._root_key
+
+    def build_column_lineage(
+        self,
+        column: str,
+    ) -> Tuple[List[LineageRecord], Dict[str, Set[str]]]:
+        explorer = ColumnLineageExplorer(self.records, self._canonical_key)
+        start_schema = self.start_schema
+        start_table = self.start_table
+        if not start_table:
+            start_schema, start_table = self._split_table_identifier(self.start_table_input)
+        return explorer.explore(start_schema, start_table, column)
 
     def extract(self) -> List[LineageRecord]:
         start_key = self._root_key
@@ -897,6 +910,57 @@ class SQLLineageParser:
         return None, identifier.strip()
 
 
+class ColumnLineageExplorer:
+    def __init__(
+        self,
+        records: Sequence[LineageRecord],
+        canonical_fn,
+    ) -> None:
+        self._canonical = canonical_fn
+        self._records: Dict[str, Dict[str, List[LineageRecord]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
+        for rec in records:
+            key = self._canonical(rec.target_schema, rec.target_table)
+            column = (rec.target_column or "").lower()
+            if not key or not column:
+                continue
+            self._records[key][column].append(rec)
+
+    def explore(
+        self,
+        start_schema: Optional[str],
+        start_table: Optional[str],
+        column: str,
+    ) -> Tuple[List[LineageRecord], Dict[str, Set[str]]]:
+        start_key = self._canonical(start_schema, start_table)
+        if not start_key or not column:
+            return [], {}
+        queue: deque[Tuple[str, str]] = deque([(start_key, column.lower())])
+        visited: Set[Tuple[str, str]] = set()
+        lineage_records: List[LineageRecord] = []
+        tree: Dict[str, Set[str]] = defaultdict(set)
+
+        while queue:
+            key, col = queue.popleft()
+            if (key, col) in visited:
+                continue
+            visited.add((key, col))
+            column_records = self._records.get(key, {}).get(col)
+            if not column_records:
+                continue
+            tree.setdefault(key, set())
+            for rec in column_records:
+                lineage_records.append(rec)
+                child_key = self._canonical(rec.source_schema, rec.source_table)
+                if child_key:
+                    tree[key].add(child_key)
+                    if rec.source_column:
+                        queue.append((child_key, rec.source_column.lower()))
+
+        return lineage_records, {k: set(v) for k, v in tree.items()}
+
+
 class LineageExporter:
     def __init__(
         self,
@@ -1055,6 +1119,7 @@ def run(
         hide_input=True,
     ),
     start_table: str = typer.Option(..., envvar="START_TABLE", prompt=True),
+    lineage_column: str = typer.Option(..., envvar="LINEAGE_COLUMN", prompt=True),
     output_dir: Path = typer.Option(Path.cwd(), envvar="OUTPUT_DIR"),
     log_level: str = typer.Option("INFO", envvar="LOG_LEVEL"),
     greenplum_host: Optional[str] = typer.Option(None, envvar="GREENPLUM_HOST"),
@@ -1073,7 +1138,11 @@ def run(
     """Entry point for the SQL lineage extraction workflow."""
 
     setup_logging(log_level)
-    LOGGER.info("Starting lineage extraction for table '%s'", start_table)
+    LOGGER.info(
+        "Starting lineage extraction for table '%s' column '%s'",
+        start_table,
+        lineage_column,
+    )
     exclude_folders = _split_exclude_folders(exclude_folder)
     schemas = _split_schemas(greenplum_schema)
     greenplum_password = greenplum_password or None
@@ -1108,22 +1177,29 @@ def run(
     parser = SQLLineageParser(
         repository=repository,
         metadata=metadata,
-        start_table=start_table.lower(),
+        start_table=start_table.strip(),
         preferred_start_subfolder=preferred_start_subfolder,
     )
     records = parser.extract()
     if not records:
         LOGGER.warning("No lineage records generated.")
+    column_records, tree_edges = parser.build_column_lineage(lineage_column.strip())
+    if not column_records:
+        LOGGER.warning(
+            "No lineage records found for %s.%s",
+            start_table,
+            lineage_column,
+        )
     exporter = LineageExporter(
-        records,
+        column_records,
         output_dir,
         start_table,
-        parser.dependencies,
+        tree_edges,
         parser.display_names,
         parser.root_key,
     )
     outputs = exporter.export()
-    LOGGER.info("Exported %d lineage rows", len(records))
+    LOGGER.info("Exported %d lineage rows", len(column_records))
     LOGGER.info("Lineage exports created:")
     for fmt, path in outputs.items():
         LOGGER.info("  %s -> %s", fmt.upper(), path)
