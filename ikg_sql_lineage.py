@@ -523,11 +523,12 @@ class SQLLineageParser:
 
         cte_names = self._collect_cte_names(qualified)
         tables = self._collect_tables(qualified, cte_names, normalizer)
-        downstream_tables = {
+        queue_tables = {
             table.table
             for table in tables
             if not table.is_cte and not table.is_temp and table.table
         }
+        all_source_tables = {table.table for table in tables if table.table}
 
         target_schema = normalizer.restore_identifier(target_table_expr.db)
         target_table_name = self._extract_table_name(target_table_expr, normalizer)
@@ -539,7 +540,8 @@ class SQLLineageParser:
             normalizer,
         )
         logic_records: List[LineageRecord] = list(nested_records)
-        downstream_tables.update(nested_dependencies)
+        all_source_tables.update(nested_dependencies)
+        queue_tables.update({dep for dep in nested_dependencies if dep})
 
         for projection in qualified.expressions:
             logic_sql = normalizer.restore(
@@ -590,8 +592,12 @@ class SQLLineageParser:
                         sql_file=str(sql_path),
                     )
                     logic_records.append(record)
-        self._register_dependencies(target_table_name or sql_path.stem, target_schema, downstream_tables)
-        return logic_records, downstream_tables
+        self._register_dependencies(
+            target_table_name or sql_path.stem,
+            target_schema,
+            all_source_tables,
+        )
+        return logic_records, queue_tables
 
     @staticmethod
     def _collect_cte_names(select_expr: exp.Select) -> Set[str]:
@@ -630,24 +636,38 @@ class SQLLineageParser:
         normalizer: PlaceholderNormalizer,
     ) -> List[TableRef]:
         refs: List[TableRef] = []
-        seen: Set[str] = set()
+        seen_aliases: Set[str] = set()
+        seen_tables: Set[str] = set()
         for subquery in select_expr.find_all(exp.Subquery):
             alias = normalizer.restore_identifier(subquery.alias)
-            if not alias:
+            base_table = None
+            source_table = None
+            if isinstance(subquery.this, exp.Select):
+                first_table = next(subquery.this.find_all(exp.Table), None)
+                if first_table:
+                    base_table = normalizer.restore_identifier(first_table.name or first_table.alias_or_name)
+                    source_table = base_table
+            table_name = alias or base_table
+            if not table_name:
                 continue
-            key = alias.lower()
-            if key in seen:
+            key = table_name.lower()
+            if alias and alias.lower() in seen_aliases:
                 continue
-            seen.add(key)
+            if not alias and key in seen_tables:
+                continue
+            if alias:
+                seen_aliases.add(alias.lower())
+            else:
+                seen_tables.add(key)
             table_ref = TableRef(
                 schema=None,
-                table=alias,
+                table=table_name,
                 alias=alias,
                 is_cte=False,
                 is_temp=True,
             )
             refs.append(table_ref)
-            self._remember_display_name(alias, None)
+            self._remember_display_name(table_name, None)
         return refs
 
     def _extract_sources(
@@ -672,6 +692,13 @@ class SQLLineageParser:
             if not table_output and preferred_table:
                 schema_name = preferred_table.schema
                 table_output = preferred_table.table
+            if not table_output:
+                real_candidates = [
+                    t for t in tables if not t.is_cte and not t.is_temp and t.table
+                ]
+                if len(real_candidates) == 1:
+                    schema_name = real_candidates[0].schema
+                    table_output = real_candidates[0].table
             if not table_output:
                 table_output = table_name or "__UNKNOWN__"
             sources.append((schema_name, table_output, column_name))
@@ -861,22 +888,22 @@ class LineageExporter:
                 source_node = f"{record.source_schema or ''}.{record.source_table}".strip(".") or record.source_table
             graph.add_node(
                 target_node,
-                schema=record.target_schema,
-                table=record.target_table,
+                schema=(record.target_schema or ""),
+                table=(record.target_table or ""),
             )
             if source_node:
                 graph.add_node(
                     source_node,
-                    schema=record.source_schema,
-                    table=record.source_table,
+                    schema=(record.source_schema or ""),
+                    table=(record.source_table or ""),
                 )
                 graph.add_edge(
                     source_node,
                     target_node,
-                    source_column=record.source_column,
-                    target_column=record.target_column,
-                    logic=record.logic,
-                    sql_file=record.sql_file,
+                    source_column=(record.source_column or ""),
+                    target_column=(record.target_column or ""),
+                    logic=(record.logic or ""),
+                    sql_file=(record.sql_file or ""),
                 )
         nx.write_gexf(graph, str(path))
 
