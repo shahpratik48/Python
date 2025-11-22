@@ -389,14 +389,19 @@ class SQLLineageParser:
         self._table_dependencies: Dict[str, Set[str]] = defaultdict(set)
         self._table_display_names: Dict[str, str] = {}
         self._remember_display_name(start_table, None)
+        self._root_key = self._canonical_key(None, start_table)
 
     @property
     def dependencies(self) -> Dict[str, Set[str]]:
-        return self._table_dependencies
+        return {k: set(v) for k, v in self._table_dependencies.items()}
 
     @property
     def display_names(self) -> Dict[str, str]:
         return self._table_display_names.copy()
+
+    @property
+    def root_key(self) -> Optional[str]:
+        return self._root_key
 
     def extract(self) -> List[LineageRecord]:
         queue: deque[str] = deque([self.start_table.lower()])
@@ -528,20 +533,21 @@ class SQLLineageParser:
             for table in tables
             if not table.is_cte and not table.is_temp and table.table
         }
-        all_source_tables = {table.table for table in tables if table.table}
+        all_source_tables = {
+            (table.schema, table.table) for table in tables if table.table
+        }
 
         target_schema = normalizer.restore_identifier(target_table_expr.db)
         target_table_name = self._extract_table_name(target_table_expr, normalizer)
         self._remember_display_name(target_table_name, target_schema)
 
-        nested_records, nested_dependencies = self._process_nested_structures(
+        nested_records, nested_queue = self._process_nested_structures(
             qualified,
             sql_path,
             normalizer,
         )
         logic_records: List[LineageRecord] = list(nested_records)
-        all_source_tables.update(nested_dependencies)
-        queue_tables.update({dep for dep in nested_dependencies if dep})
+        queue_tables.update({dep for dep in nested_queue if dep})
 
         for projection in qualified.expressions:
             logic_sql = normalizer.restore(
@@ -782,23 +788,25 @@ class SQLLineageParser:
         self,
         target_table: Optional[str],
         target_schema: Optional[str],
-        downstream_tables: Set[str],
+        downstream_tables: Set[Tuple[Optional[str], Optional[str]]],
     ) -> None:
-        if not target_table:
+        target_key = self._canonical_key(target_schema, target_table)
+        if not target_key:
             return
-        key = target_table.lower()
+        self._table_dependencies.setdefault(target_key, set())
         self._remember_display_name(target_table, target_schema)
-        for dep in downstream_tables:
-            if not dep:
+        for schema, table in downstream_tables:
+            dep_key = self._canonical_key(schema, table)
+            if not dep_key:
                 continue
-            dep_key = dep.lower()
-            self._table_dependencies[key].add(dep_key)
+            self._table_dependencies[target_key].add(dep_key)
+            self._remember_display_name(table, schema)
 
     def _remember_display_name(self, table: Optional[str], schema: Optional[str]) -> None:
-        if not table:
+        key = self._canonical_key(schema, table)
+        if not key:
             return
-        key = table.lower()
-        label = self._format_display_name(schema, table)
+        label = self._format_display_name(schema, table or "")
         self._table_display_names.setdefault(key, label)
 
     @staticmethod
@@ -806,6 +814,13 @@ class SQLLineageParser:
         if schema:
             return f"{schema}.{table}"
         return table
+
+    @staticmethod
+    def _canonical_key(schema: Optional[str], table: Optional[str]) -> Optional[str]:
+        if not table:
+            return None
+        schema_part = (schema or "").lower()
+        return f"{schema_part}::{table.lower()}"
 
 
 class LineageExporter:
@@ -816,12 +831,14 @@ class LineageExporter:
         start_table: str,
         dependencies: Optional[Dict[str, Set[str]]] = None,
         display_names: Optional[Dict[str, str]] = None,
+        root_key: Optional[str] = None,
     ) -> None:
         self.records = records
         self.output_dir = output_dir
         self.start_table = start_table
         self.dependencies = {k: set(v) for k, v in (dependencies or {}).items()}
         self.display_names = (display_names or {}).copy()
+        self.root_key = root_key or ""
         self.output_dir.mkdir(parents=True, exist_ok=True)
         now = dt.datetime.now()
         self.timestamp = now.strftime("%Y%m%d_%H%M%S")
@@ -922,7 +939,9 @@ class LineageExporter:
             for child in sorted(self.dependencies.get(node_key, [])):
                 dfs(child, depth + 1)
 
-        start_key = self.start_table.lower()
+        start_key = self.root_key or f"::{self.start_table.lower()}"
+        if not start_key:
+            return
         dfs(start_key, 0)
         path.write_text("\n".join(lines), encoding="utf-8")
 
@@ -1019,6 +1038,7 @@ def run(
         start_table,
         parser.dependencies,
         parser.display_names,
+        parser.root_key,
     )
     outputs = exporter.export()
     LOGGER.info("Exported %d lineage rows", len(records))
