@@ -381,15 +381,18 @@ class SQLLineageParser:
     ) -> None:
         self.repository = repository
         self.metadata = metadata
-        self.start_table = start_table
+        self.start_table_input = start_table
         self.preferred_start_subfolder = preferred_start_subfolder
         self.dialect = dialect
         self.records: List[LineageRecord] = []
         self._processed_tables: Set[str] = set()
         self._table_dependencies: Dict[str, Set[str]] = defaultdict(set)
         self._table_display_names: Dict[str, str] = {}
-        self._remember_display_name(start_table, None)
-        self._root_key = self._canonical_key(None, start_table)
+        self._table_actual: Dict[str, Tuple[Optional[str], str]] = {}
+        self.start_schema, self.start_table = self._split_table_identifier(start_table)
+        self.start_table_lower = (self.start_table or "").lower()
+        self._remember_display_name(self.start_table, self.start_schema)
+        self._root_key = self._canonical_key(self.start_schema, self.start_table)
 
     @property
     def dependencies(self) -> Dict[str, Set[str]]:
@@ -404,30 +407,52 @@ class SQLLineageParser:
         return self._root_key
 
     def extract(self) -> List[LineageRecord]:
-        queue: deque[str] = deque([self.start_table.lower()])
-        queued: Set[str] = {self.start_table.lower()}
+        start_key = self._root_key
+        if not start_key:
+            LOGGER.error("Unable to determine start table key; aborting extraction.")
+            return []
+
+        queue: deque[str] = deque([start_key])
+        queued: Set[str] = {start_key}
         while queue:
-            table = queue.popleft()
-            if table in self._processed_tables:
+            table_key = queue.popleft()
+            if table_key in self._processed_tables:
                 continue
-            LOGGER.debug("Processing table %s", table)
-            sql_path = self._resolve_table_path(table)
+            schema, table_name = self._table_actual.get(
+                table_key, self._split_key(table_key)
+            )
+            if not table_name:
+                LOGGER.debug("Skipping table with unknown name for key %s", table_key)
+                self._processed_tables.add(table_key)
+                continue
+            LOGGER.debug("Processing table %s", table_name)
+            sql_path = self._resolve_table_path(table_name)
             if not sql_path:
-                LOGGER.info("Table %s treated as original source (no SQL file).", table)
-                self._processed_tables.add(table)
+                LOGGER.info(
+                    "Table %s treated as original source (no SQL file).", table_name
+                )
+                self._processed_tables.add(table_key)
                 continue
-            file_records, downstream_tables = self._parse_file(sql_path, table)
+            file_records, downstream_tables = self._parse_file(
+                sql_path, table_name, schema
+            )
             self.records.extend(file_records)
-            self._processed_tables.add(table)
+            self._processed_tables.add(table_key)
             for downstream in downstream_tables:
-                dep_key = downstream.lower()
-                if dep_key not in self._processed_tables and dep_key not in queued:
-                    queue.append(dep_key)
-                    queued.add(dep_key)
+                if (
+                    downstream
+                    and downstream not in self._processed_tables
+                    and downstream not in queued
+                ):
+                    queue.append(downstream)
+                    queued.add(downstream)
         return self.records
 
     def _resolve_table_path(self, table: str) -> Optional[Path]:
-        preferred = self.repository.find_preferred_path(table, self.preferred_start_subfolder if table == self.start_table.lower() else None)
+        preferred = self.repository.find_preferred_path(
+            table,
+            self.preferred_start_subfolder if table.lower() == self.start_table_lower else None,
+        )
         if preferred:
             return preferred
         candidates = self.repository.get_paths_for_table(table)
@@ -435,7 +460,12 @@ class SQLLineageParser:
             return candidates[0]
         return None
 
-    def _parse_file(self, path: Path, logical_table: str) -> Tuple[List[LineageRecord], Set[str]]:
+    def _parse_file(
+        self,
+        path: Path,
+        logical_table: str,
+        schema: Optional[str],
+    ) -> Tuple[List[LineageRecord], Set[str]]:
         text = self.repository.get_text(path)
         if text is None:
             LOGGER.warning("Missing content for %s", path)
@@ -462,6 +492,7 @@ class SQLLineageParser:
                         target_table,
                         path,
                         normalizer,
+                        schema,
                     )
                     file_records.extend(recs)
                     downstream_tables.update(deps)
@@ -472,6 +503,7 @@ class SQLLineageParser:
                             target_table,
                             path,
                             normalizer,
+                            schema,
                         )
                         file_records.extend(recs)
                         downstream_tables.update(deps)
@@ -484,6 +516,7 @@ class SQLLineageParser:
                         target_table,
                         path,
                         normalizer,
+                        schema,
                     )
                     file_records.extend(recs)
                     downstream_tables.update(deps)
@@ -496,6 +529,7 @@ class SQLLineageParser:
                         target_table,
                         path,
                         normalizer,
+                        schema,
                     )
                     file_records.extend(recs)
                     downstream_tables.update(deps)
@@ -512,6 +546,7 @@ class SQLLineageParser:
         target_table_expr: exp.Table,
         sql_path: Path,
         normalizer: PlaceholderNormalizer,
+        default_schema: Optional[str],
     ) -> Tuple[List[LineageRecord], Set[str]]:
         select_copy = select_expr.copy()
         try:
@@ -529,7 +564,7 @@ class SQLLineageParser:
         cte_names = self._collect_cte_names(qualified)
         tables = self._collect_tables(qualified, cte_names, normalizer)
         queue_tables = {
-            table.table
+            self._canonical_key(table.schema, table.table)
             for table in tables
             if not table.is_cte and not table.is_temp and table.table
         }
@@ -537,17 +572,20 @@ class SQLLineageParser:
             (table.schema, table.table) for table in tables if table.table
         }
 
-        target_schema = normalizer.restore_identifier(target_table_expr.db)
+        target_schema = normalizer.restore_identifier(
+            target_table_expr.db if target_table_expr.db else default_schema
+        )
         target_table_name = self._extract_table_name(target_table_expr, normalizer)
         self._remember_display_name(target_table_name, target_schema)
 
-        nested_records, nested_queue = self._process_nested_structures(
+        nested_records, nested_queue, nested_pairs = self._process_nested_structures(
             qualified,
             sql_path,
             normalizer,
         )
         logic_records: List[LineageRecord] = list(nested_records)
         queue_tables.update({dep for dep in nested_queue if dep})
+        all_source_tables.update(nested_pairs)
 
         for projection in qualified.expressions:
             logic_sql = normalizer.restore(
@@ -725,9 +763,14 @@ class SQLLineageParser:
         select_expr: exp.Select,
         sql_path: Path,
         normalizer: PlaceholderNormalizer,
-    ) -> Tuple[List[LineageRecord], Set[str]]:
+    ) -> Tuple[
+        List[LineageRecord],
+        Set[str],
+        Set[Tuple[Optional[str], Optional[str]]],
+    ]:
         records: List[LineageRecord] = []
-        dependencies: Set[str] = set()
+        queue_keys: Set[Optional[str]] = set()
+        dependency_pairs: Set[Tuple[Optional[str], Optional[str]]] = set()
         processed: Set[str] = set()
 
         cte_clause = select_expr.args.get("with") or select_expr.args.get("with_")
@@ -743,9 +786,16 @@ class SQLLineageParser:
                 inner = cte.this
                 if isinstance(inner, exp.Select):
                     table_expr = self._make_table_expr(alias)
-                    nested_records, nested_deps = self._process_select(inner, table_expr, sql_path, normalizer)
+                    nested_records, nested_queue = self._process_select(
+                        inner,
+                        table_expr,
+                        sql_path,
+                        normalizer,
+                        None,
+                    )
                     records.extend(nested_records)
-                    dependencies.update(nested_deps)
+                    queue_keys.update(nested_queue)
+                    dependency_pairs.add((None, alias))
 
         for subquery in select_expr.find_all(exp.Subquery):
             alias = normalizer.restore_identifier(subquery.alias)
@@ -757,11 +807,18 @@ class SQLLineageParser:
             processed.add(key)
             if isinstance(subquery.this, exp.Select):
                 table_expr = self._make_table_expr(alias)
-                nested_records, nested_deps = self._process_select(subquery.this, table_expr, sql_path, normalizer)
+                nested_records, nested_queue = self._process_select(
+                    subquery.this,
+                    table_expr,
+                    sql_path,
+                    normalizer,
+                    None,
+                )
                 records.extend(nested_records)
-                dependencies.update(nested_deps)
+                queue_keys.update(nested_queue)
+                dependency_pairs.add((None, alias))
 
-        return records, dependencies
+        return records, {k for k in queue_keys if k}, dependency_pairs
 
     @staticmethod
     def _make_table_expr(name: str) -> exp.Table:
@@ -808,6 +865,8 @@ class SQLLineageParser:
             return
         label = self._format_display_name(schema, table or "")
         self._table_display_names.setdefault(key, label)
+        if table:
+            self._table_actual.setdefault(key, (schema, table))
 
     @staticmethod
     def _format_display_name(schema: Optional[str], table: str) -> str:
@@ -821,6 +880,21 @@ class SQLLineageParser:
             return None
         schema_part = (schema or "").lower()
         return f"{schema_part}::{table.lower()}"
+
+    @staticmethod
+    def _split_key(key: str) -> Tuple[Optional[str], str]:
+        if "::" not in key:
+            return None, key
+        schema_part, table_part = key.split("::", 1)
+        schema = schema_part or None
+        return schema, table_part
+
+    @staticmethod
+    def _split_table_identifier(identifier: str) -> Tuple[Optional[str], str]:
+        if "." in identifier:
+            schema, table = identifier.split(".", 1)
+            return schema.strip() or None, table.strip()
+        return None, identifier.strip()
 
 
 class LineageExporter:
@@ -928,7 +1002,9 @@ class LineageExporter:
         lines: List[str] = []
         visited: Set[str] = set()
 
-        def dfs(node_key: str, depth: int) -> None:
+        def dfs(node_key: Optional[str], depth: int) -> None:
+            if not node_key:
+                return
             label = self.display_names.get(node_key, node_key)
             prefix = "  " * depth + f"- {label}"
             if node_key in visited:
@@ -939,7 +1015,13 @@ class LineageExporter:
             for child in sorted(self.dependencies.get(node_key, [])):
                 dfs(child, depth + 1)
 
-        start_key = self.root_key or f"::{self.start_table.lower()}"
+        start_key = self.root_key
+        if not start_key:
+            if "." in self.start_table:
+                schema_part, table_part = self.start_table.split(".", 1)
+            else:
+                schema_part, table_part = "", self.start_table
+            start_key = f"{schema_part.lower()}::{table_part.lower()}"
         if not start_key:
             return
         dfs(start_key, 0)
