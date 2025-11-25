@@ -34,6 +34,10 @@ LOGGER = logging.getLogger("ikg-metadata")
 
 TEMPLATE_PATTERN = re.compile(r"\{\{\s*([^}]+?)\s*\}\}")
 DISTRIBUTED_BY_PATTERN = re.compile(r"DISTRIBUTED\s+BY\s*\([^;]*\)", re.IGNORECASE)
+DO_BLOCK_PATTERN = re.compile(
+    r"DO\s+\$(?P<tag>[A-Za-z0-9_]*)\$(.*?)\$(?P=tag)\$\s*;",
+    re.IGNORECASE | re.DOTALL,
+)
 SKIP_PREFIXES = ("ALTER", "GRANT")
 
 
@@ -219,12 +223,35 @@ def strip_greenplum_specifics(sql_text: str) -> str:
     return DISTRIBUTED_BY_PATTERN.sub("", sql_text)
 
 
+def remove_do_blocks(sql_text: str) -> str:
+    """Remove DO $$ ... $$ blocks which are not relevant for metadata extraction."""
+    return DO_BLOCK_PATTERN.sub("", sql_text)
+
+
 @dataclass
 class SqlFile:
     path: str
     filename: str
     process: str
     content: str
+
+
+class ErrorLogger:
+    def __init__(self, output_dir: Path) -> None:
+        self.path = (output_dir / "error.txt").resolve()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("", encoding="utf-8")
+
+    def log_error(self, message: str) -> None:
+        self._write("ERROR", message)
+
+    def log_warning(self, message: str) -> None:
+        self._write("WARNING", message)
+
+    def _write(self, level: str, message: str) -> None:
+        timestamp = _now_utc().isoformat()
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(f"[{timestamp}] [{level}] {message}\n")
 
 
 class GitLabSqlFetcher:
@@ -463,11 +490,12 @@ class SqlMetadataExtractor:
         self,
         sql_file: SqlFile,
         run_timestamp: datetime,
-        error_log: Optional[List[str]] = None,
+        error_logger: Optional[ErrorLogger] = None,
     ) -> List[Dict[str, object]]:
         normalizer = TemplateNormalizer()
         normalized = normalizer.normalize(sql_file.content)
-        statements = split_statements(normalized)
+        cleaned = remove_do_blocks(normalized)
+        statements = split_statements(cleaned)
         rows: List[Dict[str, object]] = []
         drop_cache: Dict[str, str] = {}
         for raw_statement in statements:
@@ -486,8 +514,8 @@ class SqlMetadataExtractor:
             except (ParseError, SqlglotError) as exc:
                 message = f"{sql_file.path}: {exc}"
                 LOGGER.error("Failed to parse %s: %s", sql_file.path, exc)
-                if error_log is not None:
-                    error_log.append(message)
+                if error_logger is not None:
+                    error_logger.log_error(message)
                 continue
             logic_text = normalizer.restore(raw_statement)
             if isinstance(expr, exp.Drop) and isinstance(expr.this, exp.Table):
@@ -512,6 +540,7 @@ class SqlMetadataExtractor:
                         combined_logic,
                         run_timestamp,
                         normalizer,
+                        error_logger,
                     )
                 )
                 if isinstance(expr.expression, exp.Expression):
@@ -531,6 +560,7 @@ class SqlMetadataExtractor:
                         logic_text,
                         run_timestamp,
                         normalizer,
+                        error_logger,
                     )
                 )
         return rows
@@ -543,6 +573,7 @@ class SqlMetadataExtractor:
         logic_text: str,
         run_timestamp: datetime,
         normalizer: TemplateNormalizer,
+        error_logger: Optional[ErrorLogger],
     ) -> List[Dict[str, object]]:
         if not isinstance(query, exp.Expression):
             LOGGER.debug("Skipping %s (no SELECT body)", target_table)
@@ -572,7 +603,10 @@ class SqlMetadataExtractor:
                 select_expr = candidate
                 break
         if not select_expr:
-            LOGGER.warning("No SELECT found for %s in %s", target_table, sql_file.path)
+            message = f"No SELECT found for target table {target_table} in {sql_file.path}"
+            LOGGER.warning(message)
+            if error_logger:
+                error_logger.log_warning(message)
             return rows
         sources_override = {
             name: source
@@ -606,13 +640,10 @@ class SqlMetadataExtractor:
                     trim_selects=False,
                 )
             except SqlglotError as exc:
-                LOGGER.warning(
-                    "Lineage failed for %s.%s (%s): %s",
-                    target_table,
-                    column_alias,
-                    sql_file.path,
-                    exc,
-                )
+                message = f"Lineage failed for {target_table}.{column_alias} in {sql_file.path}: {exc}"
+                LOGGER.warning(message)
+                if error_logger:
+                    error_logger.log_warning(message)
                 continue
             for leaf in iter_lineage_leaves(lineage_node):
                 table_part, column_part = self._split_leaf_name(leaf.name)
@@ -749,18 +780,6 @@ def write_excel(dataframe: pd.DataFrame, path: Path) -> None:
     dataframe.to_excel(path, index=False, engine="xlwt")
 
 
-def write_error_log(errors: List[str], output_dir: Path) -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    path = output_dir / "error.txt"
-    with path.open("w", encoding="utf-8") as handle:
-        if errors:
-            handle.write("\n".join(errors))
-        else:
-            handle.write("No parser errors.\n")
-    LOGGER.info("Error log written to %s", path)
-    return path
-
-
 def run_pipeline(settings: Settings) -> Path:
     logging.basicConfig(
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
@@ -771,27 +790,28 @@ def run_pipeline(settings: Settings) -> Path:
     sql_files = fetcher.fetch_sql_files()
     resolver = GreenplumMetadataResolver(settings)
     extractor = SqlMetadataExtractor(resolver, settings)
+    error_logger = ErrorLogger(settings.output_dir)
     run_ts = _now_utc()
+    output_path = settings.output_path
     all_rows: List[Dict[str, object]] = []
-    error_messages: List[str] = []
     for sql_file in sql_files:
         LOGGER.info("Parsing %s", sql_file.path)
         try:
-            rows = extractor.process_file(sql_file, run_ts, error_log=error_messages)
+            rows = extractor.process_file(sql_file, run_ts, error_logger=error_logger)
         except Exception as exc:  # noqa: BLE001
             message = f"{sql_file.path}: {exc}"
             LOGGER.exception("Unhandled error while parsing %s", sql_file.path)
-            error_messages.append(message)
+            error_logger.log_error(message)
             continue
         all_rows.extend(rows)
+        dataframe = pd.DataFrame(all_rows)
+        write_excel(dataframe, output_path)
     if not all_rows:
         LOGGER.warning("No metadata rows generated.")
     dataframe = pd.DataFrame(all_rows)
-    output_path = settings.output_path
     write_excel(dataframe, output_path)
     resolver.reset_table(dataframe)
     resolver.close()
-    write_error_log(error_messages, settings.output_dir)
     LOGGER.info("Pipeline complete")
     return output_path
 
