@@ -25,7 +25,7 @@ import pandas as pd
 import psycopg2
 from gitlab import exceptions as gl_exceptions
 from psycopg2.extras import execute_values
-from sqlglot import exp, parse
+from sqlglot import exp, parse_one
 from sqlglot.errors import ParseError, SqlglotError
 from sqlglot.lineage import lineage
 from sqlglot.tokens import TokenType, Tokenizer
@@ -34,6 +34,7 @@ LOGGER = logging.getLogger("ikg-metadata")
 
 TEMPLATE_PATTERN = re.compile(r"\{\{\s*([^}]+?)\s*\}\}")
 DISTRIBUTED_BY_PATTERN = re.compile(r"DISTRIBUTED\s+BY\s*\([^;]*\)", re.IGNORECASE)
+SKIP_PREFIXES = ("ALTER", "GRANT")
 
 
 def _now_utc() -> datetime:
@@ -419,11 +420,14 @@ def collect_table_refs(expression: exp.Expression, normalizer: TemplateNormalize
         alias = table.alias_or_name
         if not alias:
             continue
+        table_name_value = get_identifier_name(table.this)
+        if not table_name_value:
+            continue
         schema_token = get_identifier_name(table.db) if table.db else None
         refs.append(
             TableRef(
                 alias=alias.lower(),
-                name=get_identifier_name(table.this) or "",
+                name=table_name_value,
                 schema_token=schema_token,
                 display_schema=normalizer.restore_identifier(schema_token),
             )
@@ -431,12 +435,18 @@ def collect_table_refs(expression: exp.Expression, normalizer: TemplateNormalize
     return refs
 
 
-def iter_lineage_leaves(node) -> Iterator:
-    if not getattr(node, "downstream", None):
+def iter_lineage_leaves(node, visited: Optional[set] = None) -> Iterator:
+    visited = visited or set()
+    node_id = id(node)
+    if node_id in visited:
+        return
+    visited.add(node_id)
+    downstream = getattr(node, "downstream", None)
+    if not downstream:
         yield node
         return
-    for child in node.downstream:
-        yield from iter_lineage_leaves(child)
+    for child in downstream:
+        yield from iter_lineage_leaves(child, visited)
 
 
 class SqlMetadataExtractor:
@@ -458,31 +468,26 @@ class SqlMetadataExtractor:
         normalizer = TemplateNormalizer()
         normalized = normalizer.normalize(sql_file.content)
         statements = split_statements(normalized)
-        parse_ready = strip_greenplum_specifics(normalized)
-        try:
-            expressions = parse(parse_ready, read="postgres")
-        except ParseError as exc:
-            message = f"{sql_file.path}: {exc}"
-            LOGGER.error("Failed to parse %s: %s", sql_file.path, exc)
-            if error_log is not None:
-                error_log.append(message)
-            return []
-        if len(expressions) != len(statements):
-            LOGGER.warning(
-                "Statement count mismatch in %s (parsed=%d vs split=%d)",
-                sql_file.path,
-                len(expressions),
-                len(statements),
-            )
         rows: List[Dict[str, object]] = []
         drop_cache: Dict[str, str] = {}
-        for idx, expr in enumerate(expressions):
-            raw_statement = (
-                statements[idx] if idx < len(statements) else expr.sql(dialect="postgres")
-            )
+        for raw_statement in statements:
             stripped = raw_statement.lstrip()
-            if stripped.upper().startswith(("ALTER", "GRANT")):
-                LOGGER.debug("Skipping %s statement in %s", stripped.split(None, 1)[0], sql_file.path)
+            if not stripped:
+                continue
+            keyword = stripped.split(None, 1)[0].upper()
+            if keyword.startswith(SKIP_PREFIXES):
+                LOGGER.debug("Skipping %s statement in %s", keyword, sql_file.path)
+                continue
+            sanitized_statement = strip_greenplum_specifics(raw_statement)
+            if not sanitized_statement.strip():
+                continue
+            try:
+                expr = parse_one(sanitized_statement, read="postgres")
+            except (ParseError, SqlglotError) as exc:
+                message = f"{sql_file.path}: {exc}"
+                LOGGER.error("Failed to parse %s: %s", sql_file.path, exc)
+                if error_log is not None:
+                    error_log.append(message)
                 continue
             logic_text = normalizer.restore(raw_statement)
             if isinstance(expr, exp.Drop) and isinstance(expr.this, exp.Table):
@@ -574,6 +579,19 @@ class SqlMetadataExtractor:
             for name, source in self.sources_map.items()
         }
         for projection in select_expr.expressions:
+            if self._is_star_projection(projection):
+                logic_sql = normalizer.restore(projection.sql(dialect="postgres"))
+                self._append_star_row(
+                    rows,
+                    sql_file,
+                    target_table,
+                    logic_sql,
+                    projection,
+                    alias_map,
+                    seen,
+                    run_timestamp,
+                )
+                continue
             column_alias = projection.alias_or_name
             if not column_alias:
                 continue
@@ -661,6 +679,68 @@ class SqlMetadataExtractor:
                 ", ".join(ref.name for ref in matches),
             )
         return None
+
+    def _is_star_projection(self, projection: exp.Expression) -> bool:
+        if isinstance(projection, exp.Column) and getattr(projection, "is_star", False):
+            return True
+        return isinstance(projection, exp.Star)
+
+    def _get_star_table_alias(self, projection: exp.Expression) -> Optional[str]:
+        if isinstance(projection, exp.Column) and getattr(projection, "is_star", False):
+            return projection.table
+        if isinstance(projection, exp.Star):
+            identifier = projection.args.get("this")
+            if isinstance(identifier, exp.Identifier):
+                return identifier.name
+            if isinstance(identifier, str):
+                return identifier
+        return None
+
+    def _append_star_row(
+        self,
+        rows: List[Dict[str, object]],
+        sql_file: SqlFile,
+        target_table: str,
+        logic_sql: str,
+        projection: exp.Expression,
+        alias_map: Dict[str, TableRef],
+        seen: set,
+        run_timestamp: datetime,
+    ) -> None:
+        table_alias = self._get_star_table_alias(projection)
+        table_ref = alias_map.get(table_alias.lower()) if table_alias else None
+        source_schema = table_ref.display_schema if table_ref and table_ref.display_schema else ""
+        if table_ref:
+            source_table = table_ref.name
+        elif table_alias:
+            source_table = table_alias
+        else:
+            source_table = "*"
+        row_key = (
+            target_table.lower(),
+            logic_sql,
+            source_schema or "",
+            source_table or "",
+            "*",
+            "",
+        )
+        if row_key in seen:
+            return
+        seen.add(row_key)
+        rows.append(
+            {
+                "filename": sql_file.filename,
+                "filepath": sql_file.path,
+                "process": sql_file.process,
+                "target_table": target_table,
+                "source_schema": source_schema,
+                "source_table": source_table,
+                "source_column": "*",
+                "column_alias": "",
+                "logic": logic_sql,
+                "current_timestamp": run_timestamp,
+            }
+        )
 
 
 def write_excel(dataframe: pd.DataFrame, path: Path) -> None:
