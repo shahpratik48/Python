@@ -40,6 +40,26 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def get_identifier_name(identifier: Optional[object]) -> Optional[str]:
+    if identifier is None:
+        return None
+    if hasattr(identifier, "name"):
+        return identifier.name  # type: ignore[attr-defined]
+    return str(identifier)
+
+
+def get_table_name(table_expr: Optional[exp.Table]) -> Optional[str]:
+    if not isinstance(table_expr, exp.Table):
+        return None
+    return get_identifier_name(table_expr.this)
+
+
+def get_table_schema(table_expr: Optional[exp.Table]) -> Optional[str]:
+    if not isinstance(table_expr, exp.Table) or not table_expr.db:
+        return None
+    return get_identifier_name(table_expr.db)
+
+
 @dataclass
 class Settings:
     gitlab_url: str = os.getenv("GITLAB_URL", "https://devcloud.ubs.net")
@@ -399,11 +419,11 @@ def collect_table_refs(expression: exp.Expression, normalizer: TemplateNormalize
         alias = table.alias_or_name
         if not alias:
             continue
-        schema_token = table.db.name if table.db else None
+        schema_token = get_identifier_name(table.db) if table.db else None
         refs.append(
             TableRef(
                 alias=alias.lower(),
-                name=table.this.name,
+                name=get_identifier_name(table.this) or "",
                 schema_token=schema_token,
                 display_schema=normalizer.restore_identifier(schema_token),
             )
@@ -449,39 +469,52 @@ class SqlMetadataExtractor:
         rows: List[Dict[str, object]] = []
         drop_cache: Dict[str, str] = {}
         for idx, expr in enumerate(expressions):
-            logic_text = normalizer.restore(
+            raw_statement = (
                 statements[idx] if idx < len(statements) else expr.sql(dialect="postgres")
             )
+            stripped = raw_statement.lstrip()
+            if stripped.upper().startswith(("ALTER", "GRANT")):
+                LOGGER.debug("Skipping %s statement in %s", stripped.split(None, 1)[0], sql_file.path)
+                continue
+            logic_text = normalizer.restore(raw_statement)
             if isinstance(expr, exp.Drop) and isinstance(expr.this, exp.Table):
-                schema_key = expr.this.db.name.lower() if expr.this.db else ""
-                table_key = f"{schema_key}.{expr.this.this.name.lower()}"
+                schema_name = (get_table_schema(expr.this) or "").lower()
+                table_id = get_table_name(expr.this) or ""
+                table_key = f"{schema_name}.{table_id.lower()}"
                 drop_cache[table_key] = logic_text
                 continue
             if isinstance(expr, exp.Create) and isinstance(expr.this, exp.Table):
-                table_schema = expr.this.db.name if expr.this.db else None
-                table_name = expr.this.this.name
-                table_key = f"{(table_schema or '').lower()}.{table_name.lower()}"
+                table_schema_name = get_table_schema(expr.this)
+                created_table_name = get_table_name(expr.this)
+                if not created_table_name:
+                    continue
+                table_key = f"{(table_schema_name or '').lower()}.{created_table_name.lower()}"
                 drop_sql = drop_cache.pop(table_key, "")
                 combined_logic = f"{drop_sql}\n{logic_text}".strip()
                 rows.extend(
                     self._handle_select_target(
                         sql_file,
                         expr.expression,
-                        table_name,
+                        created_table_name,
                         combined_logic,
                         run_timestamp,
                         normalizer,
                     )
                 )
                 if isinstance(expr.expression, exp.Expression):
-                    self.sources_map[table_name.lower()] = expr.expression
+                    self.sources_map[created_table_name.lower()] = expr.expression
             elif isinstance(expr, exp.Insert):
-                target_table = expr.this.this.this.name if isinstance(expr.this, exp.Schema) else "unknown"
+                target_table_expr: Optional[exp.Table] = None
+                if isinstance(expr.this, exp.Schema) and isinstance(expr.this.this, exp.Table):
+                    target_table_expr = expr.this.this
+                elif isinstance(expr.this, exp.Table):
+                    target_table_expr = expr.this
+                target_table_name = get_table_name(target_table_expr) or "unknown"
                 rows.extend(
                     self._handle_select_target(
                         sql_file,
                         expr.expression,
-                        target_table,
+                        target_table_name,
                         logic_text,
                         run_timestamp,
                         normalizer,
@@ -536,7 +569,7 @@ class SqlMetadataExtractor:
             column_alias = projection.alias_or_name
             if not column_alias:
                 continue
-            logic_sql = self.normalizer.restore(projection.sql(dialect="postgres"))
+            logic_sql = normalizer.restore(projection.sql(dialect="postgres"))
             try:
                 lineage_node = lineage(
                     column_alias,
