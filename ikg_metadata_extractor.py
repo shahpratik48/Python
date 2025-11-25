@@ -417,7 +417,7 @@ class GreenplumMetadataResolver:
             source_column TEXT,
             column_alias TEXT,
             logic TEXT,
-            current_timestamp TIMESTAMPTZ
+            recorded_at TIMESTAMPTZ
         """
         drop_sql = f"DROP TABLE IF EXISTS {self.settings.target_table};"
         create_sql = (
@@ -429,7 +429,7 @@ class GreenplumMetadataResolver:
             INSERT INTO {self.settings.target_table} (
                 filename, filepath, process, target_table,
                 source_schema, source_table, source_column,
-                column_alias, logic, current_timestamp
+                column_alias, logic, recorded_at
             ) VALUES %s
         """
         records = dataframe.fillna("").to_records(index=False)
@@ -606,7 +606,7 @@ class SqlMetadataExtractor:
                 "source_column": "",
                 "column_alias": "",
                 "logic": logic_text,
-                "current_timestamp": run_timestamp,
+                "recorded_at": run_timestamp,
             }
         ]
         select_expr = None
@@ -694,7 +694,7 @@ class SqlMetadataExtractor:
                         "source_column": column_part,
                         "column_alias": column_alias if column_alias != column_part else "",
                         "logic": logic_sql,
-                        "current_timestamp": run_timestamp,
+                        "recorded_at": run_timestamp,
                     }
                 )
         return rows
@@ -781,7 +781,7 @@ class SqlMetadataExtractor:
                 "source_column": "*",
                 "column_alias": "",
                 "logic": logic_sql,
-                "current_timestamp": run_timestamp,
+                "recorded_at": run_timestamp,
             }
         )
 
