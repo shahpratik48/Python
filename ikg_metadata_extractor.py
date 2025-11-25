@@ -119,10 +119,13 @@ class Settings:
             )
         else:
             path_obj = Path(filename)
-            suffix = path_obj.suffix or ".xls"
+            suffix = path_obj.suffix or ".xlsx"
             stem = path_obj.stem or "ikg_metadata"
             filename = f"{stem}_{date_str}_{time_str}{suffix}"
-        return (self.output_dir / filename).resolve()
+        path = (self.output_dir / filename).resolve()
+        if path.suffix.lower() != ".xlsx":
+            path = path.with_suffix(".xlsx")
+        return path
 
     @classmethod
     def from_args(cls) -> "Settings":
@@ -783,43 +786,12 @@ class SqlMetadataExtractor:
         )
 
 
-EXCEL_CELL_CHAR_LIMIT = 32767
-
-
-def _truncate_for_xls(dataframe: pd.DataFrame) -> pd.DataFrame:
-    if dataframe.empty:
-        return dataframe
-    truncated = dataframe.copy()
-    truncated_flag = False
-
-    def truncate_value(value):
-        nonlocal truncated_flag
-        if isinstance(value, str) and len(value) > EXCEL_CELL_CHAR_LIMIT:
-            truncated_flag = True
-            return value[:EXCEL_CELL_CHAR_LIMIT]
-        return value
-
-    for column in truncated.columns:
-        truncated[column] = truncated[column].apply(truncate_value)
-    if truncated_flag:
-        LOGGER.warning(
-            "One or more cells exceeded %d characters and were truncated for XLS output",
-            EXCEL_CELL_CHAR_LIMIT,
-        )
-    return truncated
-
-
 def write_excel(dataframe: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    suffix = path.suffix.lower()
-    if suffix in (".xlsx", ".xlsm", ".xltx", ".xltm"):
-        engine = "openpyxl"
-        safe_df = dataframe
-    else:
-        engine = "xlwt"
-        safe_df = _truncate_for_xls(dataframe)
-    LOGGER.info("Writing Excel output to %s using %s", path, engine)
-    safe_df.to_excel(path, index=False, engine=engine)
+    if path.suffix.lower() != ".xlsx":
+        path = path.with_suffix(".xlsx")
+    LOGGER.info("Writing Excel output to %s using openpyxl", path)
+    dataframe.to_excel(path, index=False, engine="openpyxl")
 
 
 def run_pipeline(settings: Settings) -> Path:
