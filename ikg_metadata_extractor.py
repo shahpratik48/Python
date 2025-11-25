@@ -104,6 +104,7 @@ class Settings:
     table_reader_role: str = os.getenv(
         "GREENPLUM_TABLE_READER_ROLE", "erd_gpdb_prj_smart_insights_ro"
     )
+    files_to_parse: str = os.getenv("FILES_TO_PARSE", "ALL")
 
     @property
     def output_path(self) -> Path:
@@ -142,6 +143,11 @@ class Settings:
             default=os.getenv("LOG_LEVEL", "INFO"),
             help="Logging level (DEBUG, INFO, ...)",
         )
+        parser.add_argument(
+            "--files-to-parse",
+            help="Number of SQL files to process (integer) or ALL",
+            default=os.getenv("FILES_TO_PARSE", "ALL"),
+        )
         parser.add_argument("--prompt-secrets", action="store_true")
         args = parser.parse_args()
 
@@ -158,6 +164,8 @@ class Settings:
             settings.output_dir = Path(args.output_dir)
         if args.log_level:
             settings.log_level = args.log_level
+        if args.files_to_parse:
+            settings.files_to_parse = args.files_to_parse
 
         if settings.project_id == "":
             parser.error("PROJECT_ID must be provided via env or --project-id")
@@ -790,8 +798,43 @@ def write_excel(dataframe: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.suffix.lower() != ".xlsx":
         path = path.with_suffix(".xlsx")
+    safe_df = _prepare_dataframe_for_excel(dataframe)
     LOGGER.info("Writing Excel output to %s using openpyxl", path)
-    dataframe.to_excel(path, index=False, engine="openpyxl")
+    safe_df.to_excel(path, index=False, engine="openpyxl")
+
+
+def _prepare_dataframe_for_excel(dataframe: pd.DataFrame) -> pd.DataFrame:
+    if dataframe.empty:
+        return dataframe
+    safe_df = dataframe.copy()
+    datetime_cols = safe_df.select_dtypes(include=["datetimetz"]).columns
+    for col in datetime_cols:
+        safe_df[col] = safe_df[col].dt.tz_convert("UTC").dt.tz_localize(None)
+    object_cols = [col for col in safe_df.columns if safe_df[col].dtype == "object"]
+    for col in object_cols:
+        safe_df[col] = safe_df[col].apply(_strip_timezone_from_value)
+    return safe_df
+
+
+def _strip_timezone_from_value(value):
+    if isinstance(value, datetime) and value.tzinfo:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+def _parse_files_limit(value: str) -> Optional[int]:
+    if not value:
+        return None
+    cleaned = value.strip()
+    if not cleaned or cleaned.upper() == "ALL":
+        return None
+    try:
+        limit = int(cleaned)
+        if limit > 0:
+            return limit
+    except ValueError:
+        LOGGER.warning("Invalid files_to_parse value '%s'. Processing all files.", value)
+    return None
 
 
 def run_pipeline(settings: Settings) -> Path:
@@ -808,6 +851,8 @@ def run_pipeline(settings: Settings) -> Path:
     run_ts = _now_utc()
     output_path = settings.output_path
     all_rows: List[Dict[str, object]] = []
+    max_files = _parse_files_limit(settings.files_to_parse)
+    processed_files = 0
     for sql_file in sql_files:
         LOGGER.info("Parsing %s", sql_file.path)
         try:
@@ -820,6 +865,13 @@ def run_pipeline(settings: Settings) -> Path:
         all_rows.extend(rows)
         dataframe = pd.DataFrame(all_rows)
         write_excel(dataframe, output_path)
+        processed_files += 1
+        if max_files is not None and processed_files >= max_files:
+            LOGGER.info(
+                "Reached files_to_parse limit (%d). Stopping further processing.",
+                max_files,
+            )
+            break
     if not all_rows:
         LOGGER.warning("No metadata rows generated.")
     dataframe = pd.DataFrame(all_rows)
