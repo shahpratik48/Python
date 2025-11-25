@@ -108,11 +108,20 @@ class Settings:
     @property
     def output_path(self) -> Path:
         today = _now_utc()
-        filename = (
-            self.output_file_template.replace("<date>", today.strftime("%Y%m%d"))
-            .replace("<timestamp>", today.strftime("%H%M%S"))
-            .strip()
-        )
+        date_str = today.strftime("%Y%m%d")
+        time_str = today.strftime("%H%M%S")
+        filename = self.output_file_template.strip()
+        if "<date>" in filename or "<timestamp>" in filename:
+            filename = (
+                filename.replace("<date>", date_str)
+                .replace("<timestamp>", time_str)
+                .strip()
+            )
+        else:
+            path_obj = Path(filename)
+            suffix = path_obj.suffix or ".xls"
+            stem = path_obj.stem or "ikg_metadata"
+            filename = f"{stem}_{date_str}_{time_str}{suffix}"
         return (self.output_dir / filename).resolve()
 
     @classmethod
