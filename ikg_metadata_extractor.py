@@ -167,9 +167,6 @@ class Settings:
                 settings.private_token = getpass.getpass("GitLab Private Token: ")
             if not settings.greenplum_password:
                 settings.greenplum_password = getpass.getpass("Greenplum password: ")
-            if settings.files_to_parse.upper() == "ALL":
-                user_input = getpass.getpass("Number of SQL files to parse (ALL for every file): ") or "ALL"
-                settings.files_to_parse = user_input
         else:
             if not settings.private_token:
                 raise SystemExit(
@@ -179,12 +176,6 @@ class Settings:
                 raise SystemExit(
                     "Missing GREENPLUM_PASSWORD. Set env var or run with --prompt-secrets."
                 )
-            user_input = (
-                os.getenv("FILES_TO_PARSE")
-                or input("Number of SQL files to parse (ALL for every file): ").strip()
-            )
-            if user_input:
-                settings.files_to_parse = user_input
 
         if not settings.greenplum_db or not settings.greenplum_user:
             raise SystemExit(
