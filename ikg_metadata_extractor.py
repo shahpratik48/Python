@@ -449,7 +449,12 @@ class SqlMetadataExtractor:
         self.settings = settings
         self.sources_map: Dict[str, exp.Expression] = {}
 
-    def process_file(self, sql_file: SqlFile, run_timestamp: datetime) -> List[Dict[str, object]]:
+    def process_file(
+        self,
+        sql_file: SqlFile,
+        run_timestamp: datetime,
+        error_log: Optional[List[str]] = None,
+    ) -> List[Dict[str, object]]:
         normalizer = TemplateNormalizer()
         normalized = normalizer.normalize(sql_file.content)
         statements = split_statements(normalized)
@@ -457,7 +462,10 @@ class SqlMetadataExtractor:
         try:
             expressions = parse(parse_ready, read="postgres")
         except ParseError as exc:
+            message = f"{sql_file.path}: {exc}"
             LOGGER.error("Failed to parse %s: %s", sql_file.path, exc)
+            if error_log is not None:
+                error_log.append(message)
             return []
         if len(expressions) != len(statements):
             LOGGER.warning(
@@ -661,6 +669,18 @@ def write_excel(dataframe: pd.DataFrame, path: Path) -> None:
     dataframe.to_excel(path, index=False, engine="xlwt")
 
 
+def write_error_log(errors: List[str], output_dir: Path) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / "error.txt"
+    with path.open("w", encoding="utf-8") as handle:
+        if errors:
+            handle.write("\n".join(errors))
+        else:
+            handle.write("No parser errors.\n")
+    LOGGER.info("Error log written to %s", path)
+    return path
+
+
 def run_pipeline(settings: Settings) -> Path:
     logging.basicConfig(
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
@@ -673,9 +693,16 @@ def run_pipeline(settings: Settings) -> Path:
     extractor = SqlMetadataExtractor(resolver, settings)
     run_ts = _now_utc()
     all_rows: List[Dict[str, object]] = []
+    error_messages: List[str] = []
     for sql_file in sql_files:
         LOGGER.info("Parsing %s", sql_file.path)
-        rows = extractor.process_file(sql_file, run_ts)
+        try:
+            rows = extractor.process_file(sql_file, run_ts, error_log=error_messages)
+        except Exception as exc:  # noqa: BLE001
+            message = f"{sql_file.path}: {exc}"
+            LOGGER.exception("Unhandled error while parsing %s", sql_file.path)
+            error_messages.append(message)
+            continue
         all_rows.extend(rows)
     if not all_rows:
         LOGGER.warning("No metadata rows generated.")
@@ -684,6 +711,7 @@ def run_pipeline(settings: Settings) -> Path:
     write_excel(dataframe, output_path)
     resolver.reset_table(dataframe)
     resolver.close()
+    write_error_log(error_messages, settings.output_dir)
     LOGGER.info("Pipeline complete")
     return output_path
 
