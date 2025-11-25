@@ -77,7 +77,7 @@ class Settings:
     private_token: Optional[str] = os.getenv("PRIVATE_TOKEN")
     output_dir: Path = Path(os.getenv("OUTPUT_DIR") or Path.cwd())
     output_file_template: str = os.getenv(
-        "OUTPUT_FILE", "ikg_metadata_<date>_<timestamp>.xls"
+        "OUTPUT_FILE", "ikg_metadata_<date>_<timestamp>.xlsx"
     )
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
     greenplum_host: str = os.getenv("GREENPLUM_HOST", "localhost")
@@ -783,10 +783,43 @@ class SqlMetadataExtractor:
         )
 
 
+EXCEL_CELL_CHAR_LIMIT = 32767
+
+
+def _truncate_for_xls(dataframe: pd.DataFrame) -> pd.DataFrame:
+    if dataframe.empty:
+        return dataframe
+    truncated = dataframe.copy()
+    truncated_flag = False
+
+    def truncate_value(value):
+        nonlocal truncated_flag
+        if isinstance(value, str) and len(value) > EXCEL_CELL_CHAR_LIMIT:
+            truncated_flag = True
+            return value[:EXCEL_CELL_CHAR_LIMIT]
+        return value
+
+    for column in truncated.columns:
+        truncated[column] = truncated[column].apply(truncate_value)
+    if truncated_flag:
+        LOGGER.warning(
+            "One or more cells exceeded %d characters and were truncated for XLS output",
+            EXCEL_CELL_CHAR_LIMIT,
+        )
+    return truncated
+
+
 def write_excel(dataframe: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    LOGGER.info("Writing Excel output to %s", path)
-    dataframe.to_excel(path, index=False, engine="xlwt")
+    suffix = path.suffix.lower()
+    if suffix in (".xlsx", ".xlsm", ".xltx", ".xltm"):
+        engine = "openpyxl"
+        safe_df = dataframe
+    else:
+        engine = "xlwt"
+        safe_df = _truncate_for_xls(dataframe)
+    LOGGER.info("Writing Excel output to %s using %s", path, engine)
+    safe_df.to_excel(path, index=False, engine=engine)
 
 
 def run_pipeline(settings: Settings) -> Path:
