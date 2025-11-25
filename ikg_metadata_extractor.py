@@ -143,11 +143,6 @@ class Settings:
             default=os.getenv("LOG_LEVEL", "INFO"),
             help="Logging level (DEBUG, INFO, ...)",
         )
-        parser.add_argument(
-            "--files-to-parse",
-            help="Number of SQL files to process (integer) or ALL",
-            default=os.getenv("FILES_TO_PARSE", "ALL"),
-        )
         parser.add_argument("--prompt-secrets", action="store_true")
         args = parser.parse_args()
 
@@ -164,9 +159,6 @@ class Settings:
             settings.output_dir = Path(args.output_dir)
         if args.log_level:
             settings.log_level = args.log_level
-        if args.files_to_parse:
-            settings.files_to_parse = args.files_to_parse
-
         if settings.project_id == "":
             parser.error("PROJECT_ID must be provided via env or --project-id")
 
@@ -175,6 +167,9 @@ class Settings:
                 settings.private_token = getpass.getpass("GitLab Private Token: ")
             if not settings.greenplum_password:
                 settings.greenplum_password = getpass.getpass("Greenplum password: ")
+            if settings.files_to_parse.upper() == "ALL":
+                user_input = getpass.getpass("Number of SQL files to parse (ALL for every file): ") or "ALL"
+                settings.files_to_parse = user_input
         else:
             if not settings.private_token:
                 raise SystemExit(
@@ -184,6 +179,12 @@ class Settings:
                 raise SystemExit(
                     "Missing GREENPLUM_PASSWORD. Set env var or run with --prompt-secrets."
                 )
+            user_input = (
+                os.getenv("FILES_TO_PARSE")
+                or input("Number of SQL files to parse (ALL for every file): ").strip()
+            )
+            if user_input:
+                settings.files_to_parse = user_input
 
         if not settings.greenplum_db or not settings.greenplum_user:
             raise SystemExit(
