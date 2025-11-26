@@ -597,6 +597,9 @@ class SqlMetadataExtractor:
         self.metadata_resolver.ensure_tables([ref.name for ref in table_refs])
         schema_dict = self.metadata_resolver.build_schema_dict(table_refs)
         alias_map = {ref.alias: ref for ref in table_refs}
+        current_target_sources = {
+            ref.alias: sources_map.get(ref.name.lower()) for ref in table_refs
+        }
         row_accumulator: Dict[
             Tuple[str, str, str, str, str, str, str, str],
             Dict[str, object],
@@ -677,6 +680,7 @@ class SqlMetadataExtractor:
                     add_row,
                     base_row,
                     sources_map,
+                    current_target_sources,
                 )
                 continue
             if self._is_static_projection(projection):
@@ -859,6 +863,7 @@ class SqlMetadataExtractor:
         add_row: Callable[[Dict[str, object], Optional[str]], None],
         base_row_fn: Callable[..., Dict[str, object]],
         sources_map: Dict[str, exp.Expression],
+        current_target_sources: Dict[str, Optional[exp.Expression]],
     ) -> None:
         table_alias = self._get_star_table_alias(projection)
         target_refs: List[TableRef] = []
@@ -870,7 +875,7 @@ class SqlMetadataExtractor:
             target_refs.extend(alias_map.values())
 
         for ref in target_refs:
-            for column_name, source_schema in self._get_columns_for_table_ref(ref, sources_map):
+            for column_name, source_schema in self._get_columns_for_table_ref(ref, sources_map, current_target_sources):
                 add_row(
                     base_row_fn(
                         logic=logic_sql,
@@ -882,11 +887,15 @@ class SqlMetadataExtractor:
                 )
 
     def _get_columns_for_table_ref(
-        self, table_ref: TableRef, sources_map: Dict[str, exp.Expression]
+        self,
+        table_ref: TableRef,
+        sources_map: Dict[str, exp.Expression],
+        current_target_sources: Dict[str, Optional[exp.Expression]],
     ) -> List[Tuple[str, str]]:
         if not table_ref:
             return []
-        columns = self._columns_from_sources_map(table_ref.name, sources_map)
+        expression = current_target_sources.get(table_ref.alias)
+        columns = self._columns_from_expression(expression)
         if columns:
             return [(column, table_ref.display_schema or "") for column in columns]
         metadata = self.metadata_resolver.get_metadata(table_ref.name)
