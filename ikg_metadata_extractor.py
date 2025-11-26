@@ -895,6 +895,8 @@ class SqlMetadataExtractor:
             return []
         names: List[str] = []
         for item in expression.expressions:
+            if self._is_star_projection(item):
+                continue
             alias = item.alias_or_name
             if alias:
                 names.append(alias)
@@ -913,16 +915,18 @@ class SqlMetadataExtractor:
         logic_sql: str,
         column_alias: str,
     ) -> None:
-        for column in projection.find_all(exp.Column):
+        columns = self._collect_columns_from_expression(projection)
+        for column in columns:
             source_schema, source_table = self._resolve_column_source(column, alias_map)
-            alias_value = column_alias if column_alias and column_alias != column.name else ""
+            column_name = column.name
+            alias_value = column_alias if column_alias and column_alias != column_name else ""
             add_row(
                 base_row_fn(
                     logic=logic_sql,
                     column_alias=alias_value,
                     source_schema=source_schema,
                     source_table=source_table,
-                    source_column=column.name,
+                    source_column=column_name,
                 ),
                 "SELECT",
             )
