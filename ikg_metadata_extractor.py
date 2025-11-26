@@ -417,8 +417,7 @@ class GreenplumMetadataResolver:
             source_column TEXT,
             column_alias TEXT,
             logic TEXT,
-            sql_operation TEXT,
-            recorded_at TIMESTAMPTZ
+            sql_operation TEXT
         """
         drop_sql = f"DROP TABLE IF EXISTS {self.settings.target_table};"
         create_sql = (
@@ -430,11 +429,10 @@ class GreenplumMetadataResolver:
             INSERT INTO {self.settings.target_table} (
                 filename, filepath, process, target_table,
                 source_schema, source_table, source_column,
-                column_alias, logic, sql_operation, recorded_at
+                column_alias, logic, sql_operation
             ) VALUES %s
         """
-        prepared_df = self._prepare_dataframe_for_insert(dataframe)
-        records = prepared_df.to_records(index=False)
+        records = dataframe.fillna("").to_records(index=False)
         values = [tuple(row) for row in records]
         LOGGER.info("Loading %d rows into %s", len(values), self.settings.target_table)
         with conn.cursor() as cur:
@@ -445,27 +443,6 @@ class GreenplumMetadataResolver:
             cur.execute(alter_sql)
             cur.execute(grant_sql)
         conn.commit()
-
-    def _prepare_dataframe_for_insert(self, dataframe: pd.DataFrame) -> pd.DataFrame:
-        df = dataframe.copy()
-        if "recorded_at" in df.columns:
-            df["recorded_at"] = df["recorded_at"].apply(self._ensure_tz_aware)
-        fill_map = {
-            column: ""
-            for column in df.columns
-            if column != "recorded_at"
-        }
-        if fill_map:
-            df = df.fillna(fill_map)
-        return df
-
-    @staticmethod
-    def _ensure_tz_aware(value: object) -> datetime:
-        if isinstance(value, datetime):
-            if value.tzinfo is None:
-                return value.replace(tzinfo=timezone.utc)
-            return value
-        return _now_utc()
 
 
 @dataclass
@@ -519,7 +496,6 @@ class SqlMetadataExtractor:
     ) -> None:
         self.metadata_resolver = metadata_resolver
         self.settings = settings
-        self.sources_map: Dict[str, exp.Expression] = {}
 
     def process_file(
         self,
@@ -532,6 +508,7 @@ class SqlMetadataExtractor:
         cleaned = remove_do_blocks(normalized)
         statements = split_statements(cleaned)
         rows: List[Dict[str, object]] = []
+        sources_map: Dict[str, exp.Expression] = {}
         drop_cache: Dict[str, str] = {}
         for raw_statement in statements:
             stripped = raw_statement.lstrip()
@@ -576,10 +553,11 @@ class SqlMetadataExtractor:
                         run_timestamp,
                         normalizer,
                         error_logger,
+                        sources_map,
                     )
                 )
                 if isinstance(expr.expression, exp.Expression):
-                    self.sources_map[created_table_name.lower()] = expr.expression
+                    sources_map[created_table_name.lower()] = expr.expression
             elif isinstance(expr, exp.Insert):
                 target_table_expr: Optional[exp.Table] = None
                 if isinstance(expr.this, exp.Schema) and isinstance(expr.this.this, exp.Table):
@@ -596,6 +574,7 @@ class SqlMetadataExtractor:
                         run_timestamp,
                         normalizer,
                         error_logger,
+                        sources_map,
                     )
                 )
         return rows
@@ -609,6 +588,7 @@ class SqlMetadataExtractor:
         run_timestamp: datetime,
         normalizer: TemplateNormalizer,
         error_logger: Optional[ErrorLogger],
+        sources_map: Dict[str, exp.Expression],
     ) -> List[Dict[str, object]]:
         if not isinstance(query, exp.Expression):
             LOGGER.debug("Skipping %s (no SELECT body)", target_table)
@@ -639,7 +619,6 @@ class SqlMetadataExtractor:
                 "source_column": source_column,
                 "column_alias": column_alias,
                 "logic": logic,
-                "recorded_at": run_timestamp,
             }
 
         def add_row(row: Dict[str, object], operation: Optional[str] = None) -> None:
@@ -682,8 +661,7 @@ class SqlMetadataExtractor:
                 error_logger.log_warning(message)
             return self._finalize_rows(row_accumulator)
         sources_override = {
-            name: source
-            for name, source in self.sources_map.items()
+            name: source for name, source in sources_map.items()
         }
         for projection in select_expr.expressions:
             logic_sql = normalizer.restore(projection.sql(dialect="postgres"))
