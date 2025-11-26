@@ -621,7 +621,7 @@ class SqlMetadataExtractor:
                 "logic": logic,
             }
 
-        def add_row(row: Dict[str, object], operation: Optional[str] = None) -> None:
+        def add_row(row: Dict[str, object], operation: Optional[str] = None) -> bool:
             key = (
                 row["filename"],
                 row["filepath"],
@@ -633,9 +633,11 @@ class SqlMetadataExtractor:
                 row["column_alias"] or "",
             )
             entry = row_accumulator.get(key)
+            created = False
             if not entry:
                 entry = {**row, "sql_operations": []}
                 row_accumulator[key] = entry
+                created = True
             else:
                 incoming_logic = row.get("logic")
                 if incoming_logic:
@@ -647,6 +649,7 @@ class SqlMetadataExtractor:
                 op = operation.upper()
                 if op not in entry["sql_operations"]:
                     entry["sql_operations"].append(op)
+            return created
 
         add_row(base_row(logic_text))
         select_expr = None
@@ -685,6 +688,7 @@ class SqlMetadataExtractor:
                     "SELECT",
                 )
                 continue
+            added_in_lineage = False
             try:
                 lineage_node = lineage(
                     column_alias,
@@ -699,7 +703,7 @@ class SqlMetadataExtractor:
                 LOGGER.warning(message)
                 if error_logger:
                     error_logger.log_warning(message)
-                add_row(
+                added_in_lineage |= add_row(
                     base_row(
                         logic=logic_sql,
                         column_alias=column_alias,
@@ -731,7 +735,7 @@ class SqlMetadataExtractor:
                         source_table = inferred.name
                         source_schema = inferred.display_schema or source_schema
                 alias_value = column_alias if column_alias and column_alias != column_part else ""
-                add_row(
+                added_in_lineage |= add_row(
                     base_row(
                         logic=logic_sql,
                         column_alias=alias_value,
@@ -741,14 +745,15 @@ class SqlMetadataExtractor:
                     ),
                     "SELECT",
                 )
-            self._collect_projection_columns(
-                projection,
-                alias_map,
-                add_row,
-                base_row,
-                logic_sql,
-                column_alias,
-            )
+            if not added_in_lineage:
+                self._collect_projection_columns(
+                    projection,
+                    alias_map,
+                    add_row,
+                    base_row,
+                    logic_sql,
+                    column_alias,
+                )
 
         self._collect_clause_columns(
             select_expr.args.get("where"),
@@ -926,6 +931,8 @@ class SqlMetadataExtractor:
             source_schema, source_table = self._resolve_column_source(column, alias_map)
             column_name = column.name
             alias_value = column_alias if column_alias and column_alias != column_name else ""
+            if not source_table:
+                continue
             add_row(
                 base_row_fn(
                     logic=logic_sql,
@@ -952,6 +959,8 @@ class SqlMetadataExtractor:
         logic_sql = normalizer.restore(expression.sql(dialect="postgres"))
         for column in self._collect_columns_from_expression(expression):
             source_schema, source_table = self._resolve_column_source(column, alias_map)
+            if not source_table:
+                continue
             add_row(
                 base_row_fn(
                     logic=logic_sql,
@@ -984,6 +993,8 @@ class SqlMetadataExtractor:
             table_ref = self._infer_table_from_column(column_name, alias_map)
             source_schema = table_ref.display_schema if table_ref and table_ref.display_schema else ""
             source_table = table_ref.name if table_ref else ""
+            if not source_table:
+                continue
             add_row(
                 base_row_fn(
                     logic=logic_sql,
