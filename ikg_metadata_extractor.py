@@ -18,7 +18,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import gitlab
 import pandas as pd
@@ -417,6 +417,7 @@ class GreenplumMetadataResolver:
             source_column TEXT,
             column_alias TEXT,
             logic TEXT,
+            sql_operation TEXT,
             recorded_at TIMESTAMPTZ
         """
         drop_sql = f"DROP TABLE IF EXISTS {self.settings.target_table};"
@@ -429,7 +430,7 @@ class GreenplumMetadataResolver:
             INSERT INTO {self.settings.target_table} (
                 filename, filepath, process, target_table,
                 source_schema, source_table, source_column,
-                column_alias, logic, recorded_at
+                column_alias, logic, sql_operation, recorded_at
             ) VALUES %s
         """
         records = dataframe.fillna("").to_records(index=False)
@@ -594,21 +595,59 @@ class SqlMetadataExtractor:
         self.metadata_resolver.ensure_tables([ref.name for ref in table_refs])
         schema_dict = self.metadata_resolver.build_schema_dict(table_refs)
         alias_map = {ref.alias: ref for ref in table_refs}
-        seen: set = set()
-        rows: List[Dict[str, object]] = [
-            {
+        row_accumulator: Dict[
+            Tuple[str, str, str, str, str, str, str, str],
+            Dict[str, object],
+        ] = {}
+
+        def base_row(
+            logic: str,
+            column_alias: str = "",
+            source_schema: str = "",
+            source_table: str = "",
+            source_column: str = "",
+        ) -> Dict[str, object]:
+            return {
                 "filename": sql_file.filename,
                 "filepath": sql_file.path,
                 "process": sql_file.process,
                 "target_table": target_table,
-                "source_schema": "",
-                "source_table": "",
-                "source_column": "",
-                "column_alias": "",
-                "logic": logic_text,
+                "source_schema": source_schema,
+                "source_table": source_table,
+                "source_column": source_column,
+                "column_alias": column_alias,
+                "logic": logic,
                 "recorded_at": run_timestamp,
             }
-        ]
+
+        def add_row(row: Dict[str, object], operation: Optional[str] = None) -> None:
+            key = (
+                row["filename"],
+                row["filepath"],
+                row["process"],
+                row["target_table"],
+                row["source_schema"] or "",
+                row["source_table"] or "",
+                row["source_column"] or "",
+                row["column_alias"] or "",
+            )
+            entry = row_accumulator.get(key)
+            if not entry:
+                entry = {**row, "sql_operations": []}
+                row_accumulator[key] = entry
+            else:
+                incoming_logic = row.get("logic")
+                if incoming_logic:
+                    if not entry.get("logic"):
+                        entry["logic"] = incoming_logic
+                    elif operation and operation.upper() == "SELECT":
+                        entry["logic"] = incoming_logic
+            if operation:
+                op = operation.upper()
+                if op not in entry["sql_operations"]:
+                    entry["sql_operations"].append(op)
+
+        add_row(base_row(logic_text))
         select_expr = None
         for candidate in query.walk():
             if isinstance(candidate, exp.Select):
@@ -619,29 +658,32 @@ class SqlMetadataExtractor:
             LOGGER.warning(message)
             if error_logger:
                 error_logger.log_warning(message)
-            return rows
+            return self._finalize_rows(row_accumulator)
         sources_override = {
             name: source
             for name, source in self.sources_map.items()
         }
         for projection in select_expr.expressions:
+            logic_sql = normalizer.restore(projection.sql(dialect="postgres"))
+            column_alias = projection.alias_or_name or ""
             if self._is_star_projection(projection):
-                logic_sql = normalizer.restore(projection.sql(dialect="postgres"))
-                self._append_star_row(
-                    rows,
-                    sql_file,
-                    target_table,
-                    logic_sql,
+                self._append_star_rows(
                     projection,
+                    logic_sql,
                     alias_map,
-                    seen,
-                    run_timestamp,
+                    add_row,
+                    base_row,
                 )
                 continue
-            column_alias = projection.alias_or_name
-            if not column_alias:
+            if self._is_static_projection(projection):
+                add_row(
+                    base_row(
+                        logic=logic_sql,
+                        column_alias=column_alias,
+                    ),
+                    "SELECT",
+                )
                 continue
-            logic_sql = normalizer.restore(projection.sql(dialect="postgres"))
             try:
                 lineage_node = lineage(
                     column_alias,
@@ -656,6 +698,21 @@ class SqlMetadataExtractor:
                 LOGGER.warning(message)
                 if error_logger:
                     error_logger.log_warning(message)
+                add_row(
+                    base_row(
+                        logic=logic_sql,
+                        column_alias=column_alias,
+                    ),
+                    "SELECT",
+                )
+                self._collect_projection_columns(
+                    projection,
+                    alias_map,
+                    add_row,
+                    base_row,
+                    logic_sql,
+                    column_alias,
+                )
                 continue
             for leaf in iter_lineage_leaves(lineage_node):
                 table_part, column_part = self._split_leaf_name(leaf.name)
@@ -672,32 +729,78 @@ class SqlMetadataExtractor:
                         table_ref = inferred
                         source_table = inferred.name
                         source_schema = inferred.display_schema or source_schema
-                row_key = (
-                    target_table.lower(),
-                    logic_sql,
-                    source_schema or "",
-                    source_table or "",
-                    column_part or "",
-                    column_alias or "",
+                alias_value = column_alias if column_alias and column_alias != column_part else ""
+                add_row(
+                    base_row(
+                        logic=logic_sql,
+                        column_alias=alias_value,
+                        source_schema=source_schema,
+                        source_table=source_table,
+                        source_column=column_part,
+                    ),
+                    "SELECT",
                 )
-                if row_key in seen:
-                    continue
-                seen.add(row_key)
-                rows.append(
-                    {
-                        "filename": sql_file.filename,
-                        "filepath": sql_file.path,
-                        "process": sql_file.process,
-                        "target_table": target_table,
-                        "source_schema": source_schema,
-                        "source_table": source_table,
-                        "source_column": column_part,
-                        "column_alias": column_alias if column_alias != column_part else "",
-                        "logic": logic_sql,
-                        "recorded_at": run_timestamp,
-                    }
+            self._collect_projection_columns(
+                projection,
+                alias_map,
+                add_row,
+                base_row,
+                logic_sql,
+                column_alias,
+            )
+
+        self._collect_clause_columns(
+            select_expr.args.get("where"),
+            "WHERE",
+            alias_map,
+            normalizer,
+            add_row,
+            base_row,
+        )
+        self._collect_clause_columns(
+            select_expr.args.get("having"),
+            "HAVING",
+            alias_map,
+            normalizer,
+            add_row,
+            base_row,
+        )
+        for join in select_expr.args.get("joins") or []:
+            operation = self._join_operation_label(join)
+            self._collect_clause_columns(
+                join.args.get("on"),
+                operation,
+                alias_map,
+                normalizer,
+                add_row,
+                base_row,
+            )
+            using_clause = join.args.get("using")
+            if using_clause:
+                self._collect_using_columns(
+                    using_clause,
+                    operation,
+                    alias_map,
+                    add_row,
+                    base_row,
+                    normalizer,
                 )
-        return rows
+
+        for subquery in query.find_all(exp.Subquery):
+            sub_alias_map = {
+                ref.alias: ref for ref in collect_table_refs(subquery, normalizer)
+            }
+            self._collect_clause_columns(
+                subquery,
+                "SUB QUERY",
+                sub_alias_map,
+                normalizer,
+                add_row,
+                base_row,
+                column_alias="",
+            )
+
+        return self._finalize_rows(row_accumulator)
 
     def _split_leaf_name(self, name: str) -> Tuple[str, str]:
         if "." in name:
@@ -739,51 +842,210 @@ class SqlMetadataExtractor:
                 return identifier
         return None
 
-    def _append_star_row(
+    def _is_static_projection(self, projection: exp.Expression) -> bool:
+        return not any(projection.find_all(exp.Column))
+
+    def _append_star_rows(
         self,
-        rows: List[Dict[str, object]],
-        sql_file: SqlFile,
-        target_table: str,
-        logic_sql: str,
         projection: exp.Expression,
+        logic_sql: str,
         alias_map: Dict[str, TableRef],
-        seen: set,
-        run_timestamp: datetime,
+        add_row: Callable[[Dict[str, object], Optional[str]], None],
+        base_row_fn: Callable[..., Dict[str, object]],
     ) -> None:
         table_alias = self._get_star_table_alias(projection)
-        table_ref = alias_map.get(table_alias.lower()) if table_alias else None
-        source_schema = table_ref.display_schema if table_ref and table_ref.display_schema else ""
-        if table_ref:
-            source_table = table_ref.name
-        elif table_alias:
-            source_table = table_alias
+        target_refs: List[TableRef] = []
+        if table_alias:
+            ref = alias_map.get(table_alias.lower())
+            if ref:
+                target_refs.append(ref)
         else:
-            source_table = "*"
-        row_key = (
-            target_table.lower(),
-            logic_sql,
-            source_schema or "",
-            source_table or "",
-            "*",
-            "",
-        )
-        if row_key in seen:
+            target_refs.extend(alias_map.values())
+
+        for ref in target_refs:
+            for column_name, source_schema in self._get_columns_for_table_ref(ref):
+                add_row(
+                    base_row_fn(
+                        logic=logic_sql,
+                        source_schema=source_schema or (ref.display_schema or ""),
+                        source_table=ref.name,
+                        source_column=column_name,
+                    ),
+                    "SELECT",
+                )
+
+    def _get_columns_for_table_ref(self, table_ref: TableRef) -> List[Tuple[str, str]]:
+        if not table_ref:
+            return []
+        columns = self._columns_from_sources_map(table_ref.name)
+        if columns:
+            return [(column, table_ref.display_schema or "") for column in columns]
+        metadata = self.metadata_resolver.get_metadata(table_ref.name)
+        if metadata.columns:
+            schema = (
+                table_ref.display_schema
+                or next(iter(metadata.schemas.keys()), "")
+            )
+            return [(column, schema) for column in sorted(metadata.columns)]
+        return []
+
+    def _columns_from_sources_map(self, table_name: str) -> List[str]:
+        expression = self.sources_map.get(table_name.lower())
+        if not isinstance(expression, exp.Select):
+            return []
+        names: List[str] = []
+        for item in expression.expressions:
+            alias = item.alias_or_name
+            if alias:
+                names.append(alias)
+                continue
+            column = next(item.find_all(exp.Column), None)
+            if column:
+                names.append(column.name)
+        return names
+
+    def _collect_projection_columns(
+        self,
+        projection: exp.Expression,
+        alias_map: Dict[str, TableRef],
+        add_row: Callable[[Dict[str, object], Optional[str]], None],
+        base_row_fn: Callable[..., Dict[str, object]],
+        logic_sql: str,
+        column_alias: str,
+    ) -> None:
+        for column in projection.find_all(exp.Column):
+            source_schema, source_table = self._resolve_column_source(column, alias_map)
+            alias_value = column_alias if column_alias and column_alias != column.name else ""
+            add_row(
+                base_row_fn(
+                    logic=logic_sql,
+                    column_alias=alias_value,
+                    source_schema=source_schema,
+                    source_table=source_table,
+                    source_column=column.name,
+                ),
+                "SELECT",
+            )
+
+    def _collect_clause_columns(
+        self,
+        expression: Optional[exp.Expression],
+        operation: str,
+        alias_map: Dict[str, TableRef],
+        normalizer: TemplateNormalizer,
+        add_row: Callable[[Dict[str, object], Optional[str]], None],
+        base_row_fn: Callable[..., Dict[str, object]],
+        column_alias: str = "",
+    ) -> None:
+        if not expression:
             return
-        seen.add(row_key)
-        rows.append(
-            {
-                "filename": sql_file.filename,
-                "filepath": sql_file.path,
-                "process": sql_file.process,
-                "target_table": target_table,
-                "source_schema": source_schema,
-                "source_table": source_table,
-                "source_column": "*",
-                "column_alias": "",
-                "logic": logic_sql,
-                "recorded_at": run_timestamp,
-            }
-        )
+        logic_sql = normalizer.restore(expression.sql(dialect="postgres"))
+        for column in self._collect_columns_from_expression(expression):
+            source_schema, source_table = self._resolve_column_source(column, alias_map)
+            add_row(
+                base_row_fn(
+                    logic=logic_sql,
+                    column_alias=column_alias,
+                    source_schema=source_schema,
+                    source_table=source_table,
+                    source_column=column.name,
+                ),
+                operation,
+            )
+
+    def _collect_using_columns(
+        self,
+        using_clause: exp.Expression,
+        operation: str,
+        alias_map: Dict[str, TableRef],
+        add_row: Callable[[Dict[str, object], Optional[str]], None],
+        base_row_fn: Callable[..., Dict[str, object]],
+        normalizer: TemplateNormalizer,
+    ) -> None:
+        if not using_clause:
+            return
+        logic_sql = normalizer.restore(using_clause.sql(dialect="postgres"))
+        identifiers = [
+            identifier.name
+            for identifier in getattr(using_clause, "expressions", []) or []
+            if isinstance(identifier, exp.Identifier)
+        ]
+        for column_name in identifiers:
+            table_ref = self._infer_table_from_column(column_name, alias_map)
+            source_schema = table_ref.display_schema if table_ref and table_ref.display_schema else ""
+            source_table = table_ref.name if table_ref else ""
+            add_row(
+                base_row_fn(
+                    logic=logic_sql,
+                    source_schema=source_schema,
+                    source_table=source_table,
+                    source_column=column_name,
+                ),
+                operation,
+            )
+
+    def _collect_columns_from_expression(
+        self, expression: exp.Expression
+    ) -> List[exp.Column]:
+        columns: List[exp.Column] = []
+        seen: set = set()
+        for column in expression.find_all(exp.Column):
+            identifier = (column.table or "", column.name)
+            if identifier in seen:
+                continue
+            seen.add(identifier)
+            columns.append(column)
+        return columns
+
+    def _resolve_column_source(
+        self, column: exp.Column, alias_map: Dict[str, TableRef]
+    ) -> Tuple[str, str]:
+        table_alias = column.table
+        if table_alias:
+            table_ref = alias_map.get(table_alias.lower())
+            if table_ref:
+                return table_ref.display_schema or "", table_ref.name
+            return "", table_alias
+        inferred = self._infer_table_from_column(column.name, alias_map)
+        if inferred:
+            return inferred.display_schema or "", inferred.name
+        return "", ""
+
+    def _join_operation_label(self, join: exp.Join) -> str:
+        kind = (join.args.get("kind") or "").upper()
+        if not kind:
+            return "JOIN"
+        if "CROSS" in kind:
+            return "CROSS JOIN"
+        if "FULL" in kind and "OUTER" in kind:
+            return "FULL OUTER JOIN"
+        if "FULL" in kind:
+            return "FULL JOIN"
+        if "LEFT" in kind and "OUTER" in kind:
+            return "LEFT OUTER JOIN"
+        if "RIGHT" in kind and "OUTER" in kind:
+            return "RIGHT OUTER JOIN"
+        if "LEFT" in kind:
+            return "LEFT JOIN"
+        if "RIGHT" in kind:
+            return "RIGHT JOIN"
+        if "INNER" in kind:
+            return "INNER JOIN"
+        return f"{kind} JOIN"
+
+    def _finalize_rows(
+        self,
+        row_accumulator: Dict[
+            Tuple[str, str, str, str, str, str, str, str],
+            Dict[str, object],
+        ],
+    ) -> List[Dict[str, object]]:
+        finalized: List[Dict[str, object]] = []
+        for entry in row_accumulator.values():
+            operations = entry.pop("sql_operations", [])
+            entry["sql_operation"] = ", ".join(operations)
+            finalized.append(entry)
+        return finalized
 
 
 def write_excel(dataframe: pd.DataFrame, path: Path) -> None:
