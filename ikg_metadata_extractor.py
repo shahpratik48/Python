@@ -433,7 +433,8 @@ class GreenplumMetadataResolver:
                 column_alias, logic, sql_operation, recorded_at
             ) VALUES %s
         """
-        records = dataframe.fillna("").to_records(index=False)
+        prepared_df = self._prepare_dataframe_for_insert(dataframe)
+        records = prepared_df.to_records(index=False)
         values = [tuple(row) for row in records]
         LOGGER.info("Loading %d rows into %s", len(values), self.settings.target_table)
         with conn.cursor() as cur:
@@ -444,6 +445,27 @@ class GreenplumMetadataResolver:
             cur.execute(alter_sql)
             cur.execute(grant_sql)
         conn.commit()
+
+    def _prepare_dataframe_for_insert(self, dataframe: pd.DataFrame) -> pd.DataFrame:
+        df = dataframe.copy()
+        if "recorded_at" in df.columns:
+            df["recorded_at"] = df["recorded_at"].apply(self._ensure_tz_aware)
+        fill_map = {
+            column: ""
+            for column in df.columns
+            if column != "recorded_at"
+        }
+        if fill_map:
+            df = df.fillna(fill_map)
+        return df
+
+    @staticmethod
+    def _ensure_tz_aware(value: object) -> datetime:
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                return value.replace(tzinfo=timezone.utc)
+            return value
+        return _now_utc()
 
 
 @dataclass
