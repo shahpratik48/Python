@@ -907,10 +907,9 @@ class SqlMetadataExtractor:
             return [(column, schema) for column in sorted(metadata.columns)]
         return []
 
-    def _columns_from_sources_map(
-        self, table_name: str, sources_map: Dict[str, exp.Expression]
+    def _columns_from_expression(
+        self, expression: Optional[exp.Expression]
     ) -> List[str]:
-        expression = sources_map.get(table_name.lower())
         if not isinstance(expression, exp.Select):
             return []
         names: List[str] = []
