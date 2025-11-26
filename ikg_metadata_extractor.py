@@ -673,6 +673,7 @@ class SqlMetadataExtractor:
                     alias_map,
                     add_row,
                     base_row,
+                    sources_map,
                 )
                 continue
             if self._is_static_projection(projection):
@@ -852,6 +853,7 @@ class SqlMetadataExtractor:
         alias_map: Dict[str, TableRef],
         add_row: Callable[[Dict[str, object], Optional[str]], None],
         base_row_fn: Callable[..., Dict[str, object]],
+        sources_map: Dict[str, exp.Expression],
     ) -> None:
         table_alias = self._get_star_table_alias(projection)
         target_refs: List[TableRef] = []
@@ -863,7 +865,7 @@ class SqlMetadataExtractor:
             target_refs.extend(alias_map.values())
 
         for ref in target_refs:
-            for column_name, source_schema in self._get_columns_for_table_ref(ref):
+            for column_name, source_schema in self._get_columns_for_table_ref(ref, sources_map):
                 add_row(
                     base_row_fn(
                         logic=logic_sql,
@@ -874,10 +876,12 @@ class SqlMetadataExtractor:
                     "SELECT",
                 )
 
-    def _get_columns_for_table_ref(self, table_ref: TableRef) -> List[Tuple[str, str]]:
+    def _get_columns_for_table_ref(
+        self, table_ref: TableRef, sources_map: Dict[str, exp.Expression]
+    ) -> List[Tuple[str, str]]:
         if not table_ref:
             return []
-        columns = self._columns_from_sources_map(table_ref.name)
+        columns = self._columns_from_sources_map(table_ref.name, sources_map)
         if columns:
             return [(column, table_ref.display_schema or "") for column in columns]
         metadata = self.metadata_resolver.get_metadata(table_ref.name)
@@ -889,8 +893,10 @@ class SqlMetadataExtractor:
             return [(column, schema) for column in sorted(metadata.columns)]
         return []
 
-    def _columns_from_sources_map(self, table_name: str) -> List[str]:
-        expression = self.sources_map.get(table_name.lower())
+    def _columns_from_sources_map(
+        self, table_name: str, sources_map: Dict[str, exp.Expression]
+    ) -> List[str]:
+        expression = sources_map.get(table_name.lower())
         if not isinstance(expression, exp.Select):
             return []
         names: List[str] = []
