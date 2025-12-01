@@ -6,7 +6,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Match, Optional, Sequence, Set, Tuple
 
 import gitlab
 import pandas as pd
@@ -95,7 +95,7 @@ class SQLParser:
     def _replace_templates(self, sql_text: str) -> Tuple[str, Dict[str, str]]:
         placeholders: Dict[str, str] = {}
 
-        def repl(match: re.Match[str]) -> str:
+        def repl(match: Match[str]) -> str:
             inner = match.group(1).strip()
             # Replace Jinja-style placeholders with SQL-safe tokens and remember originals.
             token = f"TEMPLATE_TOKEN_{len(placeholders)}"
