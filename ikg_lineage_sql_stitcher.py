@@ -1,12 +1,11 @@
 import base64
-import datetime
 import getpass
 import logging
 import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import gitlab
 import psycopg2
@@ -22,6 +21,7 @@ SQL_PATH = "dags/ikg/scripts/sql"
 TARGET_SCHEMA = "sandbox_prj_smart_insights"
 LINEAGE_TEMP_TABLE = "ikg_table_lineage_auto_refresh_temp"
 OUTPUT_SUFFIX = "_new.sql"
+MODIFIED_SUFFIX = "_modified.sql"
 EXCLUDE_FOLDER = "ikg_new fa_shhp_map"
 
 
@@ -135,18 +135,101 @@ def stitch_sql(
     return stitched
 
 
-def write_output_file(
-    insight_type: str,
-    stitched_sql: Sequence[Tuple[str, str]],
-) -> str:
-    output_name = sanitize_filename(insight_type)
+PLACEHOLDER_PATTERNS = [
+    (re.compile(r"{{\s*params\.IKG_SCHEMA\s*}}", re.IGNORECASE), "core_ikg"),
+    (re.compile(r"{{\s*params\.EDW_VIEW_INPUT_SCHEMA\s*}}", re.IGNORECASE), "core_wma_shared"),
+    (re.compile(r"{{\s*params\.EDW_INPUT_SCHEMA\s*}}", re.IGNORECASE), "core_wma_shared"),
+    (
+        re.compile(r"{{\s*params\.IKG_TABLE_OWNER_GROUP\s*}}", re.IGNORECASE),
+        "'erd_gpdb_prj_smart_insights'",
+    ),
+    (
+        re.compile(r"{{\s*params\.IKG_TABLE_READER_GROUP\s*}}", re.IGNORECASE),
+        "'erd_gpdb_prj_smart_insights_ro'",
+    ),
+]
+
+
+def apply_placeholder_replacements(text: str, profile_date: str) -> str:
+    result = text
+    for pattern, replacement in PLACEHOLDER_PATTERNS:
+        result = pattern.sub(replacement, result)
+    profile_pattern = re.compile(r"{{\s*params\.IKG_PROFILE_DATE\s*}}", re.IGNORECASE)
+    result = profile_pattern.sub(f"'{profile_date}'", result)
+    return result
+
+
+def find_tables_for_suffix(text: str) -> Set[str]:
+    pattern = re.compile(
+        r"(?i)create\s+(?:global\s+temp\s+|temp\s+)?table\s+(?!if\s+not\s+exists)(?P<name>(?:[a-z0-9_]+\.)?[a-z0-9_]+)",
+    )
+    tables: Set[str] = set()
+    for match in pattern.finditer(text):
+        name = match.group("name")
+        if not name:
+            continue
+        if name.lower().endswith("_temp"):
+            continue
+        tables.add(name)
+    return tables
+
+
+def apply_table_suffixes(text: str, tables: Set[str]) -> str:
+    sorted_tables = sorted(tables, key=len, reverse=True)
+    result = text
+    for name in sorted_tables:
+        escaped = re.escape(name)
+        pattern = re.compile(rf"(?<![\w$]){escaped}(?![\w$])", re.IGNORECASE)
+        result = pattern.sub(lambda m: append_temp_identifier(m.group(0)), result)
+    return result
+
+
+def append_temp_identifier(identifier: str) -> str:
+    if "." in identifier:
+        schema, table = identifier.rsplit(".", 1)
+        return f"{schema}.{append_temp_suffix(table)}"
+    return append_temp_suffix(identifier)
+
+
+def append_temp_suffix(table_name: str) -> str:
+    normalized = table_name.rstrip('"')
+    if table_name.lower().endswith("_temp"):
+        return table_name
+    if table_name.endswith('"'):
+        base = normalized
+        if base.lower().endswith("_temp"):
+            return table_name
+        return f'{base}_temp"'
+    return f"{table_name}_temp"
+
+
+def render_stitched_text(stitched_sql: Sequence[Tuple[str, str]]) -> str:
     lines: List[str] = []
     for path, content in stitched_sql:
         lines.append(f"-- Source: {path}")
         lines.append(content.rstrip())
-        lines.append("")  # blank line between scripts
-    Path(output_name).write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_output_file(insight_type: str, stitched_text: str) -> str:
+    output_name = sanitize_filename(insight_type)
+    Path(output_name).write_text(stitched_text, encoding="utf-8")
     logging.info("Wrote stitched SQL to %s", output_name)
+    return output_name
+
+
+def write_modified_file(
+    insight_type: str,
+    stitched_text: str,
+    profile_date: str,
+) -> str:
+    modified_text = apply_placeholder_replacements(stitched_text, profile_date)
+    tables_to_suffix = find_tables_for_suffix(modified_text)
+    modified_text = apply_table_suffixes(modified_text, tables_to_suffix)
+    output_name = sanitize_filename(insight_type).replace(OUTPUT_SUFFIX, MODIFIED_SUFFIX)
+    Path(output_name).write_text(modified_text, encoding="utf-8")
+    logging.info("Wrote modified SQL to %s", output_name)
     return output_name
 
 
@@ -159,6 +242,9 @@ def main() -> None:
     insight_type = input("Enter insight_type: ").strip()
     if not insight_type:
         raise ValueError("insight_type is required.")
+    profile_date = input("Enter profile date (YYYYMMDD): ").strip()
+    if not profile_date:
+        raise ValueError("profile date is required.")
     db_password = getpass.getpass("Enter Password for DB User: ")
 
     db_config = {
@@ -185,7 +271,10 @@ def main() -> None:
         logging.warning("No SQL files were stitched; please verify repository contents.")
         return
 
-    write_output_file(insight_type, stitched_sql)
+    stitched_text = render_stitched_text(stitched_sql)
+    original_path = write_output_file(insight_type, stitched_text)
+    write_modified_file(insight_type, stitched_text, profile_date)
+    logging.info("Created original and modified SQL files for %s", insight_type)
 
 
 if __name__ == "__main__":
