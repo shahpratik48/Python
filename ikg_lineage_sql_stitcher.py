@@ -141,11 +141,11 @@ PLACEHOLDER_PATTERNS = [
     (re.compile(r"{{\s*params\.EDW_INPUT_SCHEMA\s*}}", re.IGNORECASE), "core_wma_shared"),
     (
         re.compile(r"{{\s*params\.IKG_TABLE_OWNER_GROUP\s*}}", re.IGNORECASE),
-        "'erd_gpdb_prj_smart_insights'",
+        "erd_gpdb_prj_smart_insights",
     ),
     (
         re.compile(r"{{\s*params\.IKG_TABLE_READER_GROUP\s*}}", re.IGNORECASE),
-        "'erd_gpdb_prj_smart_insights_ro'",
+        "erd_gpdb_prj_smart_insights_ro",
     ),
 ]
 
@@ -154,7 +154,10 @@ def apply_placeholder_replacements(text: str, profile_date: str) -> str:
     result = text
     for pattern, replacement in PLACEHOLDER_PATTERNS:
         result = pattern.sub(replacement, result)
-    profile_pattern = re.compile(r"{{\s*params\.IKG_PROFILE_DATE\s*}}", re.IGNORECASE)
+    profile_pattern = re.compile(
+        r"(?:'\s*)?{{\s*params\.IKG_PROFILE_DATE\s*}}(?:\s*')?",
+        re.IGNORECASE,
+    )
     result = profile_pattern.sub(f"'{profile_date}'", result)
     return result
 
@@ -167,8 +170,6 @@ def find_tables_for_suffix(text: str) -> Set[str]:
     for match in pattern.finditer(text):
         name = match.group("name")
         if not name:
-            continue
-        if name.lower().endswith("_temp"):
             continue
         tables.add(name)
     return tables
@@ -192,13 +193,8 @@ def append_temp_identifier(identifier: str) -> str:
 
 
 def append_temp_suffix(table_name: str) -> str:
-    normalized = table_name.rstrip('"')
-    if table_name.lower().endswith("_temp"):
-        return table_name
     if table_name.endswith('"'):
-        base = normalized
-        if base.lower().endswith("_temp"):
-            return table_name
+        base = table_name[:-1]
         return f'{base}_temp"'
     return f"{table_name}_temp"
 
