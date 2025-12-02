@@ -28,7 +28,9 @@ LINEAGE_TEMP_TABLE = "ikg_table_lineage_auto_refresh_temp"
 RULE_METADATA_TABLE = "odm_rule_metadata_auto_refresh"
 OUTPUT_SUFFIX = "_new.sql"
 MODIFIED_SUFFIX = "_modified.sql"
+PROFILE_MODIFIED_SUFFIX = "_modified_profile.sql"
 EXCLUDE_FOLDER = "ikg_new fa_shhp_map"
+PROFILE_DATE_TOKENS = ("IKG_PROFILE_DATE", "IKG_PREV_PROFILE_DATE")
 
 
 @dataclass(frozen=True)
@@ -310,16 +312,19 @@ def apply_placeholder_replacements(text: str, profile_date: str) -> str:
     result = text
     for pattern, replacement in PLACEHOLDER_PATTERNS:
         result = pattern.sub(replacement, result)
-    partition_pattern = re.compile(
-        r"(?P<prefix>[sS])\s*{{\s*params\.IKG_PROFILE_DATE\s*}}",
-        re.IGNORECASE,
-    )
-    result = partition_pattern.sub(lambda m: f"{m.group('prefix')}{profile_date}", result)
-    profile_pattern = re.compile(
-        r"(?:'\s*)?{{\s*params\.IKG_PROFILE_DATE\s*}}(?:\s*')?",
-        re.IGNORECASE,
-    )
-    result = profile_pattern.sub(f"'{profile_date}'", result)
+    for token in PROFILE_DATE_TOKENS:
+        partition_pattern = re.compile(
+            r"(?P<prefix>[sS])\s*\{\{\s*params\." + token + r"\s*\}\}",
+            re.IGNORECASE,
+        )
+        result = partition_pattern.sub(
+            lambda m: f"{m.group('prefix')}{profile_date}", result
+        )
+        profile_pattern = re.compile(
+            r"(?:'\s*)?\{\{\s*params\." + token + r"\s*\}\}(?:\s*')?",
+            re.IGNORECASE,
+        )
+        result = profile_pattern.sub(f"'{profile_date}'", result)
     return result
 
 
@@ -390,6 +395,23 @@ def write_modified_file(
     return output_name, modified_text
 
 
+def build_profile_only_text(profile_script: str, profile_date: str) -> str:
+    text = apply_placeholder_replacements(profile_script, profile_date)
+    tables_to_suffix = find_tables_for_suffix(text)
+    return apply_table_suffixes(text, tables_to_suffix)
+
+
+def write_profile_only_file(insight_type: str, profile_text: str) -> str:
+    base_name = sanitize_filename(insight_type)
+    if base_name.endswith(OUTPUT_SUFFIX):
+        profile_name = base_name.replace(OUTPUT_SUFFIX, PROFILE_MODIFIED_SUFFIX)
+    else:
+        profile_name = f"{base_name}_{PROFILE_MODIFIED_SUFFIX}"
+    Path(profile_name).write_text(profile_text, encoding="utf-8")
+    logging.info("Wrote profile-only SQL to %s", profile_name)
+    return profile_name
+
+
 def main() -> None:
     logging.basicConfig(
         level=getattr(logging, LOG_LEVEL.upper(), logging.DEBUG),
@@ -442,6 +464,13 @@ def main() -> None:
         stitched_sql.extend(profile_scripts)
     elif profile_tables:
         logging.warning("Profile table scripts were not appended; none were retrieved.")
+    profile_only_text = None
+    profile_only_path = None
+    if profile_scripts:
+        profile_only_text = build_profile_only_text(
+            profile_scripts[-1][1], profile_date
+        )
+        profile_only_path = write_profile_only_file(insight_raw, profile_only_text)
 
     stitched_text = render_stitched_text(stitched_sql)
     original_path = write_output_file(insight_raw, stitched_text)
@@ -455,13 +484,19 @@ def main() -> None:
         modified_path,
     )
 
-    try:
-        run_sql_script(modified_text, db_config)
-    except Exception:
-        logging.error("Execution of %s failed.", modified_path)
-        raise
-
-    preview_final_table(db_config, profile_tables)
+    if profile_only_text:
+        try:
+            run_sql_script(profile_only_text, db_config)
+        except Exception:
+            logging.error(
+                "Execution of %s failed.", profile_only_path or "profile-only script"
+            )
+            raise
+        preview_final_table(db_config, profile_tables)
+    else:
+        logging.warning(
+            "No profile-only script available to execute; skipping run and preview."
+        )
 
 
 if __name__ == "__main__":
