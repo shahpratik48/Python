@@ -116,7 +116,11 @@ class SQLParser:
         try:
             parsed = sqlglot.parse(sanitized, read="postgres", error_level="ignore")
         except sqlglot.errors.ParseError as exc:
-            logging.warning("sqlglot failed to parse SQL (%s). Falling back to regex.", exc)
+            message = str(exc).lower()
+            if "alter table" in message:
+                logging.debug("sqlglot parse error (alter table): %s", exc)
+            else:
+                logging.warning("sqlglot failed to parse SQL (%s). Falling back to regex.", exc)
             return self._regex_fallback(sanitized, placeholders)
         if not parsed:
             return set()
