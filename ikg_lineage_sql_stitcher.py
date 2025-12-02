@@ -20,6 +20,7 @@ BRANCH = "ikg-master"
 SQL_PATH = "dags/ikg/scripts/sql"
 TARGET_SCHEMA = "sandbox_prj_smart_insights"
 LINEAGE_TEMP_TABLE = "ikg_table_lineage_auto_refresh_temp"
+RULE_METADATA_TABLE = "odm_rule_metadata_auto_refresh"
 OUTPUT_SUFFIX = "_new.sql"
 MODIFIED_SUFFIX = "_modified.sql"
 EXCLUDE_FOLDER = "ikg_new fa_shhp_map"
@@ -101,6 +102,69 @@ def fetch_lineage_entries(
                 )
             )
     return rows
+
+
+def parse_insight_values(raw: str) -> List[str]:
+    if not raw:
+        return []
+    parts = [part.strip() for part in re.split(r",", raw)]
+    return [part for part in parts if part]
+
+
+def fetch_profile_tables(
+    conn: psycopg2.extensions.connection, insight_types: Sequence[str]
+) -> List[str]:
+    if not insight_types:
+        return []
+    query = sql.SQL(
+        """
+        SELECT DISTINCT profile_table
+        FROM {}.{}
+        WHERE lower(trim(coalesce(insight_type, ''))) = ANY(%s)
+        ORDER BY profile_table
+        """
+    ).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(RULE_METADATA_TABLE))
+    lowered = [value.lower() for value in insight_types]
+    with conn.cursor() as cur:
+        cur.execute(query, (lowered,))
+        rows = [row[0] for row in cur.fetchall() if row and row[0]]
+    seen: Set[str] = set()
+    ordered: List[str] = []
+    for value in rows:
+        key = value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(value)
+    return ordered
+
+
+def fetch_profile_scripts(
+    fetcher: "GitLabSQLFetcher", profile_tables: Sequence[str]
+) -> List[Tuple[str, str]]:
+    scripts: List[Tuple[str, str]] = []
+    seen: Set[str] = set()
+    for table in profile_tables:
+        if not table:
+            continue
+        filename = f"{table}.sql"
+        lower = filename.lower()
+        if lower in seen:
+            continue
+        path = fetcher.resolve_path(filename, None)
+        if not path:
+            logging.warning(
+                "Unable to locate profile table script %s in GitLab repository.", filename
+            )
+            continue
+        try:
+            content = fetcher.fetch_sql(path)
+        except gitlab.exceptions.GitlabGetError as exc:
+            logging.warning("Failed to fetch %s: %s", path, exc)
+            continue
+        scripts.append((path, content))
+        seen.add(lower)
+    return scripts
 
 
 def sanitize_filename(insight_type: str) -> str:
@@ -235,9 +299,12 @@ def main() -> None:
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
 
-    insight_type = input("Enter insight_type: ").strip()
-    if not insight_type:
+    insight_raw = input("Enter insight_type: ").strip()
+    if not insight_raw:
         raise ValueError("insight_type is required.")
+    insight_values = parse_insight_values(insight_raw)
+    if not insight_values:
+        raise ValueError("At least one insight_type value is required.")
     profile_date = input("Enter profile date (YYYYMMDD): ").strip()
     if not profile_date:
         raise ValueError("profile date is required.")
@@ -253,10 +320,17 @@ def main() -> None:
 
     with psycopg2.connect(**db_config) as conn:
         entries = fetch_lineage_entries(conn)
+        profile_tables = fetch_profile_tables(conn, insight_values)
 
     if not entries:
         logging.warning("No lineage entries found in %s.%s", TARGET_SCHEMA, LINEAGE_TEMP_TABLE)
         return
+    if not profile_tables:
+        logging.warning(
+            "No profile tables found in %s.%s for the provided insight types.",
+            TARGET_SCHEMA,
+            RULE_METADATA_TABLE,
+        )
 
     private_token = getpass.getpass("Enter your private token: ")
     exclude_folders = [folder for folder in EXCLUDE_FOLDER.split() if folder]
@@ -266,11 +340,16 @@ def main() -> None:
     if not stitched_sql:
         logging.warning("No SQL files were stitched; please verify repository contents.")
         return
+    profile_scripts = fetch_profile_scripts(fetcher, profile_tables)
+    if profile_scripts:
+        stitched_sql.extend(profile_scripts)
+    elif profile_tables:
+        logging.warning("Profile table scripts were not appended; none were retrieved.")
 
     stitched_text = render_stitched_text(stitched_sql)
-    original_path = write_output_file(insight_type, stitched_text)
-    write_modified_file(insight_type, stitched_text, profile_date)
-    logging.info("Created original and modified SQL files for %s", insight_type)
+    original_path = write_output_file(insight_raw, stitched_text)
+    write_modified_file(insight_raw, stitched_text, profile_date)
+    logging.info("Created original and modified SQL files for %s", insight_raw)
 
 
 if __name__ == "__main__":
