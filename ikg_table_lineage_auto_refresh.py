@@ -29,9 +29,11 @@ TARGET_SCHEMA = "sandbox_prj_smart_insights"
 TARGET_TABLE = "ikg_table_lineage_auto_refresh"
 TARGET_OWNER = "erd_gpdbprj_smart_insights"
 TARGET_READER = "erd_gpdb_prj_smart_insights_ro"
+SQL_PATH_PARTS = Path(SQL_PATH).parts
 LINEAGE_COLUMNS = [
     "filename",
     "filepath",
+    "process",
     "target_table",
     "source_schema",
     "source_table",
@@ -43,10 +45,19 @@ LINEAGE_COLUMNS = [
 class LineageRow:
     filename: str
     filepath: str
+    process: str
     target_table: str
     source_schema: Optional[str]
     source_table: Optional[str]
     current_timestamp: datetime.datetime
+
+
+def derive_process(file_path: str) -> str:
+    parts = Path(file_path).parts
+    prefix_len = len(SQL_PATH_PARTS)
+    if parts[:prefix_len] == SQL_PATH_PARTS and len(parts) > prefix_len:
+        return parts[prefix_len]
+    return ""
 
 
 class GitLabSQLFetcher:
@@ -82,6 +93,20 @@ class GitLabSQLFetcher:
 
 class SQLParser:
     TEMPLATE_PATTERN = re.compile(r"{{\s*([^{}]+?)\s*}}")
+    SOURCE_CONTEXTS: Tuple[type, ...] = (
+        exp.From,
+        exp.Join,
+        exp.Subquery,
+        exp.SubqueryAlias,
+        exp.Select,
+        exp.With,
+        exp.Union,
+        exp.Where,
+        exp.Group,
+        exp.Having,
+        exp.Order,
+        exp.SetOperation,
+    )
 
     def extract_tables(self, sql_text: str) -> Set[Tuple[Optional[str], str]]:
         """Return a set of (schema, table) pairs referenced inside the SQL text."""
@@ -109,7 +134,7 @@ class SQLParser:
         placeholders: Dict[str, str] = {}
 
         def repl(match: Match[str]) -> str:
-            inner = match.group(1).strip()
+            inner = re.sub(r"\s+", "", match.group(1))
             # Replace Jinja-style placeholders with SQL-safe tokens and remember originals.
             token = f"TEMPLATE_TOKEN_{len(placeholders)}"
             placeholders[token] = f"{{{{{inner}}}}}"
@@ -143,6 +168,8 @@ class SQLParser:
                 (cte.alias_or_name or "").lower() for cte in statement.find_all(exp.CTE)
             }
             for table in statement.find_all(exp.Table):
+                if not self._is_source_context(table):
+                    continue
                 raw_name = table.name
                 if not raw_name:
                     continue
@@ -165,7 +192,7 @@ class SQLParser:
         placeholder_lookup = {k.lower(): v for k, v in placeholders.items()}
         pattern = re.compile(
             r"""(?ix)
-            (?:from|join|into|update|table|truncate|delete\s+from)\s+
+            (?:from|inner\s+join|left\s+(?:outer\s+)?join|right\s+(?:outer\s+)?join|full\s+(?:outer\s+)?join|cross\s+join|join)\s+
             (?:
                 (?P<schema>[a-z0-9_]+)\.(?P<table>[a-z0-9_]+) |
                 (?P<table_only>[a-z0-9_]+)
@@ -187,6 +214,9 @@ class SQLParser:
             tables.add((schema_name, restored_table))
         return tables
 
+    def _is_source_context(self, table: exp.Table) -> bool:
+        return any(table.find_ancestor(ctx) is not None for ctx in self.SOURCE_CONTEXTS)
+
 
 class LineageBuilder:
     def __init__(self, fetcher: GitLabSQLFetcher, parser: SQLParser) -> None:
@@ -202,24 +232,30 @@ class LineageBuilder:
         rows: List[LineageRow] = []
         for file_path in self._fetcher.iter_sql_paths():
             logging.info("Processing %s", file_path)
-            sql_text = self._fetcher.fetch_sql(file_path)
-            tables = self._parser.extract_tables(sql_text)
-            if not tables:
-                tables = {(None, None)}
-            filename = Path(file_path).name
-            target_table = Path(filename).stem
-            for schema, table in tables:
-                row = LineageRow(
-                    filename=filename,
-                    filepath=file_path,
-                    target_table=target_table,
-                    source_schema=schema,
-                    source_table=table,
-                    current_timestamp=timestamp,
-                )
-                rows.append(row)
-            if progress_callback:
-                progress_callback(rows)
+            try:
+                sql_text = self._fetcher.fetch_sql(file_path)
+                tables = self._parser.extract_tables(sql_text)
+                if not tables:
+                    tables = {(None, None)}
+                filename = Path(file_path).name
+                target_table = Path(filename).stem
+                process = derive_process(file_path)
+                for schema, table in tables:
+                    row = LineageRow(
+                        filename=filename,
+                        filepath=file_path,
+                        process=process,
+                        target_table=target_table,
+                        source_schema=schema,
+                        source_table=table,
+                        current_timestamp=timestamp,
+                    )
+                    rows.append(row)
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("Failed to process %s: %s", file_path, exc)
+            finally:
+                if progress_callback:
+                    progress_callback(rows)
         return rows
 
 
@@ -243,10 +279,11 @@ class DatabaseUploader:
                         CREATE TABLE {}.{} (
                             filename TEXT,
                             filepath TEXT,
+                            process TEXT,
                             target_table TEXT,
                             source_schema TEXT,
                             source_table TEXT,
-                            current_timestamp TIMESTAMP
+                            "current_timestamp" TIMESTAMP
                         )
                         """
                     ).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TARGET_TABLE))
@@ -255,6 +292,7 @@ class DatabaseUploader:
                     (
                         row.filename,
                         row.filepath,
+                        row.process,
                         row.target_table,
                         row.source_schema,
                         row.source_table,
@@ -266,7 +304,7 @@ class DatabaseUploader:
                     execute_values(
                         cur,
                         sql.SQL(
-                            "INSERT INTO {}.{} (filename, filepath, target_table, source_schema, source_table, current_timestamp) VALUES %s"
+                            'INSERT INTO {}.{} (filename, filepath, process, target_table, source_schema, source_table, "current_timestamp") VALUES %s'
                         ).format(
                             sql.Identifier(TARGET_SCHEMA), sql.Identifier(TARGET_TABLE)
                         ),
@@ -298,6 +336,7 @@ def rows_to_dataframe(rows: Sequence[LineageRow]) -> pd.DataFrame:
         {
             "filename": row.filename,
             "filepath": row.filepath,
+            "process": row.process,
             "target_table": row.target_table,
             "source_schema": row.source_schema,
             "source_table": row.source_table,
