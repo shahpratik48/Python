@@ -231,8 +231,11 @@ class SQLParser:
         return tables
 
     def _regex_fallback(
-        self, sanitized_sql: str, placeholders: Dict[str, str]
+        self, sanitized_sql: str, placeholders: Dict[str, str], depth: int = 0
     ) -> Set[Tuple[Optional[str], str]]:
+        if depth > 5:
+            logging.debug("Regex fallback max depth reached.")
+            return set()
         placeholder_lookup = {k.lower(): v for k, v in placeholders.items()}
         pattern = re.compile(
             r"""(?ix)
@@ -256,6 +259,12 @@ class SQLParser:
                 schema_name = None
             restored_table = placeholder_lookup.get(table_name.lower()) or table_name
             tables.add((schema_name, restored_table))
+        subquery_pattern = re.compile(
+            r"""(?is)from\s+\((?P<inner>select.+?)\)\s+[a-z0-9_]+""",
+        )
+        for submatch in subquery_pattern.finditer(sanitized_sql):
+            inner_sql = submatch.group("inner")
+            tables |= self._regex_fallback(inner_sql, placeholders, depth + 1)
         return tables
 
     def _is_source_context(self, table: exp.Table) -> bool:
