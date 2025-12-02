@@ -6,7 +6,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Match, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Match, Optional, Sequence, Set, Tuple
 
 import gitlab
 import pandas as pd
@@ -29,6 +29,14 @@ TARGET_SCHEMA = "sandbox_prj_smart_insights"
 TARGET_TABLE = "ikg_table_lineage_auto_refresh"
 TARGET_OWNER = "erd_gpdbprj_smart_insights"
 TARGET_READER = "erd_gpdb_prj_smart_insights_ro"
+LINEAGE_COLUMNS = [
+    "filename",
+    "filepath",
+    "target_table",
+    "source_schema",
+    "source_table",
+    "current_timestamp",
+]
 
 
 @dataclass(frozen=True)
@@ -166,8 +174,12 @@ class LineageBuilder:
         self._fetcher = fetcher
         self._parser = parser
 
-    def build(self) -> List[LineageRow]:
-        timestamp = datetime.datetime.utcnow()
+    def build(
+        self,
+        progress_callback: Optional[Callable[[Sequence[LineageRow]], None]] = None,
+        run_timestamp: Optional[datetime.datetime] = None,
+    ) -> List[LineageRow]:
+        timestamp = run_timestamp or datetime.datetime.utcnow()
         rows: List[LineageRow] = []
         for file_path in self._fetcher.iter_sql_paths():
             logging.info("Processing %s", file_path)
@@ -187,6 +199,8 @@ class LineageBuilder:
                     current_timestamp=timestamp,
                 )
                 rows.append(row)
+            if progress_callback:
+                progress_callback(rows)
         return rows
 
 
@@ -272,15 +286,22 @@ def rows_to_dataframe(rows: Sequence[LineageRow]) -> pd.DataFrame:
         }
         for row in rows
     ]
-    return pd.DataFrame(data)
+    return pd.DataFrame(data, columns=LINEAGE_COLUMNS)
 
 
-def write_to_excel(df: pd.DataFrame, run_timestamp: datetime.datetime) -> str:
-    timestamp_str = run_timestamp.strftime("%Y%m%d%H%M%S")
-    output_file = f"{OUTPUT_PREFIX}_{timestamp_str}.xlsx"
-    df.to_excel(output_file, index=False)
-    logging.info("Wrote %s", output_file)
-    return output_file
+def write_to_excel(
+    df: pd.DataFrame,
+    run_timestamp: Optional[datetime.datetime] = None,
+    output_path: Optional[str] = None,
+) -> str:
+    if output_path is None:
+        if run_timestamp is None:
+            raise ValueError("run_timestamp must be provided when output_path is None.")
+        timestamp_str = run_timestamp.strftime("%Y%m%d%H%M%S")
+        output_path = f"{OUTPUT_PREFIX}_{timestamp_str}.xlsx"
+    df.to_excel(output_path, index=False)
+    logging.info("Wrote %s", output_path)
+    return output_path
 
 
 def main() -> None:
@@ -296,11 +317,17 @@ def main() -> None:
     fetcher = GitLabSQLFetcher(private_token=private_token, exclude_folders=exclude_folders)
     parser = SQLParser()
     builder = LineageBuilder(fetcher, parser)
-    rows = builder.build()
+    run_timestamp = datetime.datetime.utcnow()
+    output_file = f"{OUTPUT_PREFIX}_{run_timestamp.strftime('%Y%m%d%H%M%S')}.xlsx"
+    # Initialize the Excel file with headers so it exists even if parsing fails early.
+    write_to_excel(rows_to_dataframe([]), output_path=output_file)
 
-    df = rows_to_dataframe(rows)
-    now = datetime.datetime.utcnow()
-    write_to_excel(df, now)
+    def flush_excel(current_rows: Sequence[LineageRow]) -> None:
+        df_snapshot = rows_to_dataframe(current_rows)
+        write_to_excel(df_snapshot, output_path=output_file)
+
+    rows = builder.build(progress_callback=flush_excel, run_timestamp=run_timestamp)
+    logging.info("Captured %d lineage rows", len(rows))
 
     db_config = {
         "host": "greenplum-rdsp.zur.swissbank.com",
