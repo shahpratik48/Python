@@ -112,27 +112,31 @@ class SQLParser:
         cleaned = self._remove_sql_comments(sql_text)
         normalized = self._strip_vendor_specific(cleaned)
         sanitized, placeholders = self._replace_templates(normalized)
-        logging.debug("Sanitized SQL length: %d", len(sanitized))
-        try:
-            parsed = sqlglot.parse(sanitized, read="postgres", error_level="ignore")
-        except sqlglot.errors.ParseError as exc:
-            message = str(exc).lower()
-            if "alter table" in message:
-                logging.debug("sqlglot parse error (alter table): %s", exc)
-            else:
-                logging.warning("sqlglot failed to parse SQL (%s). Falling back to regex.", exc)
-            return self._regex_fallback(sanitized, placeholders)
-        if not parsed:
-            return set()
-        if all(isinstance(statement, exp.Command) for statement in parsed):
-            logging.debug("sqlglot returned Command nodes only; using regex fallback.")
-            return self._regex_fallback(sanitized, placeholders)
-        return self._collect_tables(parsed, placeholders)
+        sanitized_no_do, do_blocks = self._strip_do_blocks(sanitized)
+        logging.debug("Sanitized SQL length: %d", len(sanitized_no_do))
+        tables = self._parse_sql_to_tables(sanitized_no_do, placeholders)
+        for block in do_blocks:
+            tables |= self._parse_do_block(block, placeholders)
+        return tables
 
     def _remove_sql_comments(self, sql_text: str) -> str:
         no_block = re.sub(r"/\*.*?\*/", "", sql_text, flags=re.S)
         no_inline = re.sub(r"--.*?$", "", no_block, flags=re.M)
         return no_inline
+
+    def _strip_do_blocks(self, sql_text: str) -> Tuple[str, List[str]]:
+        blocks: List[str] = []
+        pattern = re.compile(
+            r"do\s+\$\$(.*?)\$\$\s*(?:language\s+\w+)?\s*;",
+            flags=re.I | re.S,
+        )
+
+        def repl(match: re.Match[str]) -> str:
+            blocks.append(match.group(1))
+            return ""
+
+        stripped = pattern.sub(repl, sql_text)
+        return stripped, blocks
 
     def _strip_vendor_specific(self, sql_text: str) -> str:
         patterns = [
@@ -161,6 +165,27 @@ class SQLParser:
 
         sanitized = self.TEMPLATE_PATTERN.sub(repl, sql_text)
         return sanitized, placeholders
+
+    def _parse_sql_to_tables(
+        self, sql_text: str, placeholders: Dict[str, str]
+    ) -> Set[Tuple[Optional[str], str]]:
+        if not sql_text.strip():
+            return set()
+        try:
+            parsed = sqlglot.parse(sql_text, read="postgres", error_level="ignore")
+        except sqlglot.errors.ParseError as exc:
+            message = str(exc).lower()
+            if "alter table" in message:
+                logging.debug("sqlglot parse error (alter table): %s", exc)
+            else:
+                logging.warning("sqlglot failed to parse SQL (%s). Falling back to regex.", exc)
+            return self._regex_fallback(sql_text, placeholders)
+        if not parsed:
+            return set()
+        if all(isinstance(statement, exp.Command) for statement in parsed):
+            logging.debug("sqlglot returned Command nodes only; using regex fallback.")
+            return self._regex_fallback(sql_text, placeholders)
+        return self._collect_tables(parsed, placeholders)
 
     def _collect_tables(
         self, statements: List[exp.Expression], placeholders: Dict[str, str]
@@ -235,6 +260,28 @@ class SQLParser:
 
     def _is_source_context(self, table: exp.Table) -> bool:
         return any(table.find_ancestor(ctx) is not None for ctx in self.SOURCE_CONTEXTS)
+
+    def _parse_do_block(
+        self, block_text: str, placeholders: Dict[str, str]
+    ) -> Set[Tuple[Optional[str], str]]:
+        prepared = self._prepare_do_block(block_text)
+        tables = self._parse_sql_to_tables(prepared, placeholders)
+        if tables:
+            return tables
+        return self._regex_fallback(prepared, placeholders)
+
+    def _prepare_do_block(self, block_text: str) -> str:
+        block = self._remove_raise_statements(block_text)
+        block = re.sub(r"\blanguage\s+\w+\s*;?", "", block, flags=re.I)
+        block = re.sub(r"^\s*begin\b", "", block, flags=re.I)
+        block = re.sub(r"\bend\s*;?\s*$", "", block, flags=re.I)
+        block = re.sub(r"\bif\b.+?\bthen\b", "", block, flags=re.I | re.S)
+        block = re.sub(r"\belse\b", "", block, flags=re.I)
+        block = re.sub(r"\bend\s+if\b", "", block, flags=re.I)
+        return block
+
+    def _remove_raise_statements(self, sql_text: str) -> str:
+        return re.sub(r"\braise\s+(?:exception|error).*?;", "", sql_text, flags=re.I | re.S)
 
 
 class LineageBuilder:
