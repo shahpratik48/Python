@@ -110,7 +110,8 @@ class SQLParser:
     def extract_tables(self, sql_text: str) -> Set[Tuple[Optional[str], str]]:
         """Return a set of (schema, table) pairs referenced inside the SQL text."""
         cleaned = self._remove_sql_comments(sql_text)
-        sanitized, placeholders = self._replace_templates(cleaned)
+        normalized = self._strip_vendor_specific(cleaned)
+        sanitized, placeholders = self._replace_templates(normalized)
         logging.debug("Sanitized SQL length: %d", len(sanitized))
         try:
             parsed = sqlglot.parse(sanitized, read="postgres", error_level="ignore")
@@ -128,6 +129,21 @@ class SQLParser:
         no_block = re.sub(r"/\*.*?\*/", "", sql_text, flags=re.S)
         no_inline = re.sub(r"--.*?$", "", no_block, flags=re.M)
         return no_inline
+
+    def _strip_vendor_specific(self, sql_text: str) -> str:
+        patterns = [
+            r"\bdistributed\s+by\s*\([^;]+?\)",
+            r"\bdistributed\s+replicated",
+            r"\bon\s+commit\s+preserve\s+rows",
+            r"\bwith\s*\(.*?appendonly.*?\)",
+            r"\bencode\s*'.*?'",
+            r"\borganization\s*\([^)]*\)",
+            r"\bpartition\s+by\s+range\s+\([^)]*\)",
+        ]
+        cleaned = sql_text
+        for pattern in patterns:
+            cleaned = re.sub(pattern, "", cleaned, flags=re.I | re.S)
+        return cleaned
 
     def _replace_templates(self, sql_text: str) -> Tuple[str, Dict[str, str]]:
         placeholders: Dict[str, str] = {}
