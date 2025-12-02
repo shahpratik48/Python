@@ -131,7 +131,7 @@ class SQLParser:
             flags=re.I | re.S,
         )
 
-        def repl(match: Match[str]) -> str:
+        def repl(match: Match) -> str:
             blocks.append(match.group(1))
             return ""
 
@@ -156,7 +156,7 @@ class SQLParser:
     def _replace_templates(self, sql_text: str) -> Tuple[str, Dict[str, str]]:
         placeholders: Dict[str, str] = {}
 
-        def repl(match: Match[str]) -> str:
+        def repl(match: Match) -> str:
             inner = re.sub(r"\s+", "", match.group(1))
             # Replace Jinja-style placeholders with SQL-safe tokens and remember originals.
             token = f"TEMPLATE_TOKEN_{len(placeholders)}"
