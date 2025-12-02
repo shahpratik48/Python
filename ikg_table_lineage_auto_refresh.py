@@ -330,8 +330,16 @@ class LineageBuilder:
                 logging.exception("Failed to process %s: %s", file_path, exc)
             finally:
                 if progress_callback:
-                    progress_callback(rows)
-        return rows
+                    progress_callback(self._filter_self_references(rows))
+        return self._filter_self_references(rows)
+
+    @staticmethod
+    def _filter_self_references(rows: Sequence[LineageRow]) -> List[LineageRow]:
+        return [
+            row
+            for row in rows
+            if not (row.source_table and row.source_table.lower() == row.target_table.lower())
+        ]
 
 
 class DatabaseUploader:
