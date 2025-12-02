@@ -97,7 +97,6 @@ class SQLParser:
         exp.From,
         exp.Join,
         exp.Subquery,
-        exp.SubqueryAlias,
         exp.Select,
         exp.With,
         exp.Union,
