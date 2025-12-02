@@ -89,11 +89,16 @@ class SQLParser:
         sanitized, placeholders = self._replace_templates(cleaned)
         logging.debug("Sanitized SQL length: %d", len(sanitized))
         try:
-            parsed = sqlglot.parse(sanitized, read="postgres")
-            return self._collect_tables(parsed, placeholders)
+            parsed = sqlglot.parse(sanitized, read="postgres", error_level="ignore")
         except sqlglot.errors.ParseError as exc:
             logging.warning("sqlglot failed to parse SQL (%s). Falling back to regex.", exc)
             return self._regex_fallback(sanitized, placeholders)
+        if not parsed:
+            return set()
+        if all(isinstance(statement, exp.Command) for statement in parsed):
+            logging.debug("sqlglot returned Command nodes only; using regex fallback.")
+            return self._regex_fallback(sanitized, placeholders)
+        return self._collect_tables(parsed, placeholders)
 
     def _remove_sql_comments(self, sql_text: str) -> str:
         no_block = re.sub(r"/\*.*?\*/", "", sql_text, flags=re.S)
@@ -120,8 +125,22 @@ class SQLParser:
         placeholder_lookup = {k.lower(): v for k, v in placeholders.items()}
 
         for statement in statements:
+            if statement is None:
+                continue
+            if isinstance(statement, (exp.Alter, exp.Grant)):
+                logging.debug("Skipping %s statement", statement.__class__.__name__)
+                continue
+            if isinstance(statement, exp.Command):
+                this_obj = statement.this
+                if isinstance(this_obj, exp.Expression):
+                    command_text = this_obj.sql().upper()
+                else:
+                    command_text = str(this_obj or "").upper()
+                if command_text.startswith("ALTER") or command_text.startswith("GRANT"):
+                    logging.debug("Skipping command statement: %s", command_text[:20])
+                    continue
             cte_names = {
-                (cte.alias or "").lower() for cte in statement.find_all(exp.CTE)
+                (cte.alias_or_name or "").lower() for cte in statement.find_all(exp.CTE)
             }
             for table in statement.find_all(exp.Table):
                 raw_name = table.name
