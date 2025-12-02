@@ -203,6 +203,12 @@ PLACEHOLDER_PATTERNS = [
     (re.compile(r"{{\s*params\.IKG_SCHEMA\s*}}", re.IGNORECASE), "core_ikg"),
     (re.compile(r"{{\s*params\.EDW_VIEW_INPUT_SCHEMA\s*}}", re.IGNORECASE), "core_wma_shared"),
     (re.compile(r"{{\s*params\.EDW_INPUT_SCHEMA\s*}}", re.IGNORECASE), "core_wma_shared"),
+    (re.compile(r"{{\s*params\.EDW_ETL_SCHEMA\s*}}", re.IGNORECASE), "core_etl"),
+    (re.compile(r"{{\s*params\.IKG_CLIP_SCHEMA\s*}}", re.IGNORECASE), "core_in_shared"),
+    (re.compile(r"{{\s*params\.IKG_PRE_PROD_SCHEMA\s*}}", re.IGNORECASE), "sandbox_ikg_pre_prd"),
+    (re.compile(r"{{\s*params\.IKG_VENDOR_SCHEMA\s*}}", re.IGNORECASE), "core_wma_shared"),
+    (re.compile(r"{{\s*params\.IKG_WEALTHX_SCHEMA\s*}}", re.IGNORECASE), "sandbox_prj_smart_relationship"),
+    (re.compile(r"{{\s*params\.MODEL_SCHEMA\s*}}", re.IGNORECASE), "core_model"),
     (
         re.compile(r"{{\s*params\.IKG_TABLE_OWNER_GROUP\s*}}", re.IGNORECASE),
         "erd_gpdb_prj_smart_insights",
