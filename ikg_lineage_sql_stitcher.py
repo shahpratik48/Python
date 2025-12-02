@@ -11,6 +11,11 @@ import gitlab
 import psycopg2
 from psycopg2 import sql
 
+try:
+    import sqlparse
+except ImportError:
+    sqlparse = None
+
 
 LOG_LEVEL = os.environ.get("IKG_LINEAGE_LOG_LEVEL", "DEBUG")
 GITLAB_URL = "https://devcloud.ubs.net"
@@ -167,6 +172,87 @@ def fetch_profile_scripts(
     return scripts
 
 
+def split_sql_statements(script: str) -> List[str]:
+    if sqlparse:
+        return [stmt.strip() for stmt in sqlparse.split(script) if stmt.strip()]
+    statements: List[str] = []
+    current: List[str] = []
+    in_single = False
+    in_double = False
+    prev_char = ""
+    for char in script:
+        current.append(char)
+        if char == "'" and not in_double and prev_char != "\\":
+            in_single = not in_single
+        elif char == '"' and not in_single and prev_char != "\\":
+            in_double = not in_double
+        if char == ";" and not in_single and not in_double:
+            statement = "".join(current).strip()
+            if statement:
+                statements.append(statement.rstrip(";").strip())
+            current = []
+        prev_char = char
+    trailing = "".join(current).strip()
+    if trailing:
+        statements.append(trailing.rstrip(";").strip())
+    return statements
+
+
+def run_sql_script(script_text: str, db_config: Dict[str, str]) -> None:
+    statements = split_sql_statements(script_text)
+    if not statements:
+        logging.warning("No SQL statements to execute.")
+        return
+    with psycopg2.connect(**db_config) as conn:
+        conn.autocommit = False
+        with conn.cursor() as cur:
+            for idx, statement in enumerate(statements, start=1):
+                if not statement:
+                    continue
+                logging.debug("Executing statement #%d", idx)
+                try:
+                    cur.execute(statement)
+                except Exception as exc:
+                    conn.rollback()
+                    logging.error("Error executing statement #%d: %s", idx, exc)
+                    logging.debug("Failed statement text:\n%s", statement)
+                    raise
+        conn.commit()
+    logging.info("Executed %d SQL statements successfully.", len(statements))
+
+
+def preview_final_table(
+    db_config: Dict[str, str],
+    profile_tables: Sequence[str],
+    default_schema: str = "core_ikg",
+) -> None:
+    if not profile_tables:
+        logging.info("No profile table available for preview.")
+        return
+    target = profile_tables[-1]
+    if "." in target:
+        schema, table = target.split(".", 1)
+    else:
+        schema, table = default_schema, target
+    final_table = f"{table}_temp"
+    query = sql.SQL("SELECT * FROM {}.{} LIMIT 5").format(
+        sql.Identifier(schema), sql.Identifier(final_table)
+    )
+    with psycopg2.connect(**db_config) as conn, conn.cursor() as cur:
+        try:
+            cur.execute(query)
+            rows = cur.fetchall()
+            columns = [desc[0] for desc in cur.description]
+        except Exception as exc:
+            logging.warning(
+                "Unable to preview %s.%s: %s", schema, final_table, exc
+            )
+            return
+    logging.info("Top 5 rows from %s.%s:", schema, final_table)
+    for row in rows:
+        logging.info(dict(zip(columns, row)))
+
+
 def sanitize_filename(insight_type: str) -> str:
     safe = re.sub(r"[^a-zA-Z0-9]+", "_", insight_type.strip())
     safe = safe.strip("_")
@@ -224,6 +310,11 @@ def apply_placeholder_replacements(text: str, profile_date: str) -> str:
     result = text
     for pattern, replacement in PLACEHOLDER_PATTERNS:
         result = pattern.sub(replacement, result)
+    partition_pattern = re.compile(
+        r"(?P<prefix>[sS])\s*{{\s*params\.IKG_PROFILE_DATE\s*}}",
+        re.IGNORECASE,
+    )
+    result = partition_pattern.sub(lambda m: f"{m.group('prefix')}{profile_date}", result)
     profile_pattern = re.compile(
         r"(?:'\s*)?{{\s*params\.IKG_PROFILE_DATE\s*}}(?:\s*')?",
         re.IGNORECASE,
@@ -289,14 +380,14 @@ def write_modified_file(
     insight_type: str,
     stitched_text: str,
     profile_date: str,
-) -> str:
+) -> Tuple[str, str]:
     modified_text = apply_placeholder_replacements(stitched_text, profile_date)
     tables_to_suffix = find_tables_for_suffix(modified_text)
     modified_text = apply_table_suffixes(modified_text, tables_to_suffix)
     output_name = sanitize_filename(insight_type).replace(OUTPUT_SUFFIX, MODIFIED_SUFFIX)
     Path(output_name).write_text(modified_text, encoding="utf-8")
     logging.info("Wrote modified SQL to %s", output_name)
-    return output_name
+    return output_name, modified_text
 
 
 def main() -> None:
@@ -354,8 +445,23 @@ def main() -> None:
 
     stitched_text = render_stitched_text(stitched_sql)
     original_path = write_output_file(insight_raw, stitched_text)
-    write_modified_file(insight_raw, stitched_text, profile_date)
-    logging.info("Created original and modified SQL files for %s", insight_raw)
+    modified_path, modified_text = write_modified_file(
+        insight_raw, stitched_text, profile_date
+    )
+    logging.info(
+        "Created original and modified SQL files for %s: %s, %s",
+        insight_raw,
+        original_path,
+        modified_path,
+    )
+
+    try:
+        run_sql_script(modified_text, db_config)
+    except Exception:
+        logging.error("Execution of %s failed.", modified_path)
+        raise
+
+    preview_final_table(db_config, profile_tables)
 
 
 if __name__ == "__main__":
