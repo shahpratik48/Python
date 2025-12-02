@@ -131,7 +131,7 @@ class SQLParser:
             flags=re.I | re.S,
         )
 
-        def repl(match: re.Match[str]) -> str:
+        def repl(match: Match[str]) -> str:
             blocks.append(match.group(1))
             return ""
 
