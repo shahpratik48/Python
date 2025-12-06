@@ -1,19 +1,23 @@
 import base64
+import datetime
 import getpass
 import logging
 import os
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import gitlab
+import pandas as pd
 import psycopg2
 from psycopg2 import sql
+from psycopg2.extras import execute_values
 
 try:
     import sqlparse
-except ImportError:
+except ImportError:  # pragma: no cover - optional dependency
     sqlparse = None
 
 
@@ -24,13 +28,23 @@ IKG_PROJECT_PATH = f"{GENESTS_GROUP_PATH}/ikg-dags"
 BRANCH = "ikg-master"
 SQL_PATH = "dags/ikg/scripts/sql"
 TARGET_SCHEMA = "sandbox_prj_smart_insights"
-LINEAGE_TEMP_TABLE = "ikg_table_lineage_auto_refresh_temp"
+METADATA_TABLE = "ikg_table_lineage_metadata_auto_refresh"
 RULE_METADATA_TABLE = "odm_rule_metadata_auto_refresh"
+LINEAGE_TEMP_TABLE = "ikg_table_lineage_auto_refresh_temp"
 OUTPUT_SUFFIX = "_new.sql"
 MODIFIED_SUFFIX = "_modified.sql"
 PROFILE_MODIFIED_SUFFIX = "_modified_profile.sql"
 EXCLUDE_FOLDER = "ikg_new fa_shhp_map"
 PROFILE_DATE_TOKENS = ("IKG_PROFILE_DATE", "IKG_PREV_PROFILE_DATE")
+LINEAGE_OUTPUT_PREFIX = "ikg_table_lineage"
+LINEAGE_OUTPUT_SUFFIX = "temp"
+TABLE_SUFFIX = "_temp_auto"
+BASE_DB_CONFIG = {
+    "host": "greenplum-rdsp.zur.swissbank.com",
+    "port": "5432",
+    "dbname": "gprdsp",
+    "user": "ds_rdsp_dev",
+}
 
 
 @dataclass(frozen=True)
@@ -38,6 +52,34 @@ class LineageEntry:
     order_index: int
     source_table: str
     process: Optional[str]
+    filename: Optional[str]
+    filepath: Optional[str]
+    target_table: Optional[str]
+    root_profile_table: Optional[str]
+
+
+@dataclass
+class MetadataRow:
+    filename: str
+    filepath: str
+    process: str
+    target_table: str
+    source_schema: Optional[str]
+    source_table: Optional[str]
+
+
+@dataclass
+class DependencyRow:
+    order_index: int
+    root_profile_table: str
+    target_table: str
+    source_schema: Optional[str]
+    source_table: Optional[str]
+    process: str
+    filename: str
+    filepath: str
+    level: int
+    current_timestamp: datetime.datetime
 
 
 class GitLabSQLFetcher:
@@ -83,32 +125,14 @@ class GitLabSQLFetcher:
                     return candidate
         return candidates[0]
 
+    def iter_sql_paths(self) -> Iterable[str]:
+        return self._path_map.keys()
 
-def fetch_lineage_entries(
-    conn: psycopg2.extensions.connection,
-) -> List[LineageEntry]:
-    query = sql.SQL(
-        """
-        SELECT order_index, source_table, process
-        FROM {}.{}
-        WHERE source_schema ILIKE '%ikg%'
-        ORDER BY order_index ASC
-        """
-    ).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(LINEAGE_TEMP_TABLE))
-    with conn.cursor() as cur:
-        cur.execute(query)
-        rows = []
-        for order_index, source_table, process in cur.fetchall():
-            if not source_table:
-                continue
-            rows.append(
-                LineageEntry(
-                    order_index=order_index,
-                    source_table=source_table,
-                    process=process,
-                )
-            )
-    return rows
+
+def build_db_config(password: str) -> Dict[str, str]:
+    config = dict(BASE_DB_CONFIG)
+    config["password"] = password
+    return config
 
 
 def parse_insight_values(raw: str) -> List[str]:
@@ -116,6 +140,10 @@ def parse_insight_values(raw: str) -> List[str]:
         return []
     parts = [part.strip() for part in re.split(r",", raw)]
     return [part for part in parts if part]
+
+
+def qualified_table(table_name: str) -> sql.SQL:
+    return sql.SQL("{}.{}").format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(table_name))
 
 
 def fetch_profile_tables(
@@ -126,11 +154,11 @@ def fetch_profile_tables(
     query = sql.SQL(
         """
         SELECT DISTINCT profile_table
-        FROM {}.{}
+        FROM {}
         WHERE lower(trim(coalesce(insight_type, ''))) = ANY(%s)
         ORDER BY profile_table
         """
-    ).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(RULE_METADATA_TABLE))
+    ).format(qualified_table(RULE_METADATA_TABLE))
     lowered = [value.lower() for value in insight_types]
     with conn.cursor() as cur:
         cur.execute(query, (lowered,))
@@ -144,6 +172,285 @@ def fetch_profile_tables(
         seen.add(key)
         ordered.append(value)
     return ordered
+
+
+def fetch_metadata_rows(conn: psycopg2.extensions.connection) -> List[MetadataRow]:
+    query = sql.SQL(
+        """
+        SELECT filename, filepath, process, target_table, source_schema, source_table
+        FROM {}
+        """
+    ).format(qualified_table(METADATA_TABLE))
+    with conn.cursor() as cur:
+        cur.execute(query)
+        return [
+            MetadataRow(
+                filename=row[0],
+                filepath=row[1],
+                process=row[2],
+                target_table=row[3],
+                source_schema=row[4],
+                source_table=row[5],
+            )
+            for row in cur.fetchall()
+        ]
+
+
+def build_adjacency(metadata_rows: Sequence[MetadataRow]) -> Dict[str, List[MetadataRow]]:
+    adjacency: Dict[str, List[MetadataRow]] = defaultdict(list)
+    for row in metadata_rows:
+        if not row.target_table:
+            continue
+        adjacency[row.target_table.lower()].append(row)
+    return adjacency
+
+
+def build_lineage_rows(
+    profile_tables: Sequence[str],
+    adjacency: Dict[str, List[MetadataRow]],
+    run_timestamp: datetime.datetime,
+) -> List[DependencyRow]:
+    results: List[DependencyRow] = []
+    order_index = 1
+
+    def dfs(
+        current_target: str,
+        root_target: str,
+        level: int,
+        path: Set[str],
+        edge_seen: Set[Tuple[str, str, str]],
+    ) -> None:
+        nonlocal order_index
+        if not current_target:
+            return
+        current_lower = current_target.lower()
+        if current_lower in path:
+            logging.debug("Cycle detected at %s under root %s", current_target, root_target)
+            return
+        path.add(current_lower)
+        rows = adjacency.get(current_lower, [])
+        for row in rows:
+            source = row.source_table
+            if not source:
+                continue
+            source_lower = source.lower()
+            edge_key = (root_target.lower(), row.target_table.lower(), source_lower)
+            if edge_key in edge_seen:
+                continue
+            if source_lower in path:
+                logging.debug(
+                    "Cycle detected: %s -> %s for root %s", row.target_table, source, root_target
+                )
+                continue
+            dfs(source, root_target, level + 1, path, edge_seen)
+            edge_seen.add(edge_key)
+            results.append(
+                DependencyRow(
+                    order_index=order_index,
+                    root_profile_table=root_target,
+                    target_table=row.target_table,
+                    source_schema=row.source_schema,
+                    source_table=source,
+                    process=row.process,
+                    filename=row.filename,
+                    filepath=row.filepath,
+                    level=level,
+                    current_timestamp=run_timestamp,
+                )
+            )
+            order_index += 1
+        path.remove(current_lower)
+
+    for root in profile_tables:
+        edge_seen: Set[Tuple[str, str, str]] = set()
+        dfs(root, root, 1, set(), edge_seen)
+        template_rows = adjacency.get(root.lower(), [])
+        template = template_rows[0] if template_rows else None
+        results.append(
+            DependencyRow(
+                order_index=order_index,
+                root_profile_table=root,
+                target_table=root,
+                source_schema=None,
+                source_table=None,
+                process=template.process if template else "",
+                filename=template.filename if template else "",
+                filepath=template.filepath if template else "",
+                level=0,
+                current_timestamp=run_timestamp,
+            )
+        )
+        order_index += 1
+
+    return results
+
+
+def rows_to_dataframe(rows: Sequence[DependencyRow]) -> pd.DataFrame:
+    records = [
+        {
+            "order_index": row.order_index,
+            "root_profile_table": row.root_profile_table,
+            "target_table": row.target_table,
+            "source_schema": row.source_schema,
+            "source_table": row.source_table,
+            "process": row.process,
+            "filename": row.filename,
+            "filepath": row.filepath,
+            "level": row.level,
+            "current_timestamp": row.current_timestamp,
+        }
+        for row in rows
+    ]
+    return pd.DataFrame(records)
+
+
+def write_temp_excel(
+    df: pd.DataFrame,
+    run_timestamp: datetime.datetime,
+) -> str:
+    timestamp_str = run_timestamp.strftime("%Y%m%d%H%M%S")
+    output_file = f"{LINEAGE_OUTPUT_PREFIX}_{timestamp_str}_{LINEAGE_OUTPUT_SUFFIX}.xlsx"
+    df.to_excel(output_file, index=False)
+    logging.info("Wrote %s", output_file)
+    return output_file
+
+
+def refresh_temp_table(
+    conn: psycopg2.extensions.connection,
+    rows: Sequence[DependencyRow],
+) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            sql.SQL("DROP TABLE IF EXISTS {}").format(qualified_table(LINEAGE_TEMP_TABLE))
+        )
+        cur.execute(
+            sql.SQL(
+                """
+                CREATE TABLE {} (
+                    order_index INTEGER,
+                    root_profile_table TEXT,
+                    target_table TEXT,
+                    source_schema TEXT,
+                    source_table TEXT,
+                    process TEXT,
+                    filename TEXT,
+                    filepath TEXT,
+                    level INTEGER,
+                    "current_timestamp" TIMESTAMP
+                )
+                """
+            ).format(qualified_table(LINEAGE_TEMP_TABLE))
+        )
+        values = [
+            (
+                row.order_index,
+                row.root_profile_table,
+                row.target_table,
+                row.source_schema,
+                row.source_table,
+                row.process,
+                row.filename,
+                row.filepath,
+                row.level,
+                row.current_timestamp,
+            )
+            for row in rows
+        ]
+        if values:
+            execute_values(
+                cur,
+                sql.SQL(
+                    'INSERT INTO {} (order_index, root_profile_table, target_table, source_schema, source_table, process, filename, filepath, level, "current_timestamp") VALUES %s'
+                ).format(qualified_table(LINEAGE_TEMP_TABLE)),
+                values,
+            )
+        cur.execute(
+            sql.SQL("ALTER TABLE {} OWNER TO {}").format(
+                qualified_table(LINEAGE_TEMP_TABLE),
+                sql.Identifier("erd_gpdb_prj_smart_insights"),
+            )
+        )
+        cur.execute(
+            sql.SQL("GRANT SELECT ON {} TO {}").format(
+                qualified_table(LINEAGE_TEMP_TABLE),
+                sql.Identifier("erd_gpdb_prj_smart_insights_ro"),
+            )
+        )
+    conn.commit()
+
+
+def build_dependency_artifacts(
+    insight_types: Sequence[str],
+    db_config: Dict[str, str],
+    run_timestamp: Optional[datetime.datetime] = None,
+) -> Tuple[List[DependencyRow], List[str], Optional[str]]:
+    timestamp = run_timestamp or datetime.datetime.utcnow()
+    with psycopg2.connect(**db_config) as conn:
+        profile_tables = fetch_profile_tables(conn, insight_types)
+        if not profile_tables:
+            logging.warning("No profile tables found for %s", insight_types)
+            return [], [], None
+        metadata_rows = fetch_metadata_rows(conn)
+    adjacency = build_adjacency(metadata_rows)
+    lineage_rows = build_lineage_rows(profile_tables, adjacency, timestamp)
+    df = rows_to_dataframe(lineage_rows)
+    excel_path = write_temp_excel(df, timestamp)
+    with psycopg2.connect(**db_config) as conn:
+        refresh_temp_table(conn, lineage_rows)
+    logging.info(
+        "Refreshed %s.%s with %d rows.",
+        TARGET_SCHEMA,
+        LINEAGE_TEMP_TABLE,
+        len(lineage_rows),
+    )
+    return lineage_rows, profile_tables, excel_path
+
+
+def fetch_lineage_entries(
+    conn: psycopg2.extensions.connection,
+) -> List[LineageEntry]:
+    query = sql.SQL(
+        """
+        SELECT
+            order_index,
+            root_profile_table,
+            target_table,
+            source_table,
+            process,
+            filename,
+            filepath
+        FROM {}
+        WHERE source_table IS NOT NULL
+          AND (source_schema ILIKE '%ikg%')
+        ORDER BY order_index ASC
+        """
+    ).format(qualified_table(LINEAGE_TEMP_TABLE))
+    with conn.cursor() as cur:
+        cur.execute(query)
+        rows = []
+        for (
+            order_index,
+            root_profile_table,
+            target_table,
+            source_table,
+            process,
+            filename,
+            filepath,
+        ) in cur.fetchall():
+            if not source_table:
+                continue
+            rows.append(
+                LineageEntry(
+                    order_index=order_index,
+                    source_table=source_table,
+                    process=process,
+                    filename=filename,
+                    filepath=filepath,
+                    target_table=target_table,
+                    root_profile_table=root_profile_table,
+                )
+            )
+    return rows
 
 
 def fetch_profile_scripts(
@@ -166,7 +473,7 @@ def fetch_profile_scripts(
             continue
         try:
             content = fetcher.fetch_sql(path)
-        except gitlab.exceptions.GitlabGetError as exc:
+        except gitlab.exceptions.GitlabGetError as exc:  # pragma: no cover - external call
             logging.warning("Failed to fetch %s: %s", path, exc)
             continue
         scripts.append((path, content))
@@ -236,7 +543,7 @@ def preview_final_table(
         schema, table = target.split(".", 1)
     else:
         schema, table = default_schema, target
-    final_table = f"{table}_temp"
+    final_table = f"{table}{TABLE_SUFFIX}"
     query = sql.SQL("SELECT * FROM {}.{} LIMIT 5").format(
         sql.Identifier(schema), sql.Identifier(final_table)
     )
@@ -279,7 +586,7 @@ def stitch_sql(
             continue
         try:
             content = fetcher.fetch_sql(path)
-        except gitlab.exceptions.GitlabGetError as exc:
+        except gitlab.exceptions.GitlabGetError as exc:  # pragma: no cover - network call
             logging.warning("Failed to fetch %s: %s", path, exc)
             continue
         stitched.append((path, content))
@@ -298,11 +605,11 @@ PLACEHOLDER_PATTERNS = [
     (re.compile(r"{{\s*params\.IKG_WEALTHX_SCHEMA\s*}}", re.IGNORECASE), "sandbox_prj_smart_relationship"),
     (re.compile(r"{{\s*params\.MODEL_SCHEMA\s*}}", re.IGNORECASE), "core_model"),
     (
-        re.compile(r"{{\s*params\.IKG_TABLE_OWNER_GROUP\s*}}", re.IGNORECASE),
+        re.compile(r"[\"']?\{\{\s*params\.IKG_TABLE_OWNER_GROUP\s*\}\}[\"']?", re.IGNORECASE),
         "erd_gpdb_prj_smart_insights",
     ),
     (
-        re.compile(r"{{\s*params\.IKG_TABLE_READER_GROUP\s*}}", re.IGNORECASE),
+        re.compile(r"[\"']?\{\{\s*params\.IKG_TABLE_READER_GROUP\s*\}\}[\"']?", re.IGNORECASE),
         "erd_gpdb_prj_smart_insights_ro",
     ),
 ]
@@ -359,10 +666,12 @@ def append_temp_identifier(identifier: str) -> str:
 
 
 def append_temp_suffix(table_name: str) -> str:
+    if table_name.lower().endswith(TABLE_SUFFIX):
+        return table_name
     if table_name.endswith('"'):
         base = table_name[:-1]
-        return f'{base}_temp"'
-    return f"{table_name}_temp"
+        return f'{base}{TABLE_SUFFIX}"'
+    return f"{table_name}{TABLE_SUFFIX}"
 
 
 def render_stitched_text(stitched_sql: Sequence[Tuple[str, str]]) -> str:
@@ -412,44 +721,43 @@ def write_profile_only_file(insight_type: str, profile_text: str) -> str:
     return profile_name
 
 
-def main() -> None:
+def run_pipeline() -> None:
     logging.basicConfig(
         level=getattr(logging, LOG_LEVEL.upper(), logging.DEBUG),
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
 
-    insight_raw = input("Enter insight_type: ").strip()
+    insight_raw = input("Enter insight_type (comma-separated allowed): ").strip()
     if not insight_raw:
         raise ValueError("insight_type is required.")
     insight_values = parse_insight_values(insight_raw)
     if not insight_values:
         raise ValueError("At least one insight_type value is required.")
+
     profile_date = input("Enter profile date (YYYYMMDD): ").strip()
     if not profile_date:
         raise ValueError("profile date is required.")
-    db_password = getpass.getpass("Enter Password for DB User: ")
 
-    db_config = {
-        "host": "greenplum-rdsp.zur.swissbank.com",
-        "port": "5432",
-        "dbname": "gprdsp",
-        "user": "ds_rdsp_dev",
-        "password": db_password,
-    }
+    db_password = getpass.getpass("Enter Password for DB User: ")
+    db_config = build_db_config(db_password)
+
+    run_timestamp = datetime.datetime.utcnow()
+    _, profile_tables, excel_path = build_dependency_artifacts(
+        insight_values, db_config, run_timestamp=run_timestamp
+    )
+    if not profile_tables:
+        logging.warning("Stopping because no profile tables were detected.")
+        return
+    logging.info("Dependency Excel generated at %s", excel_path)
 
     with psycopg2.connect(**db_config) as conn:
         entries = fetch_lineage_entries(conn)
-        profile_tables = fetch_profile_tables(conn, insight_values)
 
     if not entries:
-        logging.warning("No lineage entries found in %s.%s", TARGET_SCHEMA, LINEAGE_TEMP_TABLE)
-        return
-    if not profile_tables:
         logging.warning(
-            "No profile tables found in %s.%s for the provided insight types.",
-            TARGET_SCHEMA,
-            RULE_METADATA_TABLE,
+            "No lineage entries found in %s.%s", TARGET_SCHEMA, LINEAGE_TEMP_TABLE
         )
+        return
 
     private_token = getpass.getpass("Enter your private token: ")
     exclude_folders = [folder for folder in EXCLUDE_FOLDER.split() if folder]
@@ -464,8 +772,9 @@ def main() -> None:
         stitched_sql.extend(profile_scripts)
     elif profile_tables:
         logging.warning("Profile table scripts were not appended; none were retrieved.")
-    profile_only_text = None
-    profile_only_path = None
+
+    profile_only_text: Optional[str] = None
+    profile_only_path: Optional[str] = None
     if profile_scripts:
         profile_only_text = build_profile_only_text(
             profile_scripts[-1][1], profile_date
@@ -478,25 +787,28 @@ def main() -> None:
         insight_raw, stitched_text, profile_date
     )
     logging.info(
-        "Created original and modified SQL files for %s: %s, %s",
+        "Created stitched artifacts for %s: %s, %s",
         insight_raw,
         original_path,
         modified_path,
     )
 
-    if profile_only_text:
+    try:
+        run_sql_script(modified_text, db_config)
+        preview_final_table(db_config, profile_tables)
+    except Exception as exc:  # pragma: no cover - requires DB
+        logging.error("Execution of %s failed: %s", modified_path, exc)
+
+    if profile_only_text and profile_only_path:
         try:
             run_sql_script(profile_only_text, db_config)
-        except Exception:
-            logging.error(
-                "Execution of %s failed.", profile_only_path or "profile-only script"
-            )
-            raise
-        preview_final_table(db_config, profile_tables)
-    else:
-        logging.warning(
-            "No profile-only script available to execute; skipping run and preview."
-        )
+            preview_final_table(db_config, profile_tables)
+        except Exception as exc:  # pragma: no cover - requires DB
+            logging.error("Execution of %s failed: %s", profile_only_path, exc)
+
+
+def main() -> None:
+    run_pipeline()
 
 
 if __name__ == "__main__":
