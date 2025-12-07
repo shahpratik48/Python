@@ -4,6 +4,7 @@ import getpass
 import logging
 import os
 import re
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -83,6 +84,9 @@ class DependencyRow:
 
 
 class GitLabSQLFetcher:
+    RETRY_ATTEMPTS = 3
+    RETRY_BASE_DELAY = 2.0
+
     def __init__(self, private_token: str, exclude_folders: Sequence[str]) -> None:
         self._gl = gitlab.Gitlab(GITLAB_URL, private_token=private_token)
         self._project = self._gl.projects.get(IKG_PROJECT_PATH)
@@ -111,8 +115,29 @@ class GitLabSQLFetcher:
         return any(part in self._exclude for part in parts)
 
     def fetch_sql(self, file_path: str) -> str:
-        file_obj = self._project.files.get(file_path=file_path, ref=BRANCH)
-        return base64.b64decode(file_obj.content).decode("utf-8", errors="replace")
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, self.RETRY_ATTEMPTS + 1):
+            try:
+                file_obj = self._project.files.get(file_path=file_path, ref=BRANCH)
+                return base64.b64decode(file_obj.content).decode("utf-8", errors="replace")
+            except gitlab.exceptions.GitlabGetError as exc:
+                status = getattr(exc, "response_code", None)
+                if status and int(status) >= 500 and attempt < self.RETRY_ATTEMPTS:
+                    wait_seconds = self.RETRY_BASE_DELAY * attempt
+                    logging.warning(
+                        "GitLab 500 while fetching %s (attempt %d/%d). Retrying in %.1fs",
+                        file_path,
+                        attempt,
+                        self.RETRY_ATTEMPTS,
+                        wait_seconds,
+                    )
+                    time.sleep(wait_seconds)
+                    last_exc = exc
+                    continue
+                raise
+        if last_exc:
+            raise last_exc
+        raise RuntimeError(f"Failed to fetch {file_path}")
 
     def resolve_path(self, filename: str, process_hint: Optional[str] = None) -> Optional[str]:
         candidates = self._path_map.get(filename.lower())
@@ -648,8 +673,32 @@ def find_tables_for_suffix(text: str) -> Set[str]:
     return tables
 
 
-def apply_table_suffixes(text: str, tables: Set[str]) -> str:
-    sorted_tables = sorted(tables, key=len, reverse=True)
+def derive_forced_table_tokens(table_names: Sequence[str]) -> Set[str]:
+    tokens: Set[str] = set()
+    for name in table_names:
+        if not name:
+            continue
+        tokens.add(name)
+        plain = name.split(".", 1)[-1]
+        tokens.add(plain)
+    return {token for token in tokens if token}
+
+
+def enforce_profile_table_suffix(script_text: str, profile_table: str) -> str:
+    if not profile_table:
+        return script_text
+    forced = derive_forced_table_tokens([profile_table])
+    tables = find_tables_for_suffix(script_text)
+    return apply_table_suffixes(script_text, tables, forced_tables=forced)
+
+
+def apply_table_suffixes(
+    text: str, tables: Set[str], forced_tables: Optional[Set[str]] = None
+) -> str:
+    names: Set[str] = set(tables)
+    if forced_tables:
+        names.update(forced_tables)
+    sorted_tables = sorted(names, key=len, reverse=True)
     result = text
     for name in sorted_tables:
         escaped = re.escape(name)
@@ -694,20 +743,25 @@ def write_modified_file(
     insight_type: str,
     stitched_text: str,
     profile_date: str,
+    forced_tables: Optional[Set[str]] = None,
 ) -> Tuple[str, str]:
     modified_text = apply_placeholder_replacements(stitched_text, profile_date)
     tables_to_suffix = find_tables_for_suffix(modified_text)
-    modified_text = apply_table_suffixes(modified_text, tables_to_suffix)
+    modified_text = apply_table_suffixes(modified_text, tables_to_suffix, forced_tables)
     output_name = sanitize_filename(insight_type).replace(OUTPUT_SUFFIX, MODIFIED_SUFFIX)
     Path(output_name).write_text(modified_text, encoding="utf-8")
     logging.info("Wrote modified SQL to %s", output_name)
     return output_name, modified_text
 
 
-def build_profile_only_text(profile_script: str, profile_date: str) -> str:
+def build_profile_only_text(
+    profile_script: str,
+    profile_date: str,
+    forced_tables: Optional[Set[str]] = None,
+) -> str:
     text = apply_placeholder_replacements(profile_script, profile_date)
     tables_to_suffix = find_tables_for_suffix(text)
-    return apply_table_suffixes(text, tables_to_suffix)
+    return apply_table_suffixes(text, tables_to_suffix, forced_tables)
 
 
 def write_profile_only_file(insight_type: str, profile_text: str) -> str:
@@ -749,6 +803,7 @@ def run_pipeline() -> None:
         logging.warning("Stopping because no profile tables were detected.")
         return
     logging.info("Dependency Excel generated at %s", excel_path)
+    forced_table_tokens = derive_forced_table_tokens(profile_tables)
 
     with psycopg2.connect(**db_config) as conn:
         entries = fetch_lineage_entries(conn)
@@ -769,7 +824,10 @@ def run_pipeline() -> None:
         return
     profile_scripts = fetch_profile_scripts(fetcher, profile_tables)
     if profile_scripts:
-        stitched_sql.extend(profile_scripts)
+        processed_profiles: List[Tuple[str, str]] = []
+        for (path, content), table_name in zip(profile_scripts, profile_tables):
+            processed_profiles.append((path, enforce_profile_table_suffix(content, table_name)))
+        stitched_sql.extend(processed_profiles)
     elif profile_tables:
         logging.warning("Profile table scripts were not appended; none were retrieved.")
 
@@ -777,14 +835,14 @@ def run_pipeline() -> None:
     profile_only_path: Optional[str] = None
     if profile_scripts:
         profile_only_text = build_profile_only_text(
-            profile_scripts[-1][1], profile_date
+            profile_scripts[-1][1], profile_date, forced_table_tokens
         )
         profile_only_path = write_profile_only_file(insight_raw, profile_only_text)
 
     stitched_text = render_stitched_text(stitched_sql)
     original_path = write_output_file(insight_raw, stitched_text)
     modified_path, modified_text = write_modified_file(
-        insight_raw, stitched_text, profile_date
+        insight_raw, stitched_text, profile_date, forced_table_tokens
     )
     logging.info(
         "Created stitched artifacts for %s: %s, %s",
