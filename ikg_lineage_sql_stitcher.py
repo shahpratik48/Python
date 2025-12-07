@@ -713,7 +713,7 @@ def sanitize_filename(insight_type: str) -> str:
     safe = safe.strip("_")
     if not safe:
         safe = "insight"
-    return f"{safe.lower()}{OUTPUT_SUFFIX}"
+    return f"profile_table_{safe.lower()}{OUTPUT_SUFFIX}"
 
 
 def stitch_sql(
