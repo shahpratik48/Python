@@ -32,6 +32,7 @@ TARGET_SCHEMA = "sandbox_prj_smart_insights"
 METADATA_TABLE = "ikg_table_lineage_metadata_auto_refresh"
 RULE_METADATA_TABLE = "odm_rule_metadata_auto_refresh"
 LINEAGE_TEMP_TABLE = "ikg_table_lineage_auto_refresh_temp"
+CORE_WMA_METADATA_TABLE = "core_wma_shared_table_list_metadata"
 OUTPUT_SUFFIX = "_new.sql"
 MODIFIED_SUFFIX = "_modified.sql"
 PROFILE_MODIFIED_SUFFIX = "_modified_profile.sql"
@@ -40,6 +41,7 @@ PROFILE_DATE_TOKENS = ("IKG_PROFILE_DATE", "IKG_PREV_PROFILE_DATE")
 LINEAGE_OUTPUT_PREFIX = "ikg_table_lineage"
 LINEAGE_OUTPUT_SUFFIX = "temp"
 TABLE_SUFFIX = "_temp_auto"
+TEMP_TABLE_SCRIPT_NAME = "core_wma_shared_temp_table_script.sql"
 BASE_DB_CONFIG = {
     "host": "greenplum-rdsp.zur.swissbank.com",
     "port": "5432",
@@ -81,6 +83,14 @@ class DependencyRow:
     filepath: str
     level: int
     current_timestamp: datetime.datetime
+
+
+@dataclass
+class TempTablePlan:
+    script_path: Optional[Path]
+    script_text: str
+    table_map: Dict[str, str]
+    timestamp_token: Optional[str]
 
 
 class GitLabSQLFetcher:
@@ -169,6 +179,10 @@ def parse_insight_values(raw: str) -> List[str]:
 
 def qualified_table(table_name: str) -> sql.SQL:
     return sql.SQL("{}.{}").format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(table_name))
+
+
+def qualified_table_custom(schema: str, table_name: str) -> sql.SQL:
+    return sql.SQL("{}.{}").format(sql.Identifier(schema), sql.Identifier(table_name))
 
 
 def fetch_profile_tables(
@@ -431,6 +445,113 @@ def build_dependency_artifacts(
     return lineage_rows, profile_tables, excel_path
 
 
+def fetch_core_metadata_table_names(
+    conn: psycopg2.extensions.connection,
+    sandbox_schema: str,
+) -> List[str]:
+    query = sql.SQL(
+        """
+        SELECT DISTINCT table_name
+        FROM {}
+        WHERE coalesce(table_name, '') <> ''
+        ORDER BY table_name
+        """
+    ).format(qualified_table_custom(sandbox_schema, CORE_WMA_METADATA_TABLE))
+    with conn.cursor() as cur:
+        cur.execute(query)
+        return [row[0] for row in cur.fetchall() if row and row[0]]
+
+
+def filter_tables_with_household_column(
+    conn: psycopg2.extensions.connection,
+    candidate_tables: Sequence[str],
+) -> List[str]:
+    if not candidate_tables:
+        return []
+    query = """
+        SELECT DISTINCT table_name
+        FROM information_schema.columns
+        WHERE table_schema = 'core_wma_shared'
+          AND lower(column_name) = 'acc_mhh_n'
+          AND table_name = ANY(%s)
+    """
+    with conn.cursor() as cur:
+        cur.execute(query, (list(candidate_tables),))
+        rows = [row[0] for row in cur.fetchall() if row and row[0]]
+    ordered: List[str] = []
+    seen: Set[str] = set()
+    for name in candidate_tables:
+        if name in rows and name.lower() not in seen:
+            ordered.append(name)
+            seen.add(name.lower())
+    return ordered
+
+
+def render_core_wma_temp_script(
+    tables: Sequence[str],
+    sandbox_schema: str,
+    acc_mhh_n_value: str,
+    timestamp_token: str,
+) -> Tuple[str, Dict[str, str]]:
+    if not tables:
+        return "", {}
+    lines: List[str] = [
+        "-- Auto-generated script to materialize core_wma_shared tables filtered by acc_mhh_n.",
+        f"-- Generated at {datetime.datetime.utcnow().isoformat()}",
+        "",
+    ]
+    sanitized_value = acc_mhh_n_value.replace("'", "''")
+    table_map: Dict[str, str] = {}
+    for table in tables:
+        temp_table = f"{table}_temp_{timestamp_token}"
+        table_map[table] = temp_table
+        lines.append(f"-- Source table: core_wma_shared.{table}")
+        lines.append(f"DROP TABLE IF EXISTS {sandbox_schema}.{temp_table};")
+        lines.append(
+            f"CREATE TABLE {sandbox_schema}.{temp_table} AS\n"
+            f"SELECT *\n"
+            f"FROM core_wma_shared.{table}\n"
+            f"WHERE acc_mhh_n = '{sanitized_value}'\n"
+            f"DISTRIBUTED BY (acc_mhh_n);"
+        )
+        lines.append("")
+    return "\n".join(lines).strip() + "\n", table_map
+
+
+def prepare_temp_table_plan(
+    db_config: Dict[str, str],
+    sandbox_schema: str,
+    acc_mhh_n_value: Optional[str],
+) -> TempTablePlan:
+    if not acc_mhh_n_value:
+        logging.info("No acc_mhh_n provided; skipping vendor temp table preparation.")
+        return TempTablePlan(None, "", {}, None)
+    with psycopg2.connect(**db_config) as conn:
+        candidate_tables = fetch_core_metadata_table_names(conn, sandbox_schema)
+        eligible_tables = filter_tables_with_household_column(conn, candidate_tables)
+    if not eligible_tables:
+        logging.warning(
+            "No tables with acc_mhh_n column found in %s.%s.",
+            sandbox_schema,
+            CORE_WMA_METADATA_TABLE,
+        )
+        return TempTablePlan(None, "", {}, None)
+    timestamp_token = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S%f")[:-3]
+    script_text, table_map = render_core_wma_temp_script(
+        eligible_tables, sandbox_schema, acc_mhh_n_value, timestamp_token
+    )
+    script_path = Path(TEMP_TABLE_SCRIPT_NAME)
+    script_path.write_text(script_text, encoding="utf-8")
+    logging.info("Wrote temp table script to %s", script_path)
+    if script_text.strip():
+        run_sql_script(script_text, db_config)
+        logging.info(
+            "Created %d core_wma_shared temp tables filtered by acc_mhh_n.",
+            len(table_map),
+        )
+    return TempTablePlan(script_path, script_text, table_map, timestamp_token)
+
+
 def fetch_lineage_entries(
     conn: psycopg2.extensions.connection,
 ) -> List[LineageEntry]:
@@ -660,6 +781,28 @@ def apply_placeholder_replacements(text: str, profile_date: str) -> str:
     return result
 
 
+SCHEMA_SWAP_PATTERN = (
+    r"(?:core_wma_shared|{{\s*params\.IKG_VENDOR_SCHEMA\s*}}|"
+    r"{{\s*params\.EDW_VIEW_INPUT_SCHEMA\s*}}|{{\s*params\.EDW_INPUT_SCHEMA\s*}})"
+)
+
+
+def apply_temp_schema_swaps(
+    text: str, temp_table_map: Dict[str, str], sandbox_schema: str
+) -> str:
+    if not temp_table_map:
+        return text
+    result = text
+    for source_table, temp_table in temp_table_map.items():
+        pattern = re.compile(
+            rf"{SCHEMA_SWAP_PATTERN}\s*\.\s*(?P<quote>\"?){re.escape(source_table)}(?P=quote)",
+            re.IGNORECASE,
+        )
+        replacement = f"{sandbox_schema}.{temp_table}"
+        result = pattern.sub(replacement, result)
+    return result
+
+
 def find_tables_for_suffix(text: str) -> Set[str]:
     pattern = re.compile(
         r"(?i)create\s+(?:global\s+temp\s+|temp\s+)?table\s+(?!if\s+not\s+exists)(?P<name>(?:[a-z0-9_]+\.)?[a-z0-9_]+)",
@@ -744,8 +887,12 @@ def write_modified_file(
     stitched_text: str,
     profile_date: str,
     forced_tables: Optional[Set[str]] = None,
+    temp_table_map: Optional[Dict[str, str]] = None,
+    sandbox_schema: str = TARGET_SCHEMA,
 ) -> Tuple[str, str]:
     modified_text = apply_placeholder_replacements(stitched_text, profile_date)
+    if temp_table_map:
+        modified_text = apply_temp_schema_swaps(modified_text, temp_table_map, sandbox_schema)
     tables_to_suffix = find_tables_for_suffix(modified_text)
     modified_text = apply_table_suffixes(modified_text, tables_to_suffix, forced_tables)
     output_name = sanitize_filename(insight_type).replace(OUTPUT_SUFFIX, MODIFIED_SUFFIX)
@@ -758,8 +905,12 @@ def build_profile_only_text(
     profile_script: str,
     profile_date: str,
     forced_tables: Optional[Set[str]] = None,
+    temp_table_map: Optional[Dict[str, str]] = None,
+    sandbox_schema: str = TARGET_SCHEMA,
 ) -> str:
     text = apply_placeholder_replacements(profile_script, profile_date)
+    if temp_table_map:
+        text = apply_temp_schema_swaps(text, temp_table_map, sandbox_schema)
     tables_to_suffix = find_tables_for_suffix(text)
     return apply_table_suffixes(text, tables_to_suffix, forced_tables)
 
@@ -773,6 +924,49 @@ def write_profile_only_file(insight_type: str, profile_text: str) -> str:
     Path(profile_name).write_text(profile_text, encoding="utf-8")
     logging.info("Wrote profile-only SQL to %s", profile_name)
     return profile_name
+
+
+def extract_created_tables(script_text: str) -> List[str]:
+    names: List[str] = []
+    seen: Set[str] = set()
+    pattern = re.compile(
+        r"(?i)create\s+(?:global\s+temp\s+|temp\s+)?table\s+(?!if\s+not\s+exists)(?P<name>(?:[a-z0-9_]+\.)?[a-z0-9_]+)"
+    )
+    for match in pattern.finditer(script_text):
+        name = match.group("name")
+        if not name:
+            continue
+        normalized = name.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        names.append(name)
+    return names
+
+
+def display_table_counts(
+    tables: Sequence[str],
+    db_config: Dict[str, str],
+) -> None:
+    if not tables:
+        logging.info("No created tables detected for count preview.")
+        return
+    with psycopg2.connect(**db_config) as conn, conn.cursor() as cur:
+        for name in tables:
+            if "." in name:
+                schema, table = name.split(".", 1)
+            else:
+                schema, table = TARGET_SCHEMA, name
+            query = sql.SQL("SELECT COUNT(*) FROM {}.{}").format(
+                sql.Identifier(schema),
+                sql.Identifier(table),
+            )
+            try:
+                cur.execute(query)
+                count = cur.fetchone()[0]
+                logging.info("Row count for %s.%s: %s", schema, table, count)
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("Unable to count %s.%s: %s", schema, table, exc)
 
 
 def run_pipeline() -> None:
@@ -791,6 +985,11 @@ def run_pipeline() -> None:
     profile_date = input("Enter profile date (YYYYMMDD): ").strip()
     if not profile_date:
         raise ValueError("profile date is required.")
+    acc_mhh_n_value = input("Enter acc_mhh_n (optional, press Enter to skip): ").strip()
+    sandbox_schema = (
+        input(f"Enter sandbox schema for temp tables [{TARGET_SCHEMA}]: ").strip()
+        or TARGET_SCHEMA
+    )
 
     db_password = getpass.getpass("Enter Password for DB User: ")
     db_config = build_db_config(db_password)
@@ -804,6 +1003,9 @@ def run_pipeline() -> None:
         return
     logging.info("Dependency Excel generated at %s", excel_path)
     forced_table_tokens = derive_forced_table_tokens(profile_tables)
+
+    temp_plan = prepare_temp_table_plan(db_config, sandbox_schema, acc_mhh_n_value)
+    temp_table_map = temp_plan.table_map
 
     with psycopg2.connect(**db_config) as conn:
         entries = fetch_lineage_entries(conn)
@@ -835,15 +1037,25 @@ def run_pipeline() -> None:
     profile_only_path: Optional[str] = None
     if profile_scripts:
         profile_only_text = build_profile_only_text(
-            profile_scripts[-1][1], profile_date, forced_table_tokens
+            profile_scripts[-1][1],
+            profile_date,
+            forced_table_tokens,
+            temp_table_map,
+            sandbox_schema,
         )
         profile_only_path = write_profile_only_file(insight_raw, profile_only_text)
 
     stitched_text = render_stitched_text(stitched_sql)
     original_path = write_output_file(insight_raw, stitched_text)
     modified_path, modified_text = write_modified_file(
-        insight_raw, stitched_text, profile_date, forced_table_tokens
+        insight_raw,
+        stitched_text,
+        profile_date,
+        forced_table_tokens,
+        temp_table_map,
+        sandbox_schema,
     )
+    created_tables = sorted(find_tables_for_suffix(modified_text))
     logging.info(
         "Created stitched artifacts for %s: %s, %s",
         insight_raw,
@@ -853,6 +1065,7 @@ def run_pipeline() -> None:
 
     try:
         run_sql_script(modified_text, db_config)
+        display_table_counts(created_tables, db_config)
         preview_final_table(db_config, profile_tables)
     except Exception as exc:  # pragma: no cover - requires DB
         logging.error("Execution of %s failed: %s", modified_path, exc)
