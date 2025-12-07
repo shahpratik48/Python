@@ -469,14 +469,19 @@ def filter_tables_with_household_column(
     if not candidate_tables:
         return []
     query = """
-        SELECT DISTINCT table_name
-        FROM information_schema.columns
-        WHERE table_schema = 'core_wma_shared'
-          AND lower(column_name) = 'acc_mhh_n'
-          AND table_name = ANY(%s)
+        SELECT DISTINCT c.relname
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+        WHERE n.nspname = 'core_wma_shared'
+          AND lower(a.attname) = 'acc_mhh_n'
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+          AND c.relkind = ANY(%s)
+          AND c.relname = ANY(%s)
     """
     with conn.cursor() as cur:
-        cur.execute(query, (list(candidate_tables),))
+        cur.execute(query, (["r", "m", "v"], list(candidate_tables)))
         rows = [row[0] for row in cur.fetchall() if row and row[0]]
     ordered: List[str] = []
     seen: Set[str] = set()
@@ -708,12 +713,18 @@ def preview_final_table(
         logging.info(dict(zip(columns, row)))
 
 
-def sanitize_filename(insight_type: str) -> str:
-    safe = re.sub(r"[^a-zA-Z0-9]+", "_", insight_type.strip())
-    safe = safe.strip("_")
-    if not safe:
-        safe = "insight"
-    return f"profile_table_{safe.lower()}{OUTPUT_SUFFIX}"
+def _sanitize_token(value: Optional[str], fallback: str) -> str:
+    if not value:
+        return fallback
+    token = re.sub(r"[^a-zA-Z0-9]+", "_", value.strip())
+    token = token.strip("_")
+    return token.lower() if token else fallback
+
+
+def sanitize_filename(insight_type: str, profile_table: Optional[str]) -> str:
+    profile_part = _sanitize_token(profile_table, "profile_table")
+    insight_part = _sanitize_token(insight_type, "insight")
+    return f"{profile_part}_{insight_part}{OUTPUT_SUFFIX}"
 
 
 def stitch_sql(
@@ -875,8 +886,10 @@ def render_stitched_text(stitched_sql: Sequence[Tuple[str, str]]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def write_output_file(insight_type: str, stitched_text: str) -> str:
-    output_name = sanitize_filename(insight_type)
+def write_output_file(
+    insight_type: str, stitched_text: str, profile_table: Optional[str]
+) -> str:
+    output_name = sanitize_filename(insight_type, profile_table)
     Path(output_name).write_text(stitched_text, encoding="utf-8")
     logging.info("Wrote stitched SQL to %s", output_name)
     return output_name
@@ -889,13 +902,16 @@ def write_modified_file(
     forced_tables: Optional[Set[str]] = None,
     temp_table_map: Optional[Dict[str, str]] = None,
     sandbox_schema: str = TARGET_SCHEMA,
+    profile_table: Optional[str] = None,
 ) -> Tuple[str, str]:
     modified_text = apply_placeholder_replacements(stitched_text, profile_date)
     if temp_table_map:
         modified_text = apply_temp_schema_swaps(modified_text, temp_table_map, sandbox_schema)
     tables_to_suffix = find_tables_for_suffix(modified_text)
     modified_text = apply_table_suffixes(modified_text, tables_to_suffix, forced_tables)
-    output_name = sanitize_filename(insight_type).replace(OUTPUT_SUFFIX, MODIFIED_SUFFIX)
+    output_name = sanitize_filename(insight_type, profile_table).replace(
+        OUTPUT_SUFFIX, MODIFIED_SUFFIX
+    )
     Path(output_name).write_text(modified_text, encoding="utf-8")
     logging.info("Wrote modified SQL to %s", output_name)
     return output_name, modified_text
@@ -915,8 +931,10 @@ def build_profile_only_text(
     return apply_table_suffixes(text, tables_to_suffix, forced_tables)
 
 
-def write_profile_only_file(insight_type: str, profile_text: str) -> str:
-    base_name = sanitize_filename(insight_type)
+def write_profile_only_file(
+    insight_type: str, profile_text: str, profile_table: Optional[str]
+) -> str:
+    base_name = sanitize_filename(insight_type, profile_table)
     if base_name.endswith(OUTPUT_SUFFIX):
         profile_name = base_name.replace(OUTPUT_SUFFIX, PROFILE_MODIFIED_SUFFIX)
     else:
@@ -1043,10 +1061,13 @@ def run_pipeline() -> None:
             temp_table_map,
             sandbox_schema,
         )
-        profile_only_path = write_profile_only_file(insight_raw, profile_only_text)
+        profile_only_path = write_profile_only_file(
+            insight_raw, profile_only_text, primary_profile_table
+        )
 
+    primary_profile_table = profile_tables[-1] if profile_tables else None
     stitched_text = render_stitched_text(stitched_sql)
-    original_path = write_output_file(insight_raw, stitched_text)
+    original_path = write_output_file(insight_raw, stitched_text, primary_profile_table)
     modified_path, modified_text = write_modified_file(
         insight_raw,
         stitched_text,
@@ -1054,6 +1075,7 @@ def run_pipeline() -> None:
         forced_table_tokens,
         temp_table_map,
         sandbox_schema,
+        primary_profile_table,
     )
     created_tables = sorted(find_tables_for_suffix(modified_text))
     logging.info(
