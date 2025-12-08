@@ -6,7 +6,7 @@ import os
 import re
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -321,23 +321,26 @@ def build_lineage_rows(
         )
         order_index += 1
 
-    return _dedupe_blank_schema_sources(results)
+    return _normalize_blank_schema_sources(results)
 
 
-def _dedupe_blank_schema_sources(rows: Sequence[DependencyRow]) -> List[DependencyRow]:
-    filtered: List[DependencyRow] = []
-    seen: Set[Tuple[str, str, str]] = set()
+def _normalize_blank_schema_sources(rows: Sequence[DependencyRow]) -> List[DependencyRow]:
+    normalized: List[DependencyRow] = []
+    counters: Dict[Tuple[str, str, str], int] = {}
     for row in rows:
         schema = (row.source_schema or "").strip()
-        source = row.source_table or ""
-        target = row.target_table or ""
+        source = (row.source_table or "").strip()
+        target = (row.target_table or "").strip()
+        replaced_row = row
         if not schema and source:
             key = (row.root_profile_table.lower(), target.lower(), source.lower())
-            if key in seen:
-                continue
-            seen.add(key)
-        filtered.append(row)
-    return filtered
+            count = counters.get(key, 0)
+            counters[key] = count + 1
+            if count > 0:
+                new_source = f"{row.source_table}_{count}_"
+                replaced_row = replace(row, source_table=new_source)
+        normalized.append(replaced_row)
+    return normalized
 
 
 def rows_to_dataframe(rows: Sequence[DependencyRow]) -> pd.DataFrame:
