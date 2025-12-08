@@ -321,7 +321,23 @@ def build_lineage_rows(
         )
         order_index += 1
 
-    return results
+    return _dedupe_blank_schema_sources(results)
+
+
+def _dedupe_blank_schema_sources(rows: Sequence[DependencyRow]) -> List[DependencyRow]:
+    filtered: List[DependencyRow] = []
+    seen: Set[Tuple[str, str, str]] = set()
+    for row in rows:
+        schema = (row.source_schema or "").strip()
+        source = row.source_table or ""
+        target = row.target_table or ""
+        if not schema and source:
+            key = (row.root_profile_table.lower(), target.lower(), source.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+        filtered.append(row)
+    return filtered
 
 
 def rows_to_dataframe(rows: Sequence[DependencyRow]) -> pd.DataFrame:
