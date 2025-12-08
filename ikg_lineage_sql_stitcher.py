@@ -770,13 +770,24 @@ def stitch_sql(
     stitched: List[Tuple[str, str]] = []
     content_cache: Dict[str, str] = {}
     alias_lookup = alias_lookup or {}
-    seen_physical: Set[str] = set()
+    seen_pairs: Set[Tuple[str, str]] = set()
 
     for entry in entries:
         alias_name = entry.source_table
-        physical_name = alias_lookup.get(alias_name.lower(), alias_name)
-        filename = f"{physical_name}.sql"
-        path = fetcher.resolve_path(filename, entry.process)
+        filename = entry.filename or f"{alias_name}.sql"
+        alias_key = (filename.lower(), alias_name.lower())
+        if alias_key in seen_pairs:
+            continue
+        seen_pairs.add(alias_key)
+
+        base_table = alias_lookup.get(alias_name.lower())
+        if not base_table:
+            base_table = Path(filename).stem
+
+        if entry.filepath:
+            path = entry.filepath
+        else:
+            path = fetcher.resolve_path(filename, entry.process)
         if not path:
             logging.warning(
                 "Unable to locate %s (alias %s) in GitLab repository.",
@@ -784,19 +795,15 @@ def stitch_sql(
                 alias_name,
             )
             continue
-        physical_key = physical_name.lower()
-        if alias_name.lower() == physical_key and physical_key in seen_physical:
-            logging.debug("Skipping duplicate inclusion of %s", filename)
-            continue
-        seen_physical.add(physical_key)
-        if filename not in content_cache:
+
+        if path not in content_cache:
             try:
-                content_cache[filename] = fetcher.fetch_sql(path)
+                content_cache[path] = fetcher.fetch_sql(path)
             except gitlab.exceptions.GitlabGetError as exc:  # pragma: no cover
                 logging.warning("Failed to fetch %s: %s", path, exc)
                 continue
-        content = content_cache[filename]
-        rewritten = rewrite_table_identifiers(content, physical_name, alias_name)
+        content = content_cache[path]
+        rewritten = rewrite_table_identifiers(content, base_table, alias_name)
         stitched.append((f"{path} (alias: {alias_name})", rewritten))
     return stitched
 
@@ -935,8 +942,21 @@ def rewrite_table_identifiers(
     if original_name.lower() == alias_name.lower():
         return script_text
     escaped = re.escape(original_name)
-    pattern = re.compile(rf"(?<![\w$]){escaped}(?![\w$])", re.IGNORECASE)
-    return pattern.sub(alias_name, script_text)
+    replacements = [
+        re.compile(rf"(?<![\w$]){escaped}(?![\w$])", re.IGNORECASE),
+        re.compile(rf"(?<![\w$])([a-z0-9_]+)\s*\.\s*{escaped}(?![\w$])", re.IGNORECASE),
+    ]
+    result = script_text
+    for pattern in replacements:
+        result = pattern.sub(
+            lambda m: (
+                f"{m.group(1)}.{alias_name}"
+                if m.lastindex and m.group(1)
+                else alias_name
+            ),
+            result,
+        )
+    return result
 
 
 def render_stitched_text(stitched_sql: Sequence[Tuple[str, str]]) -> str:
