@@ -248,7 +248,7 @@ def build_lineage_rows(
     profile_tables: Sequence[str],
     adjacency: Dict[str, List[MetadataRow]],
     run_timestamp: datetime.datetime,
-) -> List[DependencyRow]:
+) -> Tuple[List[DependencyRow], Dict[str, str]]:
     results: List[DependencyRow] = []
     order_index = 1
 
@@ -324,7 +324,9 @@ def build_lineage_rows(
     return _normalize_blank_schema_sources(results)
 
 
-def _normalize_blank_schema_sources(rows: Sequence[DependencyRow]) -> List[DependencyRow]:
+def _normalize_blank_schema_sources(
+    rows: Sequence[DependencyRow],
+) -> Tuple[List[DependencyRow], Dict[str, str]]:
     normalized: List[DependencyRow] = []
     blank_counts: Counter[str] = Counter()
     for row in rows:
@@ -334,20 +336,27 @@ def _normalize_blank_schema_sources(rows: Sequence[DependencyRow]) -> List[Depen
             blank_counts[source.lower()] += 1
 
     suffix_counters: Dict[str, int] = {}
+    alias_lookup: Dict[str, str] = {}
+
     for row in rows:
         schema = (row.source_schema or "").strip()
         source = (row.source_table or "").strip()
-        if schema or not source or blank_counts[source.lower()] <= 1:
+        key = source.lower()
+        if schema or not source or blank_counts.get(key, 0) <= 1:
+            alias_lookup.setdefault(key, source)
             normalized.append(row)
             continue
-        idx = suffix_counters.get(source.lower(), 0)
-        suffix_counters[source.lower()] = idx + 1
+        idx = suffix_counters.get(key, 0)
+        suffix_counters[key] = idx + 1
         if idx == 0:
+            alias_lookup.setdefault(key, source)
             normalized.append(row)
         else:
             new_source = f"{row.source_table}_{idx}_"
+            alias_lookup[new_source.lower()] = source
             normalized.append(replace(row, source_table=new_source))
-    return normalized
+
+    return normalized, alias_lookup
 
 
 def rows_to_dataframe(rows: Sequence[DependencyRow]) -> pd.DataFrame:
@@ -448,7 +457,7 @@ def build_dependency_artifacts(
     insight_types: Sequence[str],
     db_config: Dict[str, str],
     run_timestamp: Optional[datetime.datetime] = None,
-) -> Tuple[List[DependencyRow], List[str], Optional[str]]:
+) -> Tuple[List[DependencyRow], List[str], Optional[str], Dict[str, str]]:
     timestamp = run_timestamp or datetime.datetime.utcnow()
     with psycopg2.connect(**db_config) as conn:
         profile_tables = fetch_profile_tables(conn, insight_types)
@@ -457,7 +466,7 @@ def build_dependency_artifacts(
             return [], [], None
         metadata_rows = fetch_metadata_rows(conn)
     adjacency = build_adjacency(metadata_rows)
-    lineage_rows = build_lineage_rows(profile_tables, adjacency, timestamp)
+    lineage_rows, alias_lookup = build_lineage_rows(profile_tables, adjacency, timestamp)
     df = rows_to_dataframe(lineage_rows)
     excel_path = write_temp_excel(df, timestamp)
     with psycopg2.connect(**db_config) as conn:
@@ -468,7 +477,7 @@ def build_dependency_artifacts(
         LINEAGE_TEMP_TABLE,
         len(lineage_rows),
     )
-    return lineage_rows, profile_tables, excel_path
+    return lineage_rows, profile_tables, excel_path, alias_lookup
 
 
 def fetch_core_metadata_table_names(
@@ -756,24 +765,33 @@ def sanitize_filename(insight_type: str, profile_table: Optional[str]) -> str:
 def stitch_sql(
     entries: Sequence[LineageEntry],
     fetcher: GitLabSQLFetcher,
+    alias_lookup: Optional[Dict[str, str]] = None,
 ) -> List[Tuple[str, str]]:
     stitched: List[Tuple[str, str]] = []
-    seen_files: set[str] = set()
+    content_cache: Dict[str, str] = {}
+    alias_lookup = alias_lookup or {}
+
     for entry in entries:
-        filename = f"{entry.source_table}.sql"
-        if filename.lower() in seen_files:
-            continue
+        alias_name = entry.source_table
+        physical_name = alias_lookup.get(alias_name.lower(), alias_name)
+        filename = f"{physical_name}.sql"
         path = fetcher.resolve_path(filename, entry.process)
         if not path:
-            logging.warning("Unable to locate %s in GitLab repository.", filename)
+            logging.warning(
+                "Unable to locate %s (alias %s) in GitLab repository.",
+                filename,
+                alias_name,
+            )
             continue
-        try:
-            content = fetcher.fetch_sql(path)
-        except gitlab.exceptions.GitlabGetError as exc:  # pragma: no cover - network call
-            logging.warning("Failed to fetch %s: %s", path, exc)
-            continue
-        stitched.append((path, content))
-        seen_files.add(filename.lower())
+        if filename not in content_cache:
+            try:
+                content_cache[filename] = fetcher.fetch_sql(path)
+            except gitlab.exceptions.GitlabGetError as exc:  # pragma: no cover
+                logging.warning("Failed to fetch %s: %s", path, exc)
+                continue
+        content = content_cache[filename]
+        rewritten = rewrite_table_identifiers(content, physical_name, alias_name)
+        stitched.append((f"{path} (alias: {alias_name})", rewritten))
     return stitched
 
 
@@ -901,6 +919,18 @@ def append_temp_suffix(table_name: str) -> str:
         base = table_name[:-1]
         return f'{base}{TABLE_SUFFIX}"'
     return f"{table_name}{TABLE_SUFFIX}"
+
+
+def rewrite_table_identifiers(
+    script_text: str,
+    original_name: str,
+    alias_name: str,
+) -> str:
+    if original_name.lower() == alias_name.lower():
+        return script_text
+    escaped = re.escape(original_name)
+    pattern = re.compile(rf"(?<![\w$]){escaped}(?![\w$])", re.IGNORECASE)
+    return pattern.sub(alias_name, script_text)
 
 
 def render_stitched_text(stitched_sql: Sequence[Tuple[str, str]]) -> str:
@@ -1039,7 +1069,7 @@ def run_pipeline() -> None:
     db_config = build_db_config(db_password)
 
     run_timestamp = datetime.datetime.utcnow()
-    _, profile_tables, excel_path = build_dependency_artifacts(
+    _, profile_tables, excel_path, alias_lookup = build_dependency_artifacts(
         insight_values, db_config, run_timestamp=run_timestamp
     )
     if not profile_tables:
@@ -1064,7 +1094,7 @@ def run_pipeline() -> None:
     exclude_folders = [folder for folder in EXCLUDE_FOLDER.split() if folder]
     fetcher = GitLabSQLFetcher(private_token=private_token, exclude_folders=exclude_folders)
 
-    stitched_sql = stitch_sql(entries, fetcher)
+    stitched_sql = stitch_sql(entries, fetcher, alias_lookup)
     if not stitched_sql:
         logging.warning("No SQL files were stitched; please verify repository contents.")
         return
