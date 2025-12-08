@@ -477,10 +477,10 @@ def fetch_core_metadata_table_names(
 ) -> List[str]:
     query = sql.SQL(
         """
-        SELECT DISTINCT table_name
+        SELECT DISTINCT core_wma_shared_table_name
         FROM {}
-        WHERE coalesce(table_name, '') <> ''
-        ORDER BY table_name
+        WHERE coalesce(core_wma_shared_table_name, '') <> ''
+        ORDER BY core_wma_shared_table_name
         """
     ).format(qualified_table_custom(sandbox_schema, CORE_WMA_METADATA_TABLE))
     with conn.cursor() as cur:
@@ -710,7 +710,7 @@ def run_sql_script(script_text: str, db_config: Dict[str, str]) -> None:
 def preview_final_table(
     db_config: Dict[str, str],
     profile_tables: Sequence[str],
-    default_schema: str = "core_ikg",
+    default_schema: str = "sandbox_prj_smart_insights",
 ) -> None:
     if not profile_tables:
         logging.info("No profile table available for preview.")
@@ -778,7 +778,7 @@ def stitch_sql(
 
 
 PLACEHOLDER_PATTERNS = [
-    (re.compile(r"{{\s*params\.IKG_SCHEMA\s*}}", re.IGNORECASE), "core_ikg"),
+    (re.compile(r"{{\s*params\.IKG_SCHEMA\s*}}", re.IGNORECASE), "sandbox_prj_smart_insights"),
     (re.compile(r"{{\s*params\.EDW_VIEW_INPUT_SCHEMA\s*}}", re.IGNORECASE), "core_wma_shared"),
     (re.compile(r"{{\s*params\.EDW_INPUT_SCHEMA\s*}}", re.IGNORECASE), "core_wma_shared"),
     (re.compile(r"{{\s*params\.EDW_ETL_SCHEMA\s*}}", re.IGNORECASE), "core_etl"),
