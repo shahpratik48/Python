@@ -5,7 +5,7 @@ import logging
 import os
 import re
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -326,20 +326,27 @@ def build_lineage_rows(
 
 def _normalize_blank_schema_sources(rows: Sequence[DependencyRow]) -> List[DependencyRow]:
     normalized: List[DependencyRow] = []
-    counters: Dict[Tuple[str, str, str], int] = {}
+    blank_counts: Counter[str] = Counter()
     for row in rows:
         schema = (row.source_schema or "").strip()
         source = (row.source_table or "").strip()
-        target = (row.target_table or "").strip()
-        replaced_row = row
         if not schema and source:
-            key = (row.root_profile_table.lower(), target.lower(), source.lower())
-            count = counters.get(key, 0)
-            counters[key] = count + 1
-            if count > 0:
-                new_source = f"{row.source_table}_{count}_"
-                replaced_row = replace(row, source_table=new_source)
-        normalized.append(replaced_row)
+            blank_counts[source.lower()] += 1
+
+    suffix_counters: Dict[str, int] = {}
+    for row in rows:
+        schema = (row.source_schema or "").strip()
+        source = (row.source_table or "").strip()
+        if schema or not source or blank_counts[source.lower()] <= 1:
+            normalized.append(row)
+            continue
+        idx = suffix_counters.get(source.lower(), 0)
+        suffix_counters[source.lower()] = idx + 1
+        if idx == 0:
+            normalized.append(row)
+        else:
+            new_source = f"{row.source_table}_{idx}_"
+            normalized.append(replace(row, source_table=new_source))
     return normalized
 
 
