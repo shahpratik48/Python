@@ -8,7 +8,7 @@ import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import gitlab
 import pandas as pd
@@ -770,24 +770,13 @@ def stitch_sql(
     stitched: List[Tuple[str, str]] = []
     content_cache: Dict[str, str] = {}
     alias_lookup = alias_lookup or {}
-    seen_pairs: Set[Tuple[str, str]] = set()
+    seen_paths: Set[str] = set()
 
     for entry in entries:
         alias_name = entry.source_table
         filename = entry.filename or f"{alias_name}.sql"
-        alias_key = (filename.lower(), alias_name.lower())
-        if alias_key in seen_pairs:
-            continue
-        seen_pairs.add(alias_key)
-
-        base_table = alias_lookup.get(alias_name.lower())
-        if not base_table:
-            base_table = Path(filename).stem
-
-        if entry.filepath:
-            path = entry.filepath
-        else:
-            path = fetcher.resolve_path(filename, entry.process)
+        base_table = alias_lookup.get(alias_name.lower()) or Path(filename).stem
+        path = entry.filepath or fetcher.resolve_path(filename, entry.process)
         if not path:
             logging.warning(
                 "Unable to locate %s (alias %s) in GitLab repository.",
@@ -795,6 +784,11 @@ def stitch_sql(
                 alias_name,
             )
             continue
+        path_key = path.lower()
+        if path_key in seen_paths:
+            logging.debug("Skipping duplicate script %s", path)
+            continue
+        seen_paths.add(path_key)
 
         if path not in content_cache:
             try:
@@ -942,21 +936,142 @@ def rewrite_table_identifiers(
     if original_name.lower() == alias_name.lower():
         return script_text
     escaped = re.escape(original_name)
-    replacements = [
-        re.compile(rf"(?<![\w$]){escaped}(?![\w$])", re.IGNORECASE),
-        re.compile(rf"(?<![\w$])([a-z0-9_]+)\s*\.\s*{escaped}(?![\w$])", re.IGNORECASE),
-    ]
-    result = script_text
-    for pattern in replacements:
-        result = pattern.sub(
-            lambda m: (
-                f"{m.group(1)}.{alias_name}"
-                if m.lastindex and m.group(1)
-                else alias_name
-            ),
-            result,
-        )
+    quoted = re.compile(rf'"{escaped}"', re.IGNORECASE)
+    bare = re.compile(rf"(?<![\w$]){escaped}(?![\w$])", re.IGNORECASE)
+    schema_qualified = re.compile(
+        rf'((?:"[^"]+"|[a-z0-9_]+))\s*\.\s*{escaped}(?![\w$])', re.IGNORECASE
+    )
+    schema_qualified_quoted = re.compile(
+        rf'((?:"[^"]+"|[a-z0-9_]+))\s*\.\s*"{escaped}"', re.IGNORECASE
+    )
+
+    def _replace(match: re.Match[str], schema: bool = False) -> str:
+        if schema:
+            return f"{match.group(1)}.{alias_name}"
+        return alias_name
+
+    result = schema_qualified.sub(lambda m: _replace(m, schema=True), script_text)
+    result = schema_qualified_quoted.sub(lambda m: _replace(m, schema=True), result)
+    result = quoted.sub(f'"{alias_name}"', result)
+    result = bare.sub(alias_name, result)
     return result
+
+
+CREATE_TABLE_PATTERN = re.compile(
+    r"(?is)CREATE\s+(?:GLOBAL\s+TEMP\s+|TEMP\s+)?TABLE\s+"
+    r"(?:(?P<ifnot>IF\s+NOT\s+EXISTS)\s+)?"
+    r"(?P<identifier>(?:\"[^\"]+\"|\w+)(?:\s*\.\s*(?:\"[^\"]+\"|\w+))?)"
+)
+
+
+def strip_quotes(identifier: Optional[str]) -> str:
+    if not identifier:
+        return ""
+    identifier = identifier.strip()
+    if len(identifier) >= 2 and identifier[0] == identifier[-1] == '"':
+        return identifier[1:-1]
+    return identifier
+
+
+def split_identifier(identifier: str) -> Tuple[Optional[str], str]:
+    identifier = identifier.strip()
+    normalized = re.sub(r"\s*", "", identifier)
+    if "." in normalized:
+        schema_token, table_token = normalized.split(".", 1)
+        return schema_token, table_token
+    return None, normalized
+
+
+def replace_table_references(
+    text: str,
+    base_name: str,
+    new_identifier: str,
+    schema_token: Optional[str] = None,
+) -> str:
+    base_pattern = re.escape(base_name)
+    replacements: List[Tuple[re.Pattern[str], str]] = []
+    schema_variants: Set[str] = set()
+    if schema_token:
+        schema_variants.add(schema_token.strip())
+        schema_variants.add(strip_quotes(schema_token.strip()))
+    schema_variants = {variant for variant in schema_variants if variant}
+    for variant in schema_variants:
+        schema_pattern = re.escape(variant)
+        replacements.append(
+            (
+                re.compile(
+                    rf'{schema_pattern}\s*\.\s*"{base_pattern}"', re.IGNORECASE
+                ),
+                f"{variant}.{new_identifier}",
+            )
+        )
+        replacements.append(
+            (
+                re.compile(rf"{schema_pattern}\s*\.\s*{base_pattern}", re.IGNORECASE),
+                f"{variant}.{new_identifier}",
+            )
+        )
+    replacements.append(
+        (re.compile(rf'"{base_pattern}"', re.IGNORECASE), f'"{new_identifier}"')
+    )
+    replacements.append(
+        (re.compile(rf"(?<![\w$]){base_pattern}(?![\w$])", re.IGNORECASE), new_identifier)
+    )
+    result = text
+    for pattern, repl in replacements:
+        result = pattern.sub(repl, result)
+    return result
+
+
+def enforce_unique_table_targets(
+    scripts: Sequence[Tuple[str, str]], forced_tables: Optional[Set[str]] = None
+) -> List[Tuple[str, str]]:
+    forced_lower = {name.lower() for name in forced_tables or set()}
+    occurrences: List[Dict[str, Any]] = []
+    for idx, (_, content) in enumerate(scripts):
+        for match in CREATE_TABLE_PATTERN.finditer(content):
+            if match.group("ifnot"):
+                continue
+            schema_token, table_token = split_identifier(match.group("identifier"))
+            base_name = strip_quotes(table_token)
+            key = (
+                strip_quotes(schema_token).lower() if schema_token else "",
+                base_name.lower(),
+            )
+            occurrences.append(
+                {
+                    "script_idx": idx,
+                    "schema_token": schema_token,
+                    "base_name": base_name,
+                    "key": key,
+                }
+            )
+    if not occurrences:
+        return list(scripts)
+
+    totals = Counter(occ["key"] for occ in occurrences)
+    seen: Dict[Tuple[str, str], int] = defaultdict(int)
+    contents = [content for _, content in scripts]
+
+    for occ in occurrences:
+        key = occ["key"]
+        total = totals[key]
+        base_lower = occ["base_name"].lower()
+        force_suffix = base_lower in forced_lower
+        if total <= 1 and not force_suffix:
+            continue
+        seen[key] += 1
+        alias_base = occ["base_name"]
+        if total > 1:
+            alias_base = f"{alias_base}_{seen[key]}"
+        alias_identifier = append_temp_suffix(alias_base)
+        contents[occ["script_idx"]] = replace_table_references(
+            contents[occ["script_idx"]],
+            occ["base_name"],
+            alias_identifier,
+            occ["schema_token"],
+        )
+    return [(scripts[idx][0], contents[idx]) for idx in range(len(scripts))]
 
 
 def render_stitched_text(stitched_sql: Sequence[Tuple[str, str]]) -> str:
@@ -1116,6 +1231,7 @@ def run_pipeline() -> None:
         )
         return
 
+    primary_profile_table = profile_tables[-1] if profile_tables else None
     private_token = getpass.getpass("Enter your private token: ")
     exclude_folders = [folder for folder in EXCLUDE_FOLDER.split() if folder]
     fetcher = GitLabSQLFetcher(private_token=private_token, exclude_folders=exclude_folders)
@@ -1125,19 +1241,30 @@ def run_pipeline() -> None:
         logging.warning("No SQL files were stitched; please verify repository contents.")
         return
     profile_scripts = fetch_profile_scripts(fetcher, profile_tables)
-    if profile_scripts:
-        processed_profiles: List[Tuple[str, str]] = []
-        for (path, content), table_name in zip(profile_scripts, profile_tables):
-            processed_profiles.append((path, enforce_profile_table_suffix(content, table_name)))
-        stitched_sql.extend(processed_profiles)
+    selected_profile: Optional[Tuple[str, str]] = None
+    if profile_scripts and primary_profile_table:
+        target_lower = primary_profile_table.lower()
+        for path, content in reversed(profile_scripts):
+            stem = Path(path).stem.lower()
+            if stem == target_lower:
+                selected_profile = (path, content)
+                break
+        if not selected_profile:
+            selected_profile = profile_scripts[-1]
+        processed_profile = enforce_profile_table_suffix(
+            selected_profile[1], primary_profile_table
+        )
+        stitched_sql.append((selected_profile[0], processed_profile))
     elif profile_tables:
         logging.warning("Profile table scripts were not appended; none were retrieved.")
 
+    stitched_sql = enforce_unique_table_targets(stitched_sql, forced_table_tokens)
+
     profile_only_text: Optional[str] = None
     profile_only_path: Optional[str] = None
-    if profile_scripts:
+    if selected_profile:
         profile_only_text = build_profile_only_text(
-            profile_scripts[-1][1],
+            selected_profile[1],
             profile_date,
             forced_table_tokens,
             temp_table_map,
@@ -1147,7 +1274,6 @@ def run_pipeline() -> None:
             insight_raw, profile_only_text, primary_profile_table
         )
 
-    primary_profile_table = profile_tables[-1] if profile_tables else None
     stitched_text = render_stitched_text(stitched_sql)
     original_path = write_output_file(insight_raw, stitched_text, primary_profile_table)
     modified_path, modified_text = write_modified_file(
