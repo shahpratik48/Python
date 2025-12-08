@@ -770,6 +770,7 @@ def stitch_sql(
     stitched: List[Tuple[str, str]] = []
     content_cache: Dict[str, str] = {}
     alias_lookup = alias_lookup or {}
+    seen_physical: Set[str] = set()
 
     for entry in entries:
         alias_name = entry.source_table
@@ -783,6 +784,11 @@ def stitch_sql(
                 alias_name,
             )
             continue
+        physical_key = physical_name.lower()
+        if alias_name.lower() == physical_key and physical_key in seen_physical:
+            logging.debug("Skipping duplicate inclusion of %s", filename)
+            continue
+        seen_physical.add(physical_key)
         if filename not in content_cache:
             try:
                 content_cache[filename] = fetcher.fetch_sql(path)
