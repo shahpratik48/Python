@@ -42,6 +42,18 @@ LINEAGE_OUTPUT_PREFIX = "ikg_table_lineage"
 LINEAGE_OUTPUT_SUFFIX = "temp"
 TABLE_SUFFIX = "_temp_auto"
 IF_SUFFIX_PATTERN = re.compile(r"\bIF_\d+_temp_auto\b", re.IGNORECASE)
+INSERT_INTO_PATTERN = re.compile(
+    r"(?is)\binsert\s+into\s+(?P<identifier>(?:\"[^\"]+\"|\w+)(?:\s*\.\s*(?:\"[^\"]+\"|\w+))?)"
+)
+ALTER_TABLE_PATTERN = re.compile(
+    r"(?is)alter\s+table\s+(?P<identifier>(?:\"[^\"]+\"|\w+)(?:\s*\.\s*(?:\"[^\"]+\"|\w+))?)"
+)
+TRUNCATE_TABLE_PATTERN = re.compile(
+    r"(?is)truncate\s+table\s+(?P<identifier>(?:\"[^\"]+\"|\w+)(?:\s*\.\s*(?:\"[^\"]+\"|\w+))?)"
+)
+INSERT_INTO_TABLE_PATTERN = re.compile(
+    r"(?is)\binsert\s+into\s+(?P<identifier>(?:\"[^\"]+\"|\w+)(?:\s*\.\s*(?:\"[^\"]+\"|\w+))?)"
+)
 def normalize_table_name(name: Optional[str]) -> str:
     if not name:
         return ""
@@ -1069,6 +1081,84 @@ def replace_table_references(
     return result
 
 
+def script_has_non_insert_ddl(text: str) -> bool:
+    keywords = [
+        r"\bcreate\b",
+        r"\balter\b",
+        r"\btruncate\b",
+        r"\bdrop\b",
+        r"\bdelete\b",
+        r"\bupdate\b",
+        r"\bmerge\b",
+        r"\bgrant\b",
+    ]
+    pattern = re.compile("|".join(keywords), re.IGNORECASE)
+    return bool(pattern.search(text))
+
+
+def transform_insert_only_script(text: str) -> Tuple[str, Optional[str]]:
+    matches = list(INSERT_INTO_PATTERN.finditer(text))
+    if not matches:
+        return text, None
+    target_tables = {
+        normalize_table_name(match.group("identifier")): match.group("identifier")
+        for match in matches
+    }
+    if len(target_tables) != 1:
+        return text, None
+    if script_has_non_insert_ddl(text):
+        return text, None
+    target_identifier = next(iter(target_tables.values()))
+    schema_token, table_token = split_identifier(target_identifier)
+    base_table = extract_base_table(table_token)
+    new_identifier = append_temp_suffix(target_identifier)
+    converted = INSERT_INTO_PATTERN.sub(
+        lambda m: f"CREATE TABLE {append_temp_suffix(m.group('identifier'))} AS",
+        text,
+        count=1,
+    )
+    converted = replace_table_references(
+        converted,
+        base_table,
+        append_temp_suffix(base_table),
+        schema_token,
+    )
+    return converted, base_table
+
+
+def transform_insert_only_scripts(
+    scripts: Sequence[Tuple[str, str]]
+) -> Tuple[List[Tuple[str, str]], Set[str]]:
+    transformed: List[Tuple[str, str]] = []
+    enforced_tables: Set[str] = set()
+    for path, content in scripts:
+        updated, enforced = transform_insert_only_script(content)
+        if enforced:
+            enforced_tables.add(enforced.lower())
+        transformed.append((path, updated))
+    return transformed, enforced_tables
+
+
+def table_has_side_effects(
+    text: str, base_name: str, schema_token: Optional[str] = None
+) -> bool:
+    patterns = [
+        ALTER_TABLE_PATTERN,
+        TRUNCATE_TABLE_PATTERN,
+        INSERT_INTO_TABLE_PATTERN,
+    ]
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            match_base = extract_base_table(match.group("identifier"))
+            match_schema, _ = split_identifier(match.group("identifier"))
+            if match_base.lower() == base_name.lower():
+                if not schema_token or not match_schema or normalize_table_name(
+                    match_schema
+                ) == normalize_table_name(schema_token):
+                    return True
+    return False
+
+
 def enforce_unique_table_targets(
     scripts: Sequence[Tuple[str, str]], forced_tables: Optional[Set[str]] = None
 ) -> List[Tuple[str, str]]:
@@ -1076,8 +1166,6 @@ def enforce_unique_table_targets(
     occurrences: List[Dict[str, Any]] = []
     for idx, (_, content) in enumerate(scripts):
         for match in CREATE_TABLE_PATTERN.finditer(content):
-            if match.group("ifnot"):
-                continue
             schema_token, table_token = split_identifier(match.group("identifier"))
             base_name = strip_quotes(table_token)
             key = (
@@ -1090,6 +1178,7 @@ def enforce_unique_table_targets(
                     "schema_token": schema_token,
                     "base_name": base_name,
                     "key": key,
+                    "ifnot": bool(match.group("ifnot")),
                 }
             )
     if not occurrences:
@@ -1104,7 +1193,14 @@ def enforce_unique_table_targets(
         total = totals[key]
         base_lower = occ["base_name"].lower()
         force_suffix = base_lower in forced_lower
-        if total <= 1 and not force_suffix:
+        needs_suffix = not occ["ifnot"]
+        if occ["ifnot"]:
+            needs_suffix = table_has_side_effects(
+                contents[occ["script_idx"]],
+                occ["base_name"],
+                occ["schema_token"],
+            )
+        if total <= 1 and not force_suffix and not needs_suffix:
             continue
         seen[key] += 1
         alias_base = occ["base_name"]
@@ -1265,7 +1361,7 @@ def run_pipeline() -> None:
         logging.warning("Stopping because no profile tables were detected.")
         return
     logging.info("Dependency Excel generated at %s", excel_path)
-    forced_table_tokens = derive_forced_table_tokens(profile_tables)
+    forced_table_tokens = set(derive_forced_table_tokens(profile_tables))
 
     temp_plan = prepare_temp_table_plan(db_config, sandbox_schema, acc_mhh_n_value)
     temp_table_map = temp_plan.table_map
@@ -1308,6 +1404,8 @@ def run_pipeline() -> None:
         )
         stitched_sql.append((selected_profile[0], processed_profile))
 
+    stitched_sql, insert_enforced = transform_insert_only_scripts(stitched_sql)
+    forced_table_tokens.update(insert_enforced)
     stitched_sql = enforce_unique_table_targets(stitched_sql, forced_table_tokens)
 
     profile_only_text: Optional[str] = None
