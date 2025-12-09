@@ -255,84 +255,98 @@ def build_adjacency(metadata_rows: Sequence[MetadataRow]) -> Dict[str, List[Meta
     return adjacency
 
 
+def build_file_groups(
+    metadata_rows: Sequence[MetadataRow],
+) -> Dict[str, Dict[str, Any]]:
+    groups: Dict[str, Dict[str, Any]] = {}
+    for row in metadata_rows:
+        key = normalize_table_name(row.target_table)
+        if not key:
+            continue
+        entry = groups.setdefault(
+            key,
+            {
+                "rows": [],
+                "filename": row.filename,
+                "filepath": row.filepath,
+                "process": row.process,
+            },
+        )
+        entry["rows"].append(row)
+    return groups
+
+
+def build_dependency_map(groups: Dict[str, Dict[str, Any]]) -> Dict[str, Set[str]]:
+    dependency_map: Dict[str, Set[str]] = defaultdict(set)
+    for key, data in groups.items():
+        for row in data["rows"]:
+            source_key = normalize_table_name(row.source_table)
+            if source_key and source_key in groups:
+                dependency_map[key].add(source_key)
+    return dependency_map
+
+
+def topo_order_for_root(
+    root_key: str, dependency_map: Dict[str, Set[str]], groups: Dict[str, Dict[str, Any]]
+) -> List[str]:
+    order: List[str] = []
+    state: Dict[str, str] = {}
+
+    def visit(key: str) -> None:
+        if key not in groups:
+            return
+        status = state.get(key)
+        if status == "perm":
+            return
+        if status == "temp":
+            logging.warning("Cycle detected involving %s; skipping re-visitation.", key)
+            return
+        state[key] = "temp"
+        for dep in sorted(dependency_map.get(key, [])):
+            visit(dep)
+        state[key] = "perm"
+        order.append(key)
+
+    visit(root_key)
+    return order
+
+
 def build_lineage_rows(
     profile_tables: Sequence[str],
-    adjacency: Dict[str, List[MetadataRow]],
+    metadata_rows: Sequence[MetadataRow],
     run_timestamp: datetime.datetime,
 ) -> Tuple[List[DependencyRow], Dict[str, str]]:
+    groups = build_file_groups(metadata_rows)
+    dependency_map = build_dependency_map(groups)
     results: List[DependencyRow] = []
-    order_index = 1
-
-    def dfs(
-        current_target: str,
-        root_target: str,
-        level: int,
-        path: Set[str],
-        edge_seen: Set[Tuple[str, str, str]],
-    ) -> None:
-        nonlocal order_index
-        current_key = normalize_table_name(current_target)
-        if not current_key:
-            return
-        if current_key in path:
-            logging.debug("Cycle detected at %s under root %s", current_target, root_target)
-            return
-        path.add(current_key)
-        rows = adjacency.get(current_key, [])
-        for row in rows:
-            source = row.source_table
-            if not source:
-                continue
-            source_key = normalize_table_name(source)
-            target_key = normalize_table_name(row.target_table)
-            root_key = normalize_table_name(root_target)
-            edge_key = (root_key, target_key, source_key)
-            if edge_key in edge_seen:
-                continue
-            if source_key in path:
-                logging.debug(
-                    "Cycle detected: %s -> %s for root %s", row.target_table, source, root_target
-                )
-                continue
-            dfs(source, root_target, level + 1, path, edge_seen)
-            edge_seen.add(edge_key)
-            results.append(
-                DependencyRow(
-                    order_index=order_index,
-                    root_profile_table=root_target,
-                    target_table=row.target_table,
-                    source_schema=row.source_schema,
-                    source_table=source,
-                    process=row.process,
-                    filename=row.filename,
-                    filepath=row.filepath,
-                    level=level,
-                    current_timestamp=run_timestamp,
-                )
-            )
-            order_index += 1
-        path.remove(current_key)
+    order_counter = 1
 
     for root in profile_tables:
-        edge_seen: Set[Tuple[str, str, str]] = set()
-        dfs(root, root, 1, set(), edge_seen)
-        template_rows = adjacency.get(normalize_table_name(root), [])
-        template = template_rows[0] if template_rows else None
-        results.append(
-            DependencyRow(
-                order_index=order_index,
-                root_profile_table=root,
-                target_table=root,
-                source_schema=None,
-                source_table=None,
-                process=template.process if template else "",
-                filename=template.filename if template else "",
-                filepath=template.filepath if template else "",
-                level=0,
-                current_timestamp=run_timestamp,
-            )
-        )
-        order_index += 1
+        root_key = normalize_table_name(root)
+        if not root_key or root_key not in groups:
+            logging.warning("Profile table %s has no matching metadata rows; skipping.", root)
+            continue
+        ordered_keys = topo_order_for_root(root_key, dependency_map, groups)
+        for key in ordered_keys:
+            group = groups.get(key)
+            if not group:
+                continue
+            for row in group["rows"]:
+                results.append(
+                    DependencyRow(
+                        order_index=order_counter,
+                        root_profile_table=root,
+                        target_table=row.target_table,
+                        source_schema=row.source_schema,
+                        source_table=row.source_table,
+                        process=row.process,
+                        filename=row.filename,
+                        filepath=row.filepath,
+                        level=0,
+                        current_timestamp=run_timestamp,
+                    )
+                )
+                order_counter += 1
 
     return _normalize_blank_schema_sources(results)
 
@@ -480,8 +494,7 @@ def build_dependency_artifacts(
             logging.warning("No profile tables found for %s", insight_types)
             return [], [], None
         metadata_rows = fetch_metadata_rows(conn)
-    adjacency = build_adjacency(metadata_rows)
-    lineage_rows, alias_lookup = build_lineage_rows(profile_tables, adjacency, timestamp)
+    lineage_rows, alias_lookup = build_lineage_rows(profile_tables, metadata_rows, timestamp)
     df = rows_to_dataframe(lineage_rows)
     excel_path = write_temp_excel(df, timestamp)
     with psycopg2.connect(**db_config) as conn:
