@@ -42,6 +42,15 @@ LINEAGE_OUTPUT_PREFIX = "ikg_table_lineage"
 LINEAGE_OUTPUT_SUFFIX = "temp"
 TABLE_SUFFIX = "_temp_auto"
 IF_SUFFIX_PATTERN = re.compile(r"\bIF_\d+_temp_auto\b", re.IGNORECASE)
+def normalize_table_name(name: Optional[str]) -> str:
+    if not name:
+        return ""
+    stripped = name.strip().strip('"').lower()
+    if "." in stripped:
+        stripped = stripped.split(".")[-1]
+    return stripped
+
+
 TEMP_TABLE_SCRIPT_NAME = "core_wma_shared_temp_table_script.sql"
 BASE_DB_CONFIG = {
     "host": "greenplum-rdsp.zur.swissbank.com",
@@ -241,7 +250,8 @@ def build_adjacency(metadata_rows: Sequence[MetadataRow]) -> Dict[str, List[Meta
     for row in metadata_rows:
         if not row.target_table:
             continue
-        adjacency[row.target_table.lower()].append(row)
+        key = normalize_table_name(row.target_table)
+        adjacency[key].append(row)
     return adjacency
 
 
@@ -261,23 +271,25 @@ def build_lineage_rows(
         edge_seen: Set[Tuple[str, str, str]],
     ) -> None:
         nonlocal order_index
-        if not current_target:
+        current_key = normalize_table_name(current_target)
+        if not current_key:
             return
-        current_lower = current_target.lower()
-        if current_lower in path:
+        if current_key in path:
             logging.debug("Cycle detected at %s under root %s", current_target, root_target)
             return
-        path.add(current_lower)
-        rows = adjacency.get(current_lower, [])
+        path.add(current_key)
+        rows = adjacency.get(current_key, [])
         for row in rows:
             source = row.source_table
             if not source:
                 continue
-            source_lower = source.lower()
-            edge_key = (root_target.lower(), row.target_table.lower(), source_lower)
+            source_key = normalize_table_name(source)
+            target_key = normalize_table_name(row.target_table)
+            root_key = normalize_table_name(root_target)
+            edge_key = (root_key, target_key, source_key)
             if edge_key in edge_seen:
                 continue
-            if source_lower in path:
+            if source_key in path:
                 logging.debug(
                     "Cycle detected: %s -> %s for root %s", row.target_table, source, root_target
                 )
@@ -299,12 +311,12 @@ def build_lineage_rows(
                 )
             )
             order_index += 1
-        path.remove(current_lower)
+        path.remove(current_key)
 
     for root in profile_tables:
         edge_seen: Set[Tuple[str, str, str]] = set()
         dfs(root, root, 1, set(), edge_seen)
-        template_rows = adjacency.get(root.lower(), [])
+        template_rows = adjacency.get(normalize_table_name(root), [])
         template = template_rows[0] if template_rows else None
         results.append(
             DependencyRow(
@@ -334,7 +346,7 @@ def _normalize_blank_schema_sources(
         schema = (row.source_schema or "").strip()
         source = (row.source_table or "").strip()
         if not schema and source:
-            blank_counts[source.lower()] += 1
+            blank_counts[normalize_table_name(source)] += 1
 
     suffix_counters: Dict[str, int] = {}
     alias_lookup: Dict[str, str] = {}
@@ -342,19 +354,21 @@ def _normalize_blank_schema_sources(
     for row in rows:
         schema = (row.source_schema or "").strip()
         source = (row.source_table or "").strip()
-        key = source.lower()
+        key = normalize_table_name(source)
+        base_table = extract_base_table(source)
         if schema or not source or blank_counts.get(key, 0) <= 1:
-            alias_lookup.setdefault(key, source)
+            if source:
+                alias_lookup.setdefault(source.lower(), base_table)
             normalized.append(row)
             continue
         idx = suffix_counters.get(key, 0)
         suffix_counters[key] = idx + 1
         if idx == 0:
-            alias_lookup.setdefault(key, source)
+            alias_lookup.setdefault(source.lower(), base_table)
             normalized.append(row)
         else:
             new_source = f"{row.source_table}_{idx}_"
-            alias_lookup[new_source.lower()] = source
+            alias_lookup[new_source.lower()] = base_table
             normalized.append(replace(row, source_table=new_source))
 
     return normalized, alias_lookup
@@ -981,6 +995,15 @@ def strip_quotes(identifier: Optional[str]) -> str:
     if len(identifier) >= 2 and identifier[0] == identifier[-1] == '"':
         return identifier[1:-1]
     return identifier
+
+
+def extract_base_table(name: Optional[str]) -> str:
+    if not name:
+        return ""
+    token = name.strip()
+    if "." in token:
+        token = token.split(".")[-1]
+    return strip_quotes(token)
 
 
 def split_identifier(identifier: str) -> Tuple[Optional[str], str]:
