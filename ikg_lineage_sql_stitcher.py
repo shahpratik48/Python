@@ -41,6 +41,7 @@ PROFILE_DATE_TOKENS = ("IKG_PROFILE_DATE", "IKG_PREV_PROFILE_DATE")
 LINEAGE_OUTPUT_PREFIX = "ikg_table_lineage"
 LINEAGE_OUTPUT_SUFFIX = "temp"
 TABLE_SUFFIX = "_temp_auto"
+IF_SUFFIX_PATTERN = re.compile(r"\bIF_\d+_temp_auto\b", re.IGNORECASE)
 TEMP_TABLE_SCRIPT_NAME = "core_wma_shared_temp_table_script.sql"
 BASE_DB_CONFIG = {
     "host": "greenplum-rdsp.zur.swissbank.com",
@@ -766,11 +767,13 @@ def stitch_sql(
     entries: Sequence[LineageEntry],
     fetcher: GitLabSQLFetcher,
     alias_lookup: Optional[Dict[str, str]] = None,
+    skip_paths: Optional[Set[str]] = None,
 ) -> List[Tuple[str, str]]:
     stitched: List[Tuple[str, str]] = []
     content_cache: Dict[str, str] = {}
     alias_lookup = alias_lookup or {}
     seen_paths: Set[str] = set()
+    skip_paths = {path.lower() for path in (skip_paths or set())}
 
     for entry in entries:
         alias_name = entry.source_table
@@ -785,6 +788,9 @@ def stitch_sql(
             )
             continue
         path_key = path.lower()
+        if path_key in skip_paths:
+            logging.debug("Skipping path %s because it is designated as profile script", path)
+            continue
         if path_key in seen_paths:
             logging.debug("Skipping duplicate script %s", path)
             continue
@@ -926,6 +932,10 @@ def append_temp_suffix(table_name: str) -> str:
         base = table_name[:-1]
         return f'{base}{TABLE_SUFFIX}"'
     return f"{table_name}{TABLE_SUFFIX}"
+
+
+def strip_if_suffixes(text: str) -> str:
+    return IF_SUFFIX_PATTERN.sub("IF", text)
 
 
 def rewrite_table_identifiers(
@@ -1080,7 +1090,8 @@ def render_stitched_text(stitched_sql: Sequence[Tuple[str, str]]) -> str:
         lines.append(f"-- Source: {path}")
         lines.append(content.rstrip())
         lines.append("")
-    return "\n".join(lines).rstrip() + "\n"
+    text = "\n".join(lines).rstrip() + "\n"
+    return strip_if_suffixes(text)
 
 
 def write_output_file(
@@ -1106,6 +1117,7 @@ def write_modified_file(
         modified_text = apply_temp_schema_swaps(modified_text, temp_table_map, sandbox_schema)
     tables_to_suffix = find_tables_for_suffix(modified_text)
     modified_text = apply_table_suffixes(modified_text, tables_to_suffix, forced_tables)
+    modified_text = strip_if_suffixes(modified_text)
     output_name = sanitize_filename(insight_type, profile_table).replace(
         OUTPUT_SUFFIX, MODIFIED_SUFFIX
     )
@@ -1235,34 +1247,36 @@ def run_pipeline() -> None:
     private_token = getpass.getpass("Enter your private token: ")
     exclude_folders = [folder for folder in EXCLUDE_FOLDER.split() if folder]
     fetcher = GitLabSQLFetcher(private_token=private_token, exclude_folders=exclude_folders)
-
-    stitched_sql = stitch_sql(entries, fetcher, alias_lookup)
-    if not stitched_sql:
-        logging.warning("No SQL files were stitched; please verify repository contents.")
-        return
     profile_scripts = fetch_profile_scripts(fetcher, profile_tables)
     selected_profile: Optional[Tuple[str, str]] = None
+    skip_paths: Set[str] = set()
     if profile_scripts and primary_profile_table:
         target_lower = primary_profile_table.lower()
         for path, content in reversed(profile_scripts):
-            stem = Path(path).stem.lower()
-            if stem == target_lower:
+            if Path(path).stem.lower() == target_lower:
                 selected_profile = (path, content)
                 break
         if not selected_profile:
             selected_profile = profile_scripts[-1]
+        skip_paths.add(selected_profile[0].lower())
+    elif profile_tables:
+        logging.warning("Profile table scripts were not appended; none were retrieved.")
+
+    stitched_sql = stitch_sql(entries, fetcher, alias_lookup, skip_paths=skip_paths)
+    if not stitched_sql:
+        logging.warning("No SQL files were stitched; please verify repository contents.")
+        return
+    if selected_profile and primary_profile_table:
         processed_profile = enforce_profile_table_suffix(
             selected_profile[1], primary_profile_table
         )
         stitched_sql.append((selected_profile[0], processed_profile))
-    elif profile_tables:
-        logging.warning("Profile table scripts were not appended; none were retrieved.")
 
     stitched_sql = enforce_unique_table_targets(stitched_sql, forced_table_tokens)
 
     profile_only_text: Optional[str] = None
     profile_only_path: Optional[str] = None
-    if selected_profile:
+    if selected_profile and primary_profile_table:
         profile_only_text = build_profile_only_text(
             selected_profile[1],
             profile_date,
