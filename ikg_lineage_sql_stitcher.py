@@ -1081,19 +1081,12 @@ def replace_table_references(
     return result
 
 
-def script_has_non_insert_ddl(text: str) -> bool:
-    keywords = [
-        r"\bcreate\b",
-        r"\balter\b",
-        r"\btruncate\b",
-        r"\bdrop\b",
-        r"\bdelete\b",
-        r"\bupdate\b",
-        r"\bmerge\b",
-        r"\bgrant\b",
-    ]
-    pattern = re.compile("|".join(keywords), re.IGNORECASE)
-    return bool(pattern.search(text))
+def table_has_create_definition(text: str, base_name: str) -> bool:
+    for match in CREATE_TABLE_PATTERN.finditer(text):
+        _, table_token = split_identifier(match.group("identifier"))
+        if extract_base_table(table_token).lower() == base_name.lower():
+            return True
+    return False
 
 
 def transform_insert_only_script(text: str) -> Tuple[str, Optional[str]]:
@@ -1106,11 +1099,12 @@ def transform_insert_only_script(text: str) -> Tuple[str, Optional[str]]:
     }
     if len(target_tables) != 1:
         return text, None
-    if script_has_non_insert_ddl(text):
-        return text, None
     target_identifier = next(iter(target_tables.values()))
     schema_token, table_token = split_identifier(target_identifier)
     base_table = extract_base_table(table_token)
+
+    if table_has_create_definition(text, base_table):
+        return text, None
     new_identifier = append_temp_suffix(target_identifier)
     converted = INSERT_INTO_PATTERN.sub(
         lambda m: f"CREATE TABLE {append_temp_suffix(m.group('identifier'))} AS",
