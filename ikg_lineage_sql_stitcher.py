@@ -995,8 +995,20 @@ def apply_table_suffixes(
         names.update(forced_tables)
     sorted_tables = sorted(names, key=len, reverse=True)
     result = text
-    guard = vendor_guard or set()
+    guard = {normalize_table_name(item) for item in (vendor_guard or set())}
     processed: Set[Tuple[str, str]] = set()
+
+    def normalize_pair(schema: Optional[str], base: str) -> Tuple[str, str]:
+        schema_norm = normalize_schema_name(schema)
+        return (schema_norm, base.lower())
+
+    forced_pairs: Set[Tuple[str, str]] = set()
+    for token in forced_tables or set():
+        token_schema, token_table = split_identifier(token)
+        token_base = extract_base_table(token_table)
+        forced_pairs.add(normalize_pair(token_schema, token_base))
+        forced_pairs.add(("", token_base.lower()))
+
     for name in sorted_tables:
         schema_token, table_token = split_identifier(name)
         base_name = extract_base_table(table_token)
@@ -1004,8 +1016,18 @@ def apply_table_suffixes(
         key = (schema_norm, base_name.lower())
         if key in processed:
             continue
-        if schema_norm in VENDOR_SCHEMA_GUARD and base_name.lower() not in guard:
+
+        is_forced = key in forced_pairs or ("", base_name.lower()) in forced_pairs
+        if (
+            schema_norm in VENDOR_SCHEMA_GUARD
+            and base_name.lower() not in guard
+            and not is_forced
+        ):
             continue
+
+        if not is_forced and not table_has_population(text, base_name, schema_token):
+            continue
+
         processed.add(key)
         alias_identifier = append_temp_suffix(base_name)
         result = replace_table_references(
@@ -1070,6 +1092,13 @@ CREATE_TABLE_PATTERN = re.compile(
     r"(?is)CREATE\s+(?:GLOBAL\s+TEMP\s+|TEMP\s+)?TABLE\s+"
     r"(?:(?P<ifnot>IF\s+NOT\s+EXISTS)\s+)?"
     r"(?P<identifier>(?:\"[^\"]+\"|\w+)(?:\s*\.\s*(?:\"[^\"]+\"|\w+))?)"
+)
+
+CREATE_TABLE_AS_SELECT_PATTERN = re.compile(
+    r"(?is)CREATE\s+(?:GLOBAL\s+TEMP\s+|TEMP\s+)?TABLE\s+"
+    r"(?:(?:IF\s+NOT\s+EXISTS)\s+)?"
+    r"(?P<identifier>(?:\"[^\"]+\"|\w+)(?:\s*\.\s*(?:\"[^\"]+\"|\w+))?)"
+    r"\s+AS\s+SELECT\b"
 )
 
 
@@ -1226,13 +1255,44 @@ def table_has_side_effects(
     return False
 
 
+def table_has_ctas(
+    text: str, base_name: str, schema_token: Optional[str] = None
+) -> bool:
+    for match in CREATE_TABLE_AS_SELECT_PATTERN.finditer(text):
+        match_schema, match_table = split_identifier(match.group("identifier"))
+        if extract_base_table(match_table).lower() != base_name.lower():
+            continue
+        if schema_token and match_schema:
+            if normalize_schema_name(match_schema) != normalize_schema_name(
+                schema_token
+            ):
+                continue
+        elif schema_token and not match_schema:
+            continue
+        return True
+    return False
+
+
+def table_has_population(
+    text: str, base_name: str, schema_token: Optional[str] = None
+) -> bool:
+    if table_has_ctas(text, base_name, schema_token):
+        return True
+    return table_has_side_effects(text, base_name, schema_token)
+
+
 def enforce_unique_table_targets(
     scripts: Sequence[Tuple[str, str]],
     forced_tables: Optional[Set[str]] = None,
     vendor_guard: Optional[Set[str]] = None,
 ) -> List[Tuple[str, str]]:
-    forced_lower = {name.lower() for name in forced_tables or set()}
-    guard = vendor_guard or set()
+    guard = {name.lower() for name in vendor_guard or set()}
+    forced_pairs: Set[Tuple[str, str]] = set()
+    for token in forced_tables or set():
+        token_schema, token_table = split_identifier(token)
+        token_base = extract_base_table(token_table)
+        forced_pairs.add((normalize_schema_name(token_schema), token_base.lower()))
+        forced_pairs.add(("", token_base.lower()))
     occurrences: List[Dict[str, Any]] = []
     for idx, (_, content) in enumerate(scripts):
         for match in CREATE_TABLE_PATTERN.finditer(content):
@@ -1263,17 +1323,15 @@ def enforce_unique_table_targets(
         total = totals[key]
         base_lower = occ["base_name"].lower()
         schema_norm = normalize_schema_name(occ["schema_token"])
-        if schema_norm in VENDOR_SCHEMA_GUARD and base_lower not in guard:
+        pair = (schema_norm, base_lower)
+        is_forced = pair in forced_pairs or ("", base_lower) in forced_pairs
+        if schema_norm in VENDOR_SCHEMA_GUARD and base_lower not in guard and not is_forced:
             continue
-        force_suffix = base_lower in forced_lower
-        needs_suffix = not occ["ifnot"]
-        if occ["ifnot"]:
-            needs_suffix = table_has_side_effects(
-                contents[occ["script_idx"]],
-                occ["base_name"],
-                occ["schema_token"],
-            )
-        if total <= 1 and not force_suffix and not needs_suffix:
+        population = table_has_population(
+            contents[occ["script_idx"]], occ["base_name"], occ["schema_token"]
+        )
+        needs_suffix = is_forced or population
+        if total <= 1 and not needs_suffix:
             continue
         seen[key] += 1
         alias_base = occ["base_name"]
