@@ -63,6 +63,9 @@ VENDOR_SCHEMA_GUARD = {
     "{{params.edw_view_input_schema}}",
     "{{params.edw_input_schema}}",
 }
+VENDOR_TABLE_SUFFIX_PATTERN = re.compile(
+    r'(?is)(?P<schema>"[^"]+"|\w+)\s*\.\s*(?P<table>"[^"]+"|\w+)_temp_auto\b'
+)
 def normalize_table_name(name: Optional[str]) -> str:
     if not name:
         return ""
@@ -1142,14 +1145,6 @@ def is_vendor_schema(schema_token: Optional[str]) -> bool:
     return normalize_schema_name(schema_token) in VENDOR_SCHEMA_GUARD
 
 
-def table_has_create_definition(text: str, base_name: str) -> bool:
-    for match in CREATE_TABLE_PATTERN.finditer(text):
-        _, table_token = split_identifier(match.group("identifier"))
-        if extract_base_table(table_token).lower() == base_name.lower():
-            return True
-    return False
-
-
 def transform_insert_only_script(
     text: str, vendor_guard: Optional[Set[str]] = None
 ) -> Tuple[str, Optional[str]]:
@@ -1173,11 +1168,14 @@ def transform_insert_only_script(
         if base_table.lower() not in guard:
             return text, None
     new_identifier = append_temp_suffix(target_identifier)
+
     converted = INSERT_INTO_PATTERN.sub(
         lambda m: f"CREATE TABLE {append_temp_suffix(m.group('identifier'))} AS",
         text,
         count=1,
     )
+    drop_stmt = f"DROP TABLE IF EXISTS {new_identifier};\n"
+    converted = drop_stmt + converted
     converted = replace_table_references(
         converted,
         base_table,
@@ -1200,6 +1198,14 @@ def transform_insert_only_scripts(
     return transformed, enforced_tables
 
 
+def table_has_create_definition(text: str, base_name: str) -> bool:
+    for match in CREATE_TABLE_PATTERN.finditer(text):
+        _, table_token = split_identifier(match.group("identifier"))
+        if extract_base_table(table_token).lower() == base_name.lower():
+            return True
+    return False
+
+
 def table_has_side_effects(
     text: str, base_name: str, schema_token: Optional[str] = None
 ) -> bool:
@@ -1213,9 +1219,9 @@ def table_has_side_effects(
             match_base = extract_base_table(match.group("identifier"))
             match_schema, _ = split_identifier(match.group("identifier"))
             if match_base.lower() == base_name.lower():
-                if not schema_token or not match_schema or normalize_table_name(
+                if not schema_token or not match_schema or normalize_schema_name(
                     match_schema
-                ) == normalize_table_name(schema_token):
+                ) == normalize_schema_name(schema_token):
                     return True
     return False
 
@@ -1283,6 +1289,21 @@ def enforce_unique_table_targets(
     return [(scripts[idx][0], contents[idx]) for idx in range(len(scripts))]
 
 
+def enforce_vendor_table_bases(text: str, allowed_tables: Set[str]) -> str:
+    allowed_lower = {name.lower() for name in allowed_tables}
+
+    def _replace(match: re.Match[str]) -> str:
+        schema_token = match.group("schema")
+        table_token = match.group("table")
+        schema_norm = normalize_schema_name(schema_token)
+        table_norm = normalize_table_name(table_token)
+        if schema_norm in VENDOR_SCHEMA_GUARD and table_norm not in allowed_lower:
+            return f"{match.group('schema')}.{table_token}"
+        return match.group(0)
+
+    return VENDOR_TABLE_SUFFIX_PATTERN.sub(_replace, text)
+
+
 def render_stitched_text(stitched_sql: Sequence[Tuple[str, str]]) -> str:
     lines: List[str] = []
     for path, content in stitched_sql:
@@ -1320,6 +1341,8 @@ def write_modified_file(
         modified_text, tables_to_suffix, forced_tables, vendor_guard
     )
     modified_text = strip_if_suffixes(modified_text)
+    if vendor_guard:
+        modified_text = enforce_vendor_table_bases(modified_text, vendor_guard)
     output_name = sanitize_filename(insight_type, profile_table).replace(
         OUTPUT_SUFFIX, MODIFIED_SUFFIX
     )
@@ -1340,7 +1363,10 @@ def build_profile_only_text(
     if temp_table_map:
         text = apply_temp_schema_swaps(text, temp_table_map, sandbox_schema)
     tables_to_suffix = find_tables_for_suffix(text)
-    return apply_table_suffixes(text, tables_to_suffix, forced_tables, vendor_guard)
+    text = apply_table_suffixes(text, tables_to_suffix, forced_tables, vendor_guard)
+    if vendor_guard:
+        text = enforce_vendor_table_bases(text, vendor_guard)
+    return text
 
 
 def write_profile_only_file(
@@ -1503,11 +1529,15 @@ def run_pipeline() -> None:
             sandbox_schema,
             vendor_guard_tables,
         )
+        profile_only_text = enforce_vendor_table_bases(
+            profile_only_text, vendor_guard_tables
+        )
         profile_only_path = write_profile_only_file(
             insight_raw, profile_only_text, primary_profile_table
         )
 
     stitched_text = render_stitched_text(stitched_sql)
+    stitched_text = enforce_vendor_table_bases(stitched_text, vendor_guard_tables)
     original_path = write_output_file(insight_raw, stitched_text, primary_profile_table)
     modified_path, modified_text = write_modified_file(
         insight_raw,
