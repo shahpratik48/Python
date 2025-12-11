@@ -78,6 +78,11 @@ def normalize_schema_name(name: Optional[str]) -> str:
     return strip_quotes(name).lower()
 
 
+# Backwards compatibility for older references that used different casing.
+Normalize_table_name = normalize_table_name
+Normalize_schema_name = normalize_schema_name
+
+
 TEMP_TABLE_SCRIPT_NAME = "core_wma_shared_temp_table_script.sql"
 BASE_DB_CONFIG = {
     "host": "greenplum-rdsp.zur.swissbank.com",
