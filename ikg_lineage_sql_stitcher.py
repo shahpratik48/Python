@@ -37,6 +37,9 @@ OUTPUT_SUFFIX = "_new.sql"
 MODIFIED_SUFFIX = "_modified.sql"
 PROFILE_MODIFIED_SUFFIX = "_modified_profile.sql"
 EXCLUDE_FOLDER = "ikg_new_fa_shhp_map"
+EXCLUDED_PROCESSES = {
+    token.strip().lower() for token in EXCLUDE_FOLDER.split() if token.strip()
+}
 PROFILE_DATE_TOKENS = ("IKG_PROFILE_DATE", "IKG_PREV_PROFILE_DATE")
 LINEAGE_OUTPUT_PREFIX = "ikg_table_lineage"
 LINEAGE_OUTPUT_SUFFIX = "temp"
@@ -54,6 +57,12 @@ TRUNCATE_TABLE_PATTERN = re.compile(
 INSERT_INTO_TABLE_PATTERN = re.compile(
     r"(?is)\binsert\s+into\s+(?P<identifier>(?:\"[^\"]+\"|\w+)(?:\s*\.\s*(?:\"[^\"]+\"|\w+))?)"
 )
+VENDOR_SCHEMA_GUARD = {
+    "core_wma_shared",
+    "{{params.ikg_vendor_schema}}",
+    "{{params.edw_view_input_schema}}",
+    "{{params.edw_input_schema}}",
+}
 def normalize_table_name(name: Optional[str]) -> str:
     if not name:
         return ""
@@ -61,6 +70,12 @@ def normalize_table_name(name: Optional[str]) -> str:
     if "." in stripped:
         stripped = stripped.split(".")[-1]
     return stripped
+
+
+def normalize_schema_name(name: Optional[str]) -> str:
+    if not name:
+        return ""
+    return strip_quotes(name).lower()
 
 
 TEMP_TABLE_SCRIPT_NAME = "core_wma_shared_temp_table_script.sql"
@@ -267,11 +282,17 @@ def build_adjacency(metadata_rows: Sequence[MetadataRow]) -> Dict[str, List[Meta
     return adjacency
 
 
+def should_exclude_process(process: Optional[str]) -> bool:
+    return process is not None and process.strip().lower() in EXCLUDED_PROCESSES
+
+
 def build_file_groups(
     metadata_rows: Sequence[MetadataRow],
 ) -> Dict[str, Dict[str, Any]]:
     groups: Dict[str, Dict[str, Any]] = {}
     for row in metadata_rows:
+        if should_exclude_process(row.process):
+            continue
         key = normalize_table_name(row.target_table)
         if not key:
             continue
@@ -498,13 +519,26 @@ def build_dependency_artifacts(
     insight_types: Sequence[str],
     db_config: Dict[str, str],
     run_timestamp: Optional[datetime.datetime] = None,
+    override_profile_tables: Optional[Sequence[str]] = None,
 ) -> Tuple[List[DependencyRow], List[str], Optional[str], Dict[str, str]]:
     timestamp = run_timestamp or datetime.datetime.utcnow()
     with psycopg2.connect(**db_config) as conn:
-        profile_tables = fetch_profile_tables(conn, insight_types)
+        if override_profile_tables:
+            profile_tables = []
+            seen_tables: Set[str] = set()
+            for table in override_profile_tables:
+                if not table:
+                    continue
+                normalized = table.lower()
+                if normalized in seen_tables:
+                    continue
+                seen_tables.add(normalized)
+                profile_tables.append(table)
+        else:
+            profile_tables = fetch_profile_tables(conn, insight_types)
         if not profile_tables:
-            logging.warning("No profile tables found for %s", insight_types)
-            return [], [], None
+            logging.warning("No profile tables available for lineage construction.")
+            return [], [], None, {}
         metadata_rows = fetch_metadata_rows(conn)
     lineage_rows, alias_lookup = build_lineage_rows(profile_tables, metadata_rows, timestamp)
     df = rows_to_dataframe(lineage_rows)
@@ -943,17 +977,35 @@ def enforce_profile_table_suffix(script_text: str, profile_table: str) -> str:
 
 
 def apply_table_suffixes(
-    text: str, tables: Set[str], forced_tables: Optional[Set[str]] = None
+    text: str,
+    tables: Set[str],
+    forced_tables: Optional[Set[str]] = None,
+    vendor_guard: Optional[Set[str]] = None,
 ) -> str:
     names: Set[str] = set(tables)
     if forced_tables:
         names.update(forced_tables)
     sorted_tables = sorted(names, key=len, reverse=True)
     result = text
+    guard = vendor_guard or set()
+    processed: Set[Tuple[str, str]] = set()
     for name in sorted_tables:
-        escaped = re.escape(name)
-        pattern = re.compile(rf"(?<![\w$]){escaped}(?![\w$])", re.IGNORECASE)
-        result = pattern.sub(lambda m: append_temp_identifier(m.group(0)), result)
+        schema_token, table_token = split_identifier(name)
+        base_name = extract_base_table(table_token)
+        schema_norm = normalize_schema_name(schema_token)
+        key = (schema_norm, base_name.lower())
+        if key in processed:
+            continue
+        if schema_norm in VENDOR_SCHEMA_GUARD and base_name.lower() not in guard:
+            continue
+        processed.add(key)
+        alias_identifier = append_temp_suffix(base_name)
+        result = replace_table_references(
+            result,
+            base_name,
+            alias_identifier,
+            schema_token,
+        )
     return result
 
 
@@ -1081,6 +1133,10 @@ def replace_table_references(
     return result
 
 
+def is_vendor_schema(schema_token: Optional[str]) -> bool:
+    return normalize_schema_name(schema_token) in VENDOR_SCHEMA_GUARD
+
+
 def table_has_create_definition(text: str, base_name: str) -> bool:
     for match in CREATE_TABLE_PATTERN.finditer(text):
         _, table_token = split_identifier(match.group("identifier"))
@@ -1089,7 +1145,9 @@ def table_has_create_definition(text: str, base_name: str) -> bool:
     return False
 
 
-def transform_insert_only_script(text: str) -> Tuple[str, Optional[str]]:
+def transform_insert_only_script(
+    text: str, vendor_guard: Optional[Set[str]] = None
+) -> Tuple[str, Optional[str]]:
     matches = list(INSERT_INTO_PATTERN.finditer(text))
     if not matches:
         return text, None
@@ -1105,6 +1163,10 @@ def transform_insert_only_script(text: str) -> Tuple[str, Optional[str]]:
 
     if table_has_create_definition(text, base_table):
         return text, None
+    if schema_token and is_vendor_schema(schema_token):
+        guard = vendor_guard or set()
+        if base_table.lower() not in guard:
+            return text, None
     new_identifier = append_temp_suffix(target_identifier)
     converted = INSERT_INTO_PATTERN.sub(
         lambda m: f"CREATE TABLE {append_temp_suffix(m.group('identifier'))} AS",
@@ -1121,12 +1183,12 @@ def transform_insert_only_script(text: str) -> Tuple[str, Optional[str]]:
 
 
 def transform_insert_only_scripts(
-    scripts: Sequence[Tuple[str, str]]
+    scripts: Sequence[Tuple[str, str]], vendor_guard: Optional[Set[str]] = None
 ) -> Tuple[List[Tuple[str, str]], Set[str]]:
     transformed: List[Tuple[str, str]] = []
     enforced_tables: Set[str] = set()
     for path, content in scripts:
-        updated, enforced = transform_insert_only_script(content)
+        updated, enforced = transform_insert_only_script(content, vendor_guard)
         if enforced:
             enforced_tables.add(enforced.lower())
         transformed.append((path, updated))
@@ -1154,9 +1216,12 @@ def table_has_side_effects(
 
 
 def enforce_unique_table_targets(
-    scripts: Sequence[Tuple[str, str]], forced_tables: Optional[Set[str]] = None
+    scripts: Sequence[Tuple[str, str]],
+    forced_tables: Optional[Set[str]] = None,
+    vendor_guard: Optional[Set[str]] = None,
 ) -> List[Tuple[str, str]]:
     forced_lower = {name.lower() for name in forced_tables or set()}
+    guard = vendor_guard or set()
     occurrences: List[Dict[str, Any]] = []
     for idx, (_, content) in enumerate(scripts):
         for match in CREATE_TABLE_PATTERN.finditer(content):
@@ -1186,6 +1251,9 @@ def enforce_unique_table_targets(
         key = occ["key"]
         total = totals[key]
         base_lower = occ["base_name"].lower()
+        schema_norm = normalize_schema_name(occ["schema_token"])
+        if schema_norm in VENDOR_SCHEMA_GUARD and base_lower not in guard:
+            continue
         force_suffix = base_lower in forced_lower
         needs_suffix = not occ["ifnot"]
         if occ["ifnot"]:
@@ -1237,12 +1305,15 @@ def write_modified_file(
     temp_table_map: Optional[Dict[str, str]] = None,
     sandbox_schema: str = TARGET_SCHEMA,
     profile_table: Optional[str] = None,
+    vendor_guard: Optional[Set[str]] = None,
 ) -> Tuple[str, str]:
     modified_text = apply_placeholder_replacements(stitched_text, profile_date)
     if temp_table_map:
         modified_text = apply_temp_schema_swaps(modified_text, temp_table_map, sandbox_schema)
     tables_to_suffix = find_tables_for_suffix(modified_text)
-    modified_text = apply_table_suffixes(modified_text, tables_to_suffix, forced_tables)
+    modified_text = apply_table_suffixes(
+        modified_text, tables_to_suffix, forced_tables, vendor_guard
+    )
     modified_text = strip_if_suffixes(modified_text)
     output_name = sanitize_filename(insight_type, profile_table).replace(
         OUTPUT_SUFFIX, MODIFIED_SUFFIX
@@ -1258,12 +1329,13 @@ def build_profile_only_text(
     forced_tables: Optional[Set[str]] = None,
     temp_table_map: Optional[Dict[str, str]] = None,
     sandbox_schema: str = TARGET_SCHEMA,
+    vendor_guard: Optional[Set[str]] = None,
 ) -> str:
     text = apply_placeholder_replacements(profile_script, profile_date)
     if temp_table_map:
         text = apply_temp_schema_swaps(text, temp_table_map, sandbox_schema)
     tables_to_suffix = find_tables_for_suffix(text)
-    return apply_table_suffixes(text, tables_to_suffix, forced_tables)
+    return apply_table_suffixes(text, tables_to_suffix, forced_tables, vendor_guard)
 
 
 def write_profile_only_file(
@@ -1329,12 +1401,15 @@ def run_pipeline() -> None:
     )
 
     insight_raw = input("Enter insight_type (comma-separated allowed): ").strip()
-    if not insight_raw:
-        raise ValueError("insight_type is required.")
-    insight_values = parse_insight_values(insight_raw)
-    if not insight_values:
-        raise ValueError("At least one insight_type value is required.")
-
+    profile_raw = input("Enter profile table (optional, comma-separated): ").strip()
+    if not insight_raw and not profile_raw:
+        raise ValueError("Provide either insight_type or profile_table.")
+    insight_values = parse_insight_values(insight_raw) if insight_raw else []
+    override_profile_tables = (
+        [value.strip() for value in profile_raw.split(",") if value.strip()]
+        if profile_raw
+        else []
+    )
     profile_date = input("Enter profile date (YYYYMMDD): ").strip()
     if not profile_date:
         raise ValueError("profile date is required.")
@@ -1349,7 +1424,10 @@ def run_pipeline() -> None:
 
     run_timestamp = datetime.datetime.utcnow()
     _, profile_tables, excel_path, alias_lookup = build_dependency_artifacts(
-        insight_values, db_config, run_timestamp=run_timestamp
+        insight_values,
+        db_config,
+        run_timestamp=run_timestamp,
+        override_profile_tables=override_profile_tables or None,
     )
     if not profile_tables:
         logging.warning("Stopping because no profile tables were detected.")
@@ -1359,6 +1437,9 @@ def run_pipeline() -> None:
 
     temp_plan = prepare_temp_table_plan(db_config, sandbox_schema, acc_mhh_n_value)
     temp_table_map = temp_plan.table_map
+    vendor_guard_tables = {
+        normalize_table_name(name) for name in temp_table_map.keys()
+    }
 
     with psycopg2.connect(**db_config) as conn:
         entries = fetch_lineage_entries(conn)
@@ -1398,9 +1479,13 @@ def run_pipeline() -> None:
         )
         stitched_sql.append((selected_profile[0], processed_profile))
 
-    stitched_sql, insert_enforced = transform_insert_only_scripts(stitched_sql)
+    stitched_sql, insert_enforced = transform_insert_only_scripts(
+        stitched_sql, vendor_guard_tables
+    )
     forced_table_tokens.update(insert_enforced)
-    stitched_sql = enforce_unique_table_targets(stitched_sql, forced_table_tokens)
+    stitched_sql = enforce_unique_table_targets(
+        stitched_sql, forced_table_tokens, vendor_guard_tables
+    )
 
     profile_only_text: Optional[str] = None
     profile_only_path: Optional[str] = None
@@ -1411,6 +1496,7 @@ def run_pipeline() -> None:
             forced_table_tokens,
             temp_table_map,
             sandbox_schema,
+            vendor_guard_tables,
         )
         profile_only_path = write_profile_only_file(
             insight_raw, profile_only_text, primary_profile_table
@@ -1426,6 +1512,7 @@ def run_pipeline() -> None:
         temp_table_map,
         sandbox_schema,
         primary_profile_table,
+        vendor_guard_tables,
     )
     created_tables = sorted(find_tables_for_suffix(modified_text))
     logging.info(
