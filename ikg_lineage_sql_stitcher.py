@@ -8,7 +8,7 @@ import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Match
 
 import gitlab
 import pandas as pd
@@ -1054,7 +1054,7 @@ def rewrite_table_identifiers(
         rf'((?:"[^"]+"|[a-z0-9_]+))\s*\.\s*"{escaped}"', re.IGNORECASE
     )
 
-    def _replace(match: re.Match[str], schema: bool = False) -> str:
+    def _replace(match: Match[str], schema: bool = False) -> str:
         if schema:
             return f"{match.group(1)}.{alias_name}"
         return alias_name
@@ -1290,9 +1290,11 @@ def enforce_unique_table_targets(
 
 
 def enforce_vendor_table_bases(text: str, allowed_tables: Set[str]) -> str:
+    if not allowed_tables:
+        return text
     allowed_lower = {name.lower() for name in allowed_tables}
 
-    def _replace(match: re.Match[str]) -> str:
+    def _replace(match: Match[str]) -> str:
         schema_token = match.group("schema")
         table_token = match.group("table")
         schema_norm = normalize_schema_name(schema_token)
