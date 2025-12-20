@@ -1562,7 +1562,9 @@ def run_pipeline() -> None:
 
     if not entries:
         logging.warning(
-            "No lineage entries found in %s.%s", TARGET_SCHEMA, LINEAGE_TEMP_TABLE
+            "No lineage entries found in %s.%s",
+            TARGET_SCHEMA,
+            lineage_temp_table_name(primary_profile_table),
         )
         return
 
