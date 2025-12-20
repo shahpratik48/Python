@@ -450,10 +450,9 @@ def rows_to_dataframe(rows: Sequence[DependencyRow]) -> pd.DataFrame:
 
 def write_temp_excel(
     df: pd.DataFrame,
-    run_timestamp: datetime.datetime,
+    profile_table: Optional[str],
 ) -> str:
-    timestamp_str = run_timestamp.strftime("%Y%m%d%H%M%S")
-    output_file = f"{LINEAGE_OUTPUT_PREFIX}_{timestamp_str}_{LINEAGE_OUTPUT_SUFFIX}.xlsx"
+    output_file = lineage_temp_excel_name(profile_table)
     df.to_excel(output_file, index=False)
     logging.info("Wrote %s", output_file)
     return output_file
@@ -462,10 +461,11 @@ def write_temp_excel(
 def refresh_temp_table(
     conn: psycopg2.extensions.connection,
     rows: Sequence[DependencyRow],
+    table_name: str,
 ) -> None:
     with conn.cursor() as cur:
         cur.execute(
-            sql.SQL("DROP TABLE IF EXISTS {}").format(qualified_table(LINEAGE_TEMP_TABLE))
+            sql.SQL("DROP TABLE IF EXISTS {}").format(qualified_table(table_name))
         )
         cur.execute(
             sql.SQL(
@@ -483,7 +483,7 @@ def refresh_temp_table(
                     "current_timestamp" TIMESTAMP
                 )
                 """
-            ).format(qualified_table(LINEAGE_TEMP_TABLE))
+            ).format(qualified_table(table_name))
         )
         values = [
             (
@@ -505,18 +505,18 @@ def refresh_temp_table(
                 cur,
                 sql.SQL(
                     'INSERT INTO {} (order_index, root_profile_table, target_table, source_schema, source_table, process, filename, filepath, level, "current_timestamp") VALUES %s'
-                ).format(qualified_table(LINEAGE_TEMP_TABLE)),
+                ).format(qualified_table(table_name)),
                 values,
             )
         cur.execute(
             sql.SQL("ALTER TABLE {} OWNER TO {}").format(
-                qualified_table(LINEAGE_TEMP_TABLE),
+                qualified_table(table_name),
                 sql.Identifier("erd_gpdb_prj_smart_insights"),
             )
         )
         cur.execute(
             sql.SQL("GRANT SELECT ON {} TO {}").format(
-                qualified_table(LINEAGE_TEMP_TABLE),
+                qualified_table(table_name),
                 sql.Identifier("erd_gpdb_prj_smart_insights_ro"),
             )
         )
@@ -547,16 +547,18 @@ def build_dependency_artifacts(
         if not profile_tables:
             logging.warning("No profile tables available for lineage construction.")
             return [], [], None, {}
+        primary_profile_table = profile_tables[-1] if profile_tables else None
+        temp_table_name = lineage_temp_table_name(primary_profile_table)
         metadata_rows = fetch_metadata_rows(conn)
     lineage_rows, alias_lookup = build_lineage_rows(profile_tables, metadata_rows, timestamp)
     df = rows_to_dataframe(lineage_rows)
-    excel_path = write_temp_excel(df, timestamp)
+    excel_path = write_temp_excel(df, primary_profile_table)
     with psycopg2.connect(**db_config) as conn:
-        refresh_temp_table(conn, lineage_rows)
+        refresh_temp_table(conn, lineage_rows, temp_table_name)
     logging.info(
         "Refreshed %s.%s with %d rows.",
         TARGET_SCHEMA,
-        LINEAGE_TEMP_TABLE,
+        temp_table_name,
         len(lineage_rows),
     )
     return lineage_rows, profile_tables, excel_path, alias_lookup
@@ -676,6 +678,7 @@ def prepare_temp_table_plan(
 
 def fetch_lineage_entries(
     conn: psycopg2.extensions.connection,
+    table_name: str = LINEAGE_TEMP_TABLE,
 ) -> List[LineageEntry]:
     query = sql.SQL(
         """
@@ -692,7 +695,7 @@ def fetch_lineage_entries(
           AND (source_schema ILIKE '%ikg%')
         ORDER BY order_index ASC
         """
-    ).format(qualified_table(LINEAGE_TEMP_TABLE))
+    ).format(qualified_table(table_name))
     with conn.cursor() as cur:
         cur.execute(query)
         rows = []
@@ -836,6 +839,25 @@ def _sanitize_token(value: Optional[str], fallback: str) -> str:
     token = re.sub(r"[^a-zA-Z0-9]+", "_", value.strip())
     token = token.strip("_")
     return token.lower() if token else fallback
+
+
+def lineage_profile_token(profile_table: Optional[str]) -> str:
+    """Return a stable, safe token derived from a profile_table input."""
+    base = normalize_table_name(profile_table)
+    if not base and profile_table:
+        base = strip_quotes(profile_table.strip()).split(".")[-1].strip()
+    token = re.sub(r"[^a-zA-Z0-9]+", "_", (base or "").strip()).strip("_").lower()
+    return token or "profile_table"
+
+
+def lineage_temp_table_name(profile_table: Optional[str]) -> str:
+    """Dynamic lineage temp table name: ikg_table_lineage_<profile>_temp."""
+    return f"{LINEAGE_OUTPUT_PREFIX}_{lineage_profile_token(profile_table)}_{LINEAGE_OUTPUT_SUFFIX}"
+
+
+def lineage_temp_excel_name(profile_table: Optional[str]) -> str:
+    """Dynamic lineage Excel name: ikg_table_lineage_<profile>_temp.xlsx."""
+    return f"{lineage_temp_table_name(profile_table)}.xlsx"
 
 
 def sanitize_filename(insight_type: str, profile_table: Optional[str]) -> str:
@@ -1533,7 +1555,10 @@ def run_pipeline() -> None:
     }
 
     with psycopg2.connect(**db_config) as conn:
-        entries = fetch_lineage_entries(conn)
+        primary_profile_table = profile_tables[-1] if profile_tables else None
+        entries = fetch_lineage_entries(
+            conn, lineage_temp_table_name(primary_profile_table)
+        )
 
     if not entries:
         logging.warning(
