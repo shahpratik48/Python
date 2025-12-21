@@ -20,6 +20,7 @@ Prerequisites:
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import getpass
 import os
@@ -260,6 +261,349 @@ def should_include(diff: dict, filter_fragment: Optional[str]) -> bool:
     return fragment in old_path or fragment in new_path
 
 
+def fetch_file_text_from_gitlab(project, ref: str, file_path: str) -> Optional[str]:
+    """Fetch file content from GitLab for a given ref (branch/tag/SHA)."""
+    normalized_path = (file_path or "").lstrip("/")
+    if not normalized_path:
+        return None
+    try:
+        try:
+            file_obj = project.files.get(normalized_path, ref=ref)
+        except TypeError:
+            file_obj = project.files.get(file_path=normalized_path, ref=ref)
+    except gitlab.GitlabGetError:
+        return None
+
+    # python-gitlab typically stores file.content base64; decode() may convert it.
+    try:
+        file_obj.decode()
+        content = file_obj.content
+        if isinstance(content, bytes):
+            return content.decode("utf-8", errors="replace")
+        if isinstance(content, str):
+            return content
+    except Exception:
+        pass
+
+    content = getattr(file_obj, "content", None)
+    encoding = (getattr(file_obj, "encoding", None) or "").lower()
+    if isinstance(content, str) and encoding == "base64":
+        try:
+            return base64.b64decode(content).decode("utf-8", errors="replace")
+        except Exception:
+            return None
+    if isinstance(content, bytes):
+        return content.decode("utf-8", errors="replace")
+    if isinstance(content, str):
+        return content
+    return None
+
+
+def strip_sql_comments(sql: str) -> str:
+    """Remove -- and /* */ comments while respecting single/double quoted strings."""
+    out: List[str] = []
+    i = 0
+    in_single = False
+    in_double = False
+    length = len(sql)
+    while i < length:
+        ch = sql[i]
+        nxt = sql[i + 1] if i + 1 < length else ""
+
+        if in_single:
+            out.append(ch)
+            if ch == "'" and nxt == "'":  # escaped single quote
+                out.append(nxt)
+                i += 2
+                continue
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+
+        if in_double:
+            out.append(ch)
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+
+        if ch == "'":
+            in_single = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            out.append(ch)
+            i += 1
+            continue
+
+        # line comment
+        if ch == "-" and nxt == "-":
+            i += 2
+            while i < length and sql[i] not in "\r\n":
+                i += 1
+            continue
+
+        # block comment
+        if ch == "/" and nxt == "*":
+            i += 2
+            while i + 1 < length and not (sql[i] == "*" and sql[i + 1] == "/"):
+                i += 1
+            i = i + 2 if i + 1 < length else length
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
+def extract_parenthesized(text: str, open_paren_idx: int) -> Optional[Tuple[str, int]]:
+    """Return (inner_text, close_paren_idx) for the parens starting at open_paren_idx."""
+    if open_paren_idx < 0 or open_paren_idx >= len(text) or text[open_paren_idx] != "(":
+        return None
+    i = open_paren_idx + 1
+    depth = 1
+    in_single = False
+    in_double = False
+    out: List[str] = []
+    while i < len(text):
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+        if in_single:
+            out.append(ch)
+            if ch == "'" and nxt == "'":
+                out.append(nxt)
+                i += 2
+                continue
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if in_double:
+            out.append(ch)
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+        if ch == "'":
+            in_single = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+            out.append(ch)
+            i += 1
+            continue
+        if ch == ")":
+            depth -= 1
+            if depth == 0:
+                return "".join(out), i
+            out.append(ch)
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return None
+
+
+def split_top_level_commas(text: str) -> List[str]:
+    """Split a string by commas not nested in parens/quotes."""
+    items: List[str] = []
+    buf: List[str] = []
+    depth = 0
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+        if in_single:
+            buf.append(ch)
+            if ch == "'" and nxt == "'":
+                buf.append(nxt)
+                i += 2
+                continue
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if in_double:
+            buf.append(ch)
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+        if ch == "'":
+            in_single = True
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == ")":
+            depth = max(0, depth - 1)
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "," and depth == 0:
+            item = "".join(buf).strip()
+            if item:
+                items.append(item)
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    tail = "".join(buf).strip()
+    if tail:
+        items.append(tail)
+    return items
+
+
+def find_keyword_outside(sql: str, keyword: str, start: int = 0) -> int:
+    """Find keyword position outside parens/quotes; returns -1 if not found."""
+    kw = keyword.lower()
+    lower = sql.lower()
+    depth = 0
+    in_single = False
+    in_double = False
+    i = max(0, start)
+    while i < len(sql):
+        ch = sql[i]
+        nxt = sql[i + 1] if i + 1 < len(sql) else ""
+        if in_single:
+            if ch == "'" and nxt == "'":
+                i += 2
+                continue
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if in_double:
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+        if ch == "'":
+            in_single = True
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+            i += 1
+            continue
+        if ch == ")":
+            depth = max(0, depth - 1)
+            i += 1
+            continue
+
+        if depth == 0 and lower.startswith(kw, i):
+            before = lower[i - 1] if i > 0 else " "
+            after = lower[i + len(kw)] if i + len(kw) < len(lower) else " "
+            if not (before.isalnum() or before == "_") and not (
+                after.isalnum() or after == "_"
+            ):
+                return i
+        i += 1
+    return -1
+
+
+def normalize_identifier(value: str) -> str:
+    v = (value or "").strip()
+    v = re.sub(r"\s+", " ", v)
+    # remove common quoting for identifiers
+    if (v.startswith('"') and v.endswith('"')) or (v.startswith("`") and v.endswith("`")):
+        v = v[1:-1].strip()
+    # target_type might be referenced with table alias: foo.target_type
+    if "." in v:
+        v = v.split(".")[-1].strip()
+    # remove trailing "as ..." if present
+    v = re.split(r"\s+as\s+", v, flags=re.IGNORECASE)[0].strip()
+    return v.lower()
+
+
+def extract_single_quoted_literal(expr: str) -> Optional[str]:
+    s = (expr or "").strip()
+    m = re.fullmatch(r"'((?:''|[^'])*)'", s)
+    if not m:
+        return None
+    return m.group(1).replace("''", "'")
+
+
+def extract_target_type_from_sql(sql_text: str) -> Optional[str]:
+    """Extract target_type value from an INSERT INTO (...) SELECT ... statement."""
+    if not sql_text:
+        return None
+
+    sql = strip_sql_comments(sql_text)
+    lower = sql.lower()
+    pos = 0
+    while True:
+        match = re.search(r"\binsert\s+into\b", lower[pos:])
+        if not match:
+            return None
+        insert_idx = pos + match.start()
+        # find first '(' after INSERT INTO <table>
+        open_idx = sql.find("(", insert_idx)
+        if open_idx == -1:
+            pos = insert_idx + 1
+            continue
+        cols_info = extract_parenthesized(sql, open_idx)
+        if not cols_info:
+            pos = insert_idx + 1
+            continue
+        cols_text, close_idx = cols_info
+
+        select_idx = find_keyword_outside(sql, "select", start=close_idx + 1)
+        if select_idx == -1:
+            pos = close_idx + 1
+            continue
+        from_idx = find_keyword_outside(sql, "from", start=select_idx + 6)
+        if from_idx == -1:
+            pos = select_idx + 6
+            continue
+
+        select_list_text = sql[select_idx + 6 : from_idx].strip()
+        columns = [c for c in split_top_level_commas(cols_text) if c.strip()]
+        selects = [s for s in split_top_level_commas(select_list_text) if s.strip()]
+
+        if not columns or not selects or len(selects) < len(columns):
+            pos = from_idx + 4
+            continue
+
+        normalized_cols = [normalize_identifier(c) for c in columns]
+        try:
+            idx = normalized_cols.index("target_type")
+        except ValueError:
+            pos = from_idx + 4
+            continue
+
+        expr = selects[idx].strip()
+        literal = extract_single_quoted_literal(expr)
+        return literal if literal is not None else expr
+
+
 def gather_compare_diffs(
     project,
     base_branch: str,
@@ -321,6 +665,7 @@ def record_from_diff(
     source: str,
     change_timestamp: Optional[str],
     mr_meta: Optional[dict] = None,
+    target_type: Optional[str] = None,
 ) -> Dict[str, Optional[str]]:
     file_path = diff.get("new_path") or diff.get("old_path")
     file_name = Path(file_path).name if file_path else None
@@ -329,12 +674,13 @@ def record_from_diff(
         "branch_name": branch_name,
         "base_branch": base_branch,
         "file_name": file_name,
-        "file_path": diff.get("new_path"),
+        "file_path": file_path,
         "old_path": diff.get("old_path"),
         "new_path": diff.get("new_path"),
         "change_type": infer_change_type(diff),
         "change_source": source,
         "change_timestamp": change_timestamp,
+        "target_type": target_type,
     }
     record.update(branch_meta)
     if source == "merge_request" and mr_meta:
@@ -353,6 +699,7 @@ def collect_branch_changes(
 ) -> Tuple[pd.DataFrame, List[str]]:
     records: List[Dict[str, Optional[str]]] = []
     errors: List[str] = []
+    target_type_cache: Dict[Tuple[str, str], Optional[str]] = {}
     rows = df_issue_branches.to_dict("records")
     if max_branches is not None:
         rows = rows[:max_branches]
@@ -401,6 +748,24 @@ def collect_branch_changes(
 
         if filtered_diffs:
             for diff in filtered_diffs:
+                file_path = diff.get("new_path") or diff.get("old_path") or ""
+                target_type: Optional[str] = None
+                if (
+                    file_path
+                    and file_path.lower().endswith(".sql")
+                    and not diff.get("deleted_file")
+                ):
+                    key = (branch_name, file_path)
+                    if key in target_type_cache:
+                        target_type = target_type_cache[key]
+                    else:
+                        sql_text = fetch_file_text_from_gitlab(
+                            odm_project, ref=branch_name, file_path=file_path
+                        )
+                        target_type = (
+                            extract_target_type_from_sql(sql_text) if sql_text else None
+                        )
+                        target_type_cache[key] = target_type
                 records.append(
                     record_from_diff(
                         issue_row=row,
@@ -410,6 +775,7 @@ def collect_branch_changes(
                         diff=diff,
                         source="compare",
                         change_timestamp=branch_meta["branch_head_committed_at"],
+                        target_type=target_type,
                     )
                 )
             continue
@@ -439,6 +805,24 @@ def collect_branch_changes(
         for diff in mr_details.get("changes", []):
             if not should_include(diff, filter_fragment):
                 continue
+            file_path = diff.get("new_path") or diff.get("old_path") or ""
+            target_type = None
+            if (
+                file_path
+                and file_path.lower().endswith(".sql")
+                and not diff.get("deleted_file")
+            ):
+                key = (branch_name, file_path)
+                if key in target_type_cache:
+                    target_type = target_type_cache[key]
+                else:
+                    sql_text = fetch_file_text_from_gitlab(
+                        odm_project, ref=branch_name, file_path=file_path
+                    )
+                    target_type = (
+                        extract_target_type_from_sql(sql_text) if sql_text else None
+                    )
+                    target_type_cache[key] = target_type
             records.append(
                 record_from_diff(
                     issue_row=row,
@@ -449,6 +833,7 @@ def collect_branch_changes(
                     source="merge_request",
                     change_timestamp=mr_meta["merge_request_merged_at"],
                     mr_meta=mr_meta,
+                    target_type=target_type,
                 )
             )
 
@@ -541,6 +926,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "branch_name",
                 "change_type",
                 "file_path",
+                "target_type",
             ]
             pd.DataFrame(columns=empty_cols).to_excel(
                 writer, index=False, sheet_name="branch_changes"
