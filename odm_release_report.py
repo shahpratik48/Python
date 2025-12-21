@@ -274,14 +274,14 @@ def fetch_file_text_from_gitlab(project, ref: str, file_path: str) -> Optional[s
     except gitlab.GitlabGetError:
         return None
 
-    # python-gitlab typically stores file.content base64; decode() may convert it.
+    # python-gitlab's decode() returns decoded bytes. Prefer that to avoid
+    # accidentally returning the raw base64 string (which would break SQL parsing).
     try:
-        file_obj.decode()
-        content = file_obj.content
-        if isinstance(content, bytes):
-            return content.decode("utf-8", errors="replace")
-        if isinstance(content, str):
-            return content
+        decoded = file_obj.decode()
+        if isinstance(decoded, bytes):
+            return decoded.decode("utf-8", errors="replace")
+        if isinstance(decoded, str):
+            return decoded
     except Exception:
         pass
 
@@ -292,6 +292,13 @@ def fetch_file_text_from_gitlab(project, ref: str, file_path: str) -> Optional[s
             return base64.b64decode(content).decode("utf-8", errors="replace")
         except Exception:
             return None
+    # Fallback heuristic: sometimes encoding isn't populated but content is still base64.
+    if isinstance(content, str):
+        try:
+            raw = base64.b64decode(content, validate=True)
+            return raw.decode("utf-8", errors="replace")
+        except Exception:
+            pass
     if isinstance(content, bytes):
         return content.decode("utf-8", errors="replace")
     if isinstance(content, str):
