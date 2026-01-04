@@ -1,0 +1,42 @@
+input:
+  # Copy your file locally (Linux path) or mount it into the runtime.
+  # Example (Windows original): c:\dev\ikg data dictionary.xlsx
+  path: /workspace/ikg_data_dictionary.xlsx
+
+  # Optional: specify sheet name. If omitted, pandas will use the first sheet.
+  # sheet_name: Sheet1
+
+  # Optional: map logical field names to exact Excel header strings.
+  # If omitted, the script will auto-detect based on common header variants.
+  # column_mapping:
+  #   table_name: table_name
+  #   column_name: column_name
+  #   business_attribute_name: business attribute name
+  #   description: description
+
+output:
+  dir: out_lineage
+
+candidates:
+  # For each target column, consider up to top_k candidate source columns.
+  top_k: 20
+  # Minimum TF-IDF cosine similarity to consider (0..1).
+  min_score: 0.15
+  # Usually false: lineage across tables, not within same table.
+  include_same_table: false
+  # Max edges the LLM may emit per target.
+  max_edges_per_target: 2
+
+llm:
+  # provider: openai | ollama | none
+  # Use 'none' to generate similarity-only candidates (no LLM confirmation).
+  provider: openai
+
+  # OpenAI model name (example defaults in code to gpt-4.1-mini).
+  model: gpt-4.1-mini
+
+  # If using ollama:
+  # provider: ollama
+  # model: llama3.1
+  # base_url: http://localhost:11434
+

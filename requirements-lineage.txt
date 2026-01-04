@@ -1,0 +1,11 @@
+pandas>=2.2.0
+openpyxl>=3.1.2
+PyYAML>=6.0.1
+pydantic>=2.6.0
+scikit-learn>=1.4.0
+tqdm>=4.66.0
+
+# LLM providers (choose what you need):
+openai>=1.40.0
+requests>=2.31.0
+
