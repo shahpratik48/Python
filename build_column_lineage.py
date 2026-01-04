@@ -324,10 +324,10 @@ class LLMClient:
 
 
 class OpenAIChatClient(LLMClient):
-    def __init__(self, model: str):
+    def __init__(self, model: str, api_key: Optional[str] = None):
         from openai import OpenAI  # type: ignore
 
-        self._client = OpenAI()
+        self._client = OpenAI(api_key=api_key) if api_key else OpenAI()
         self._model = model
 
     def complete_json(self, *, system: str, user: str) -> Dict[str, Any]:
@@ -375,7 +375,8 @@ def build_llm_client(cfg: Dict[str, Any]) -> Optional[LLMClient]:
         return None
     if provider == "openai":
         model = cfg.get("model") or "gpt-4.1-mini"
-        return OpenAIChatClient(model=model)
+        api_key = cfg.get("api_key") or os.environ.get("OPENAI_API_KEY")
+        return OpenAIChatClient(model=model, api_key=api_key)
     if provider == "ollama":
         model = cfg.get("model") or "llama3.1"
         base_url = cfg.get("base_url") or "http://localhost:11434"
