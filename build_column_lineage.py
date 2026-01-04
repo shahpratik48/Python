@@ -122,10 +122,24 @@ def ensure_out_dir(out_dir: Path) -> None:
 
 def read_data_dictionary_xlsx(
     xlsx_path: Path,
-    sheet_name: Optional[str],
+    sheet_name: Optional[Any],
     column_mapping: Optional[Dict[str, str]],
 ) -> List[ColumnMeta]:
-    df = pd.read_excel(xlsx_path, sheet_name=sheet_name)
+    # pandas behavior:
+    # - sheet_name omitted or 0 -> first sheet (DataFrame)
+    # - sheet_name=None -> ALL sheets (dict[str, DataFrame])
+    # To keep configs simple, treat None/"" as "first sheet".
+    sn = sheet_name
+    if sn is None or (isinstance(sn, str) and not sn.strip()):
+        sn = 0
+
+    df = pd.read_excel(xlsx_path, sheet_name=sn)
+    if isinstance(df, dict):
+        # If a caller supplied sheet_name=None (or a list), pick the first sheet deterministically.
+        if not df:
+            raise ValueError("Excel workbook has no readable sheets.")
+        df = next(iter(df.values()))
+
     if df is None or df.empty:
         raise ValueError("Excel sheet is empty or could not be read.")
 

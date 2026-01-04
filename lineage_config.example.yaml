@@ -5,7 +5,8 @@ input:
   path: ikg data dictionary.xlsx
 
   # Optional: specify sheet name. If omitted, pandas will use the first sheet.
-  # sheet_name: Sheet1
+  # Use 0 for the first sheet, or a string sheet name like "Sheet1".
+  # sheet_name: 0
 
   # Optional: map logical field names to exact Excel header strings.
   # If omitted, the script will auto-detect based on common header variants.
