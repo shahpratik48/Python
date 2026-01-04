@@ -34,7 +34,7 @@ If using OpenAI:
 ### Run
 **Preferred:** use the notebook `column_lineage_main.ipynb` as the main entrypoint.
 
-1) Copy your file locally (Linux path) or mount it into the runtime.
+1) Put `ikg data dictionary.xlsx` in the same folder as the notebook (this repo root).
    Your original path is Windows: `c:\dev\ikg data dictionary.xlsx`
 
 2) Update the config:

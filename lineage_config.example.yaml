@@ -1,7 +1,8 @@
 input:
   # Copy your file locally (Linux path) or mount it into the runtime.
   # Example (Windows original): c:\dev\ikg data dictionary.xlsx
-  path: /workspace/ikg_data_dictionary.xlsx
+  # If the file is in the same folder as this repo, this relative path works:
+  path: ikg data dictionary.xlsx
 
   # Optional: specify sheet name. If omitted, pandas will use the first sheet.
   # sheet_name: Sheet1
