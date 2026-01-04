@@ -32,6 +32,8 @@ If using OpenAI:
 ---
 
 ### Run
+**Preferred:** use the notebook `column_lineage_main.ipynb` as the main entrypoint.
+
 1) Copy your file locally (Linux path) or mount it into the runtime.
    Your original path is Windows: `c:\dev\ikg data dictionary.xlsx`
 
