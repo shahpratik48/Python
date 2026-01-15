@@ -1,13 +1,13 @@
 -- IKG table lineage execution plan (Greenplum/Postgres).
 -- Input values:
---   source_tables: comma-separated list of source tables (schema.table or table).
+--   source_tables: comma-separated list of source tables (table only).
 --   target_table: optional target table (schema.table or table). Leave blank to traverse to the end.
 --
 -- Replace the values in the params CTE before running.
 WITH RECURSIVE
 params AS (
     SELECT
-        'schema.table1,table2'::text AS source_tables,
+        'table1,table2'::text AS source_tables,
         ''::text AS target_table
 ),
 source_list AS (
@@ -17,18 +17,12 @@ source_list AS (
         regexp_split_to_table(params.source_tables, '\s*,\s*') AS source_raw
 ),
 source_inputs AS (
-    SELECT
-        NULLIF(split_part(source_raw, '.', 1), '') AS source_schema,
-        CASE
-            WHEN source_raw LIKE '%.%' THEN split_part(source_raw, '.', 2)
-            ELSE source_raw
-        END AS source_table
+    SELECT source_raw AS source_table
     FROM source_list
     WHERE source_raw <> ''
 ),
 edges AS (
     SELECT
-        lower(source_schema) AS source_schema,
         lower(source_table) AS source_table,
         lower(target_table) AS target_table,
         filename,
@@ -42,7 +36,6 @@ start_edges AS (
     FROM edges e
     JOIN source_inputs s
         ON e.source_table = lower(s.source_table)
-        AND (s.source_schema IS NULL OR e.source_schema = lower(s.source_schema))
 ),
 walk AS (
     SELECT
