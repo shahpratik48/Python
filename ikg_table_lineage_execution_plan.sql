@@ -3,6 +3,10 @@
 --   source_tables: comma-separated list of source tables (table only).
 --   target_table: optional target table (schema.table or table). Leave blank to traverse to the end.
 --
+-- Ordering logic:
+--   step_index = 1 => targets with no dependencies on other targets in scope.
+--   step_index increases by dependency depth (topological level).
+--
 -- Replace the values in the params CTE before running.
 WITH RECURSIVE
 params AS (
@@ -17,7 +21,7 @@ source_list AS (
         regexp_split_to_table(params.source_tables, '\s*,\s*') AS source_raw
 ),
 source_inputs AS (
-    SELECT source_raw AS source_table
+    SELECT lower(source_raw) AS source_table
     FROM source_list
     WHERE source_raw <> ''
 ),
@@ -35,7 +39,7 @@ start_edges AS (
     SELECT e.*
     FROM edges e
     JOIN source_inputs s
-        ON e.source_table = lower(s.source_table)
+        ON e.source_table = s.source_table
 ),
 walk AS (
     SELECT
@@ -82,15 +86,54 @@ filtered_walk AS (
     JOIN target_paths p
         ON p.target_path[1:array_length(w.target_path, 1)] = w.target_path
 ),
+target_nodes AS (
+    SELECT DISTINCT target_table
+    FROM filtered_walk
+),
+dependency_edges AS (
+    SELECT
+        w.source_table,
+        w.target_table
+    FROM filtered_walk w
+    JOIN target_nodes src
+        ON w.source_table = src.target_table
+    JOIN target_nodes tgt
+        ON w.target_table = tgt.target_table
+),
+root_targets AS (
+    SELECT n.target_table
+    FROM target_nodes n
+    LEFT JOIN dependency_edges d
+        ON d.target_table = n.target_table
+    WHERE d.target_table IS NULL
+),
+levels AS (
+    SELECT
+        r.target_table,
+        1 AS level,
+        ARRAY[r.target_table] AS path
+    FROM root_targets r
+    UNION ALL
+    SELECT
+        d.target_table,
+        l.level + 1,
+        l.path || d.target_table
+    FROM levels l
+    JOIN dependency_edges d
+        ON d.source_table = l.target_table
+    WHERE NOT (d.target_table = ANY(l.path))
+),
 execution_plan AS (
     SELECT
-        min(depth) AS run_order,
-        target_table,
+        max(level) AS run_order,
+        l.target_table,
         min(process) AS process,
         min(filename) AS filename,
         min(filepath) AS filepath
-    FROM filtered_walk
-    GROUP BY target_table
+    FROM levels l
+    JOIN filtered_walk w
+        ON w.target_table = l.target_table
+    GROUP BY l.target_table
 )
 SELECT
     run_order AS step_index,
