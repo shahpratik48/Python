@@ -119,8 +119,10 @@ class StatementLineage:
 def derive_process(file_path: str) -> str:
     parts = Path(file_path).parts
     prefix_len = len(SQL_PATH_PARTS)
-    if parts[:prefix_len] == SQL_PATH_PARTS and len(parts) > prefix_len:
-        return parts[prefix_len]
+    if parts[:prefix_len] == SQL_PATH_PARTS:
+        rel_parts = parts[prefix_len:]
+        if len(rel_parts) > 1:
+            return rel_parts[-2]
     return ""
 
 
@@ -666,7 +668,7 @@ class SQLColumnParser:
                     context,
                     normalizer,
                     f"where{suffix}",
-                    include_target=False,
+                    include_target=True,
                     logic_override=normalizer.restore(where_logic),
                 )
             )
@@ -684,7 +686,7 @@ class SQLColumnParser:
                     context,
                     normalizer,
                     f"join{suffix}",
-                    include_target=False,
+                    include_target=True,
                     logic_override=join_logic,
                 )
             )
@@ -699,7 +701,7 @@ class SQLColumnParser:
                     context,
                     normalizer,
                     f"having{suffix}",
-                    include_target=False,
+                    include_target=True,
                     logic_override=normalizer.restore(having_logic),
                 )
             )
@@ -796,9 +798,7 @@ class SQLColumnParser:
                 return self._resolve_table_ref_column(
                     table_ref, column_name, normalizer
                 )
-            if self._metadata_resolver.column_exists(None, column.table, column_name):
-                return [ResolvedColumn(schema=None, table=column.table, column=column_name)]
-            return [ResolvedColumn(schema=None, table=None, column=column_name)]
+            return [ResolvedColumn(schema=None, table=column.table, column=column_name)]
         if len(context.base_tables) == 1:
             base = context.base_tables[0]
             return [ResolvedColumn(schema=base.schema, table=base.table, column=column_name)]
@@ -825,6 +825,17 @@ class SQLColumnParser:
                 ResolvedColumn(schema=ref.schema, table=ref.table, column=column_name)
                 for ref in context.base_tables
             ]
+        if context.table_refs:
+            seen: Set[int] = set()
+            resolved: List[ResolvedColumn] = []
+            for ref in context.table_refs.values():
+                if id(ref) in seen:
+                    continue
+                seen.add(id(ref))
+                resolved.append(
+                    ResolvedColumn(schema=ref.schema, table=ref.table, column=column_name)
+                )
+            return resolved
         return [ResolvedColumn(schema=None, table=None, column=column_name)]
 
     def _resolve_cte_subquery_column(
@@ -852,7 +863,7 @@ class SQLColumnParser:
                 mapped = table_ref.columns.get(column_name.lower())
                 if mapped:
                     return mapped
-            return [ResolvedColumn(schema=None, table=None, column=column_name)]
+            return [ResolvedColumn(schema=None, table=table_ref.table, column=column_name)]
         return [ResolvedColumn(schema=table_ref.schema, table=table_ref.table, column=column_name)]
 
     def _build_context(
@@ -1230,10 +1241,6 @@ class LineageBuilder:
                 process = derive_process(file_path)
                 for result in statement_results:
                     for record in result.records:
-                        is_clause = (
-                            record.sql_process in {"join", "where", "having"}
-                            or (record.sql_process or "").endswith("-with")
-                        )
                         targets = result.targets or [TargetTable(schema=None, table=None)]
                         for target in targets:
                             rows.append(
@@ -1241,10 +1248,10 @@ class LineageBuilder:
                                     filename=filename,
                                     filepath=file_path,
                                     process=process,
-                                    target_table=None if is_clause else target_table,
+                                    target_table=target_table,
                                     sub_target_schema=target.schema,
                                     sub_target_table=target.table,
-                                    target_column=None if is_clause else record.target_column,
+                                    target_column=record.target_column,
                                     source_schema=record.source_schema,
                                     source_table=record.source_table,
                                     source_column=record.source_column,
