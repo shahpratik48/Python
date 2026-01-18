@@ -224,6 +224,13 @@ class MetadataResolver:
                 matches.append(table_ref)
         return matches
 
+    def column_exists(
+        self, schema: Optional[str], table: Optional[str], column: Optional[str]
+    ) -> bool:
+        if not table or not column:
+            return False
+        return self._column_exists(schema, table, column)
+
     def _column_exists(self, schema: Optional[str], table: str, column: str) -> bool:
         cache_key = (schema.lower() if schema else None, table.lower())
         if cache_key in self._cache:
@@ -501,6 +508,7 @@ class SQLColumnParser:
             normalizer=normalizer,
             target_columns_override=target_columns_override,
             visited=visited,
+            include_select=True,
             records=records,
         )
         return self._deduplicate_records(records)
@@ -511,6 +519,7 @@ class SQLColumnParser:
         normalizer: TemplateNormalizer,
         target_columns_override: Optional[List[exp.Expression]],
         visited: Set[int],
+        include_select: bool,
         records: List[ColumnRecord],
     ) -> None:
         if query is None or id(query) in visited:
@@ -519,16 +528,31 @@ class SQLColumnParser:
 
         if isinstance(query, exp.Subquery):
             self._extract_query_records_recursive(
-                query.this, normalizer, target_columns_override, visited, records
+                query.this,
+                normalizer,
+                target_columns_override,
+                visited,
+                False,
+                records,
             )
             return
 
         if isinstance(query, exp.SetOperation):
             self._extract_query_records_recursive(
-                query.this, normalizer, target_columns_override, visited, records
+                query.this,
+                normalizer,
+                target_columns_override,
+                visited,
+                include_select,
+                records,
             )
             self._extract_query_records_recursive(
-                query.expression, normalizer, target_columns_override, visited, records
+                query.expression,
+                normalizer,
+                target_columns_override,
+                visited,
+                include_select,
+                records,
             )
             return
 
@@ -536,20 +560,23 @@ class SQLColumnParser:
             return
 
         context = self._build_context(query, normalizer)
-        select_records = self._extract_select_records(
-            query, context, normalizer, target_columns_override
-        )
-        records.extend(select_records)
+        if include_select:
+            select_records = self._extract_select_records(
+                query, context, normalizer, target_columns_override
+            )
+            records.extend(select_records)
         records.extend(self._extract_clause_records(query, context, normalizer))
 
-        for cte in query.find_all(exp.CTE):
-            self._extract_query_records_recursive(
-                cte.this, normalizer, None, visited, records
-            )
+        with_clause = query.args.get("with")
+        if with_clause is not None:
+            for cte in with_clause.expressions:
+                self._extract_query_records_recursive(
+                    cte.this, normalizer, None, visited, False, records
+                )
 
         for subquery in query.find_all(exp.Subquery):
             self._extract_query_records_recursive(
-                subquery.this, normalizer, None, visited, records
+                subquery.this, normalizer, None, visited, False, records
             )
 
     def _extract_select_records(
@@ -610,7 +637,12 @@ class SQLColumnParser:
         if where_clause is not None:
             records.extend(
                 self._records_for_expression(
-                    where_clause.this, query, context, normalizer, "where"
+                    where_clause.this,
+                    query,
+                    context,
+                    normalizer,
+                    "where",
+                    include_target=False,
                 )
             )
 
@@ -620,36 +652,27 @@ class SQLColumnParser:
                 continue
             records.extend(
                 self._records_for_expression(
-                    on_clause, query, context, normalizer, "join"
+                    on_clause,
+                    query,
+                    context,
+                    normalizer,
+                    "join",
+                    include_target=False,
                 )
             )
-
-        group_clause = query.args.get("group")
-        if group_clause is not None:
-            for group_expr in group_clause.expressions:
-                records.extend(
-                    self._records_for_expression(
-                        group_expr, query, context, normalizer, "group_by"
-                    )
-                )
 
         having_clause = query.args.get("having")
         if having_clause is not None:
             records.extend(
                 self._records_for_expression(
-                    having_clause.this, query, context, normalizer, "having"
+                    having_clause.this,
+                    query,
+                    context,
+                    normalizer,
+                    "having",
+                    include_target=False,
                 )
             )
-
-        order_clause = query.args.get("order")
-        if order_clause is not None:
-            for order_expr in order_clause.expressions:
-                inner_expr = order_expr.this if hasattr(order_expr, "this") else order_expr
-                records.extend(
-                    self._records_for_expression(
-                        inner_expr, query, context, normalizer, "order_by"
-                    )
-                )
 
         return records
 
@@ -660,6 +683,7 @@ class SQLColumnParser:
         context: "QueryContext",
         normalizer: TemplateNormalizer,
         sql_process: str,
+        include_target: bool,
     ) -> List[ColumnRecord]:
         records: List[ColumnRecord] = []
         if expression is None:
@@ -667,7 +691,9 @@ class SQLColumnParser:
         logic = normalizer.restore(expression.sql(dialect="postgres"))
         sources = self._resolve_expression_sources(expression, query, context, normalizer)
         for resolved in sources:
-            target_column = normalizer.restore_identifier(resolved.column)
+            target_column = (
+                normalizer.restore_identifier(resolved.column) if include_target else None
+            )
             records.append(
                 ColumnRecord(
                     target_column=target_column,
@@ -717,7 +743,9 @@ class SQLColumnParser:
                 return self._resolve_table_ref_column(
                     table_ref, column_name, normalizer
                 )
-            return [ResolvedColumn(schema=None, table=column.table, column=column_name)]
+            if self._metadata_resolver.column_exists(None, column.table, column_name):
+                return [ResolvedColumn(schema=None, table=column.table, column=column_name)]
+            return [ResolvedColumn(schema=None, table=None, column=column_name)]
         if len(context.base_tables) == 1:
             base = context.base_tables[0]
             return [ResolvedColumn(schema=base.schema, table=base.table, column=column_name)]
@@ -771,7 +799,7 @@ class SQLColumnParser:
                 mapped = table_ref.columns.get(column_name.lower())
                 if mapped:
                     return mapped
-            return [ResolvedColumn(schema=None, table=table_ref.table, column=column_name)]
+            return [ResolvedColumn(schema=None, table=None, column=column_name)]
         return [ResolvedColumn(schema=table_ref.schema, table=table_ref.table, column=column_name)]
 
     def _build_context(
@@ -1148,17 +1176,23 @@ class LineageBuilder:
                 target_table = Path(filename).stem
                 process = derive_process(file_path)
                 for result in statement_results:
-                    for target in result.targets:
-                        for record in result.records:
+                    for record in result.records:
+                        is_clause = record.sql_process in {"join", "where", "having"}
+                        targets = (
+                            [TargetTable(schema=None, table=None)]
+                            if is_clause
+                            else result.targets
+                        )
+                        for target in targets:
                             rows.append(
                                 ColumnLineageRow(
                                     filename=filename,
                                     filepath=file_path,
                                     process=process,
-                                    target_table=target_table,
-                                    sub_target_schema=target.schema,
-                                    sub_target_table=target.table,
-                                    target_column=record.target_column,
+                                    target_table=None if is_clause else target_table,
+                                    sub_target_schema=None if is_clause else target.schema,
+                                    sub_target_table=None if is_clause else target.table,
+                                    target_column=None if is_clause else record.target_column,
                                     source_schema=record.source_schema,
                                     source_table=record.source_table,
                                     source_column=record.source_column,
