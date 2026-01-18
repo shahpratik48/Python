@@ -1,9 +1,11 @@
+import argparse
 import base64
 import datetime
 import getpass
 import logging
 import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Match, Optional, Sequence, Set, Tuple
@@ -29,6 +31,8 @@ TARGET_SCHEMA = "sandbox_prj_smart_insights"
 TARGET_TABLE = "ikg_column_lineage_master_auto_refresh"
 TARGET_OWNER = "erd_gpdb_prj_smart_insights"
 TARGET_READER = "erd_gpdb_prj_smart_insights_ro"
+GITLAB_TOKEN_ENV = "IKG_GITLAB_TOKEN"
+DB_PASSWORD_ENV = "IKG_DB_PASSWORD"
 SQL_PATH_PARTS = Path(SQL_PATH).parts
 LINEAGE_COLUMNS = [
     "filename",
@@ -1288,14 +1292,58 @@ def write_to_excel(
     return output_path
 
 
+def _read_secret(
+    label: str,
+    env_key: str,
+    arg_value: Optional[str],
+) -> str:
+    if arg_value:
+        return arg_value
+    env_value = os.environ.get(env_key)
+    if env_value:
+        return env_value
+    if sys.stdin.isatty():
+        return getpass.getpass(label)
+    try:
+        return input(label)
+    except EOFError as exc:
+        raise RuntimeError(
+            f"Missing {env_key}. Provide CLI args or set the env var."
+        ) from exc
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="IKG Column Lineage Auto Refresh")
+    parser.add_argument(
+        "--gitlab-token",
+        dest="gitlab_token",
+        help=f"GitLab token (or set {GITLAB_TOKEN_ENV}).",
+    )
+    parser.add_argument(
+        "--db-password",
+        dest="db_password",
+        help=f"DB password (or set {DB_PASSWORD_ENV}).",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = _parse_args()
     logging.basicConfig(
         level=getattr(logging, LOG_LEVEL.upper(), logging.DEBUG),
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
 
-    private_token = getpass.getpass("Enter your private token: ")
-    db_password = getpass.getpass("Enter Password for DB User: ")
+    private_token = _read_secret(
+        f"Enter your private token (or set {GITLAB_TOKEN_ENV}): ",
+        GITLAB_TOKEN_ENV,
+        args.gitlab_token,
+    )
+    db_password = _read_secret(
+        f"Enter Password for DB User (or set {DB_PASSWORD_ENV}): ",
+        DB_PASSWORD_ENV,
+        args.db_password,
+    )
 
     exclude_folders = [folder for folder in EXCLUDE_FOLDER.split() if folder]
     fetcher = GitLabSQLFetcher(private_token=private_token, exclude_folders=exclude_folders)
