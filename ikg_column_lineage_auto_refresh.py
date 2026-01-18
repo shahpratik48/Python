@@ -509,6 +509,7 @@ class SQLColumnParser:
             target_columns_override=target_columns_override,
             visited=visited,
             include_select=True,
+            in_cte=False,
             records=records,
         )
         return self._deduplicate_records(records)
@@ -520,6 +521,7 @@ class SQLColumnParser:
         target_columns_override: Optional[List[exp.Expression]],
         visited: Set[int],
         include_select: bool,
+        in_cte: bool,
         records: List[ColumnRecord],
     ) -> None:
         if query is None or id(query) in visited:
@@ -533,6 +535,7 @@ class SQLColumnParser:
                 target_columns_override,
                 visited,
                 False,
+                in_cte,
                 records,
             )
             return
@@ -544,6 +547,7 @@ class SQLColumnParser:
                 target_columns_override,
                 visited,
                 include_select,
+                in_cte,
                 records,
             )
             self._extract_query_records_recursive(
@@ -552,6 +556,7 @@ class SQLColumnParser:
                 target_columns_override,
                 visited,
                 include_select,
+                in_cte,
                 records,
             )
             return
@@ -565,18 +570,18 @@ class SQLColumnParser:
                 query, context, normalizer, target_columns_override
             )
             records.extend(select_records)
-        records.extend(self._extract_clause_records(query, context, normalizer))
+        records.extend(self._extract_clause_records(query, context, normalizer, in_cte))
 
         with_clause = query.args.get("with")
         if with_clause is not None:
             for cte in with_clause.expressions:
                 self._extract_query_records_recursive(
-                    cte.this, normalizer, None, visited, False, records
+                    cte.this, normalizer, None, visited, False, True, records
                 )
 
         for subquery in query.find_all(exp.Subquery):
             self._extract_query_records_recursive(
-                subquery.this, normalizer, None, visited, False, records
+                subquery.this, normalizer, None, visited, False, in_cte, records
             )
 
     def _extract_select_records(
@@ -631,46 +636,55 @@ class SQLColumnParser:
         query: exp.Select,
         context: "QueryContext",
         normalizer: TemplateNormalizer,
+        in_cte: bool,
     ) -> List[ColumnRecord]:
         records: List[ColumnRecord] = []
+        suffix = "-with" if in_cte else ""
         where_clause = query.args.get("where")
         if where_clause is not None:
+            where_logic = f"where {where_clause.this.sql(dialect='postgres')}"
             records.extend(
                 self._records_for_expression(
                     where_clause.this,
                     query,
                     context,
                     normalizer,
-                    "where",
+                    f"where{suffix}",
                     include_target=False,
+                    logic_override=normalizer.restore(where_logic),
                 )
             )
 
         for join in query.args.get("joins") or []:
             on_clause = join.args.get("on")
-            if on_clause is None:
+            if on_clause is None and join.args.get("using") is None:
                 continue
+            join_expression = on_clause or join.args.get("using")
+            join_logic = self._join_logic(query, join, normalizer, in_cte)
             records.extend(
                 self._records_for_expression(
-                    on_clause,
+                    join_expression,
                     query,
                     context,
                     normalizer,
-                    "join",
+                    f"join{suffix}",
                     include_target=False,
+                    logic_override=join_logic,
                 )
             )
 
         having_clause = query.args.get("having")
         if having_clause is not None:
+            having_logic = f"having {having_clause.this.sql(dialect='postgres')}"
             records.extend(
                 self._records_for_expression(
                     having_clause.this,
                     query,
                     context,
                     normalizer,
-                    "having",
+                    f"having{suffix}",
                     include_target=False,
+                    logic_override=normalizer.restore(having_logic),
                 )
             )
 
@@ -684,11 +698,12 @@ class SQLColumnParser:
         normalizer: TemplateNormalizer,
         sql_process: str,
         include_target: bool,
+        logic_override: Optional[str] = None,
     ) -> List[ColumnRecord]:
         records: List[ColumnRecord] = []
         if expression is None:
             return records
-        logic = normalizer.restore(expression.sql(dialect="postgres"))
+        logic = logic_override or normalizer.restore(expression.sql(dialect="postgres"))
         sources = self._resolve_expression_sources(expression, query, context, normalizer)
         for resolved in sources:
             target_column = (
@@ -705,6 +720,28 @@ class SQLColumnParser:
                 )
             )
         return records
+
+    def _join_logic(
+        self,
+        query: exp.Select,
+        join: exp.Join,
+        normalizer: TemplateNormalizer,
+        in_cte: bool,
+    ) -> str:
+        on_clause = join.args.get("on")
+        if in_cte:
+            if on_clause is not None:
+                return normalizer.restore(f"on {on_clause.sql(dialect='postgres')}")
+            return normalizer.restore(join.sql(dialect="postgres"))
+        from_clause = query.args.get("from")
+        left_expr = None
+        if from_clause and from_clause.expressions:
+            left_expr = from_clause.expressions[0]
+        join_sql = join.sql(dialect="postgres")
+        if left_expr is None:
+            return normalizer.restore(join_sql)
+        left_sql = left_expr.sql(dialect="postgres")
+        return normalizer.restore(f"{left_sql} {join_sql}")
 
     def _resolve_expression_sources(
         self,
@@ -1177,7 +1214,10 @@ class LineageBuilder:
                 process = derive_process(file_path)
                 for result in statement_results:
                     for record in result.records:
-                        is_clause = record.sql_process in {"join", "where", "having"}
+                        is_clause = (
+                            record.sql_process in {"join", "where", "having"}
+                            or (record.sql_process or "").endswith("-with")
+                        )
                         targets = (
                             [TargetTable(schema=None, table=None)]
                             if is_clause
@@ -1190,8 +1230,8 @@ class LineageBuilder:
                                     filepath=file_path,
                                     process=process,
                                     target_table=None if is_clause else target_table,
-                                    sub_target_schema=None if is_clause else target.schema,
-                                    sub_target_table=None if is_clause else target.table,
+                                    sub_target_schema=target.schema,
+                                    sub_target_table=target.table,
                                     target_column=None if is_clause else record.target_column,
                                     source_schema=record.source_schema,
                                     source_table=record.source_table,
