@@ -217,10 +217,11 @@ class MetadataResolver:
         for table_ref in candidates:
             if table_ref.is_cte or table_ref.is_subquery or not table_ref.table:
                 continue
-            schema = table_ref.schema
-            if normalizer.is_placeholder(schema) or normalizer.is_placeholder(table_ref.table):
+            if normalizer.is_placeholder(table_ref.table):
                 continue
-            if self._column_exists(schema, table_ref.table, column):
+            schema = table_ref.schema
+            schema_lookup = None if normalizer.is_placeholder(schema) else schema
+            if self._column_exists(schema_lookup, table_ref.table, column):
                 matches.append(table_ref)
         return matches
 
@@ -527,6 +528,21 @@ class SQLColumnParser:
         if query is None or id(query) in visited:
             return
         visited.add(id(query))
+
+        if isinstance(query, exp.With):
+            main_query = query.this
+            if isinstance(main_query, exp.Select) and main_query.args.get("with") is None:
+                main_query.set("with", query)
+            self._extract_query_records_recursive(
+                main_query,
+                normalizer,
+                target_columns_override,
+                visited,
+                include_select,
+                in_cte,
+                records,
+            )
+            return
 
         if isinstance(query, exp.Subquery):
             self._extract_query_records_recursive(
@@ -1218,11 +1234,7 @@ class LineageBuilder:
                             record.sql_process in {"join", "where", "having"}
                             or (record.sql_process or "").endswith("-with")
                         )
-                        targets = (
-                            [TargetTable(schema=None, table=None)]
-                            if is_clause
-                            else result.targets
-                        )
+                        targets = result.targets or [TargetTable(schema=None, table=None)]
                         for target in targets:
                             rows.append(
                                 ColumnLineageRow(
