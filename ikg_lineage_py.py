@@ -80,6 +80,7 @@ class ResolvedColumn:
     schema: Optional[str]
     table: Optional[str]
     column: Optional[str]
+    logic: Optional[str] = None
 
 
 @dataclass
@@ -647,17 +648,7 @@ class SQLColumnParser:
                 projection, target_columns_override, index
             )
             logic = normalizer.restore(projection.sql(dialect="postgres"))
-            column_ref: Optional[exp.Column] = None
-            if isinstance(projection, exp.Column):
-                column_ref = projection
-            elif isinstance(projection, exp.Alias) and isinstance(
-                projection.this, exp.Column
-            ):
-                column_ref = projection.this
-            if column_ref is not None:
-                cte_logic = self._resolve_column_logic(column_ref, context)
-                if cte_logic:
-                    logic = cte_logic
+            
             sources = self._resolve_expression_sources(
                 projection, query, context, normalizer
             )
@@ -674,13 +665,14 @@ class SQLColumnParser:
                 )
             else:
                 for resolved in sources:
+                    source_logic = resolved.logic if resolved.logic else logic
                     records.append(
                         ColumnRecord(
                             target_column=target_column,
                             source_schema=normalizer.restore_identifier(resolved.schema),
                             source_table=normalizer.restore_identifier(resolved.table),
                             source_column=normalizer.restore_identifier(resolved.column),
-                            logic=logic,
+                            logic=source_logic,
                             sql_process="select",
                         )
                     )
@@ -764,13 +756,14 @@ class SQLColumnParser:
             target_column = (
                 normalizer.restore_identifier(resolved.column) if include_target else None
             )
+            source_logic = resolved.logic if resolved.logic else logic
             records.append(
                 ColumnRecord(
                     target_column=target_column,
                     source_schema=normalizer.restore_identifier(resolved.schema),
                     source_table=normalizer.restore_identifier(resolved.table),
                     source_column=normalizer.restore_identifier(resolved.column),
-                    logic=logic,
+                    logic=source_logic,
                     sql_process=sql_process,
                 )
             )
@@ -816,10 +809,11 @@ class SQLColumnParser:
             output_map = self._build_output_map(subquery.this, normalizer)
             for resolved_list in output_map.values():
                 sources.extend(resolved_list)
-        unique: Dict[Tuple[Optional[str], Optional[str], Optional[str]], ResolvedColumn] = {}
+        unique: Dict[Tuple[Optional[str], Optional[str], Optional[str], Optional[str]], ResolvedColumn] = {}
         for source in sources:
-            key = (source.schema, source.table, source.column)
-            unique[key] = source
+            key = (source.schema, source.table, source.column, source.logic)
+            if key not in unique:
+                unique[key] = source
         return list(unique.values())
 
     def _resolve_column(
@@ -846,6 +840,7 @@ class SQLColumnParser:
                         schema=table_ref.schema,
                         table=table_ref.table,
                         column=column_name,
+                        logic=None,
                     )
                 ]
             cte_map = context.cte_maps.get(table_key)
@@ -860,12 +855,13 @@ class SQLColumnParser:
                         schema=schema_part or None,
                         table=table_part or None,
                         column=column_name,
+                        logic=None,
                     )
                 ]
-            return [ResolvedColumn(schema=None, table=column.table, column=column_name)]
+            return [ResolvedColumn(schema=None, table=column.table, column=column_name, logic=None)]
         if len(context.base_tables) == 1:
             base = context.base_tables[0]
-            return [ResolvedColumn(schema=base.schema, table=base.table, column=column_name)]
+            return [ResolvedColumn(schema=base.schema, table=base.table, column=column_name, logic=None)]
 
         cte_matches = self._resolve_cte_subquery_column(context, column_name)
         if cte_matches:
@@ -880,13 +876,14 @@ class SQLColumnParser:
                     schema=ref.schema,
                     table=ref.table,
                     column=column_name,
+                    logic=None,
                 )
                 for ref in candidates
             ]
 
         if context.base_tables:
             return [
-                ResolvedColumn(schema=ref.schema, table=ref.table, column=column_name)
+                ResolvedColumn(schema=ref.schema, table=ref.table, column=column_name, logic=None)
                 for ref in context.base_tables
             ]
         cte_fallback = self._resolve_cte_sources(context, column_name)
@@ -904,11 +901,11 @@ class SQLColumnParser:
                 if ref.is_cte or ref.is_subquery:
                     continue
                 resolved.append(
-                    ResolvedColumn(schema=ref.schema, table=ref.table, column=column_name)
+                    ResolvedColumn(schema=ref.schema, table=ref.table, column=column_name, logic=None)
                 )
             if resolved:
                 return resolved
-        return [ResolvedColumn(schema=None, table=None, column=column_name)]
+        return [ResolvedColumn(schema=None, table=None, column=column_name, logic=None)]
 
     def _resolve_cte_column(
         self,
@@ -918,36 +915,31 @@ class SQLColumnParser:
         normalizer: TemplateNormalizer,
     ) -> List[ResolvedColumn]:
         if not table_ref.table:
-            return [ResolvedColumn(schema=None, table=None, column=column_name)]
+            return [ResolvedColumn(schema=None, table=None, column=column_name, logic=None)]
         
         cte_key = self._normalize_key(table_ref.table)
         if not cte_key or cte_key not in context.cte_maps:
-            return [ResolvedColumn(schema=None, table=None, column=column_name)]
+            return [ResolvedColumn(schema=None, table=None, column=column_name, logic=None)]
         
         cte_column_map = context.cte_maps[cte_key]
         column_key = column_name.lower()
         
         if column_key in cte_column_map:
             resolved_sources = cte_column_map[column_key]
-            result = []
-            for source in resolved_sources:
-                if source.table:
-                    result.append(source)
-            if result:
-                return result
+            return resolved_sources
         
         wildcard_sources = cte_column_map.get("*", [])
         if wildcard_sources:
             result = []
             for source in wildcard_sources:
-                if source.table:
-                    result.append(
-                        ResolvedColumn(
-                            schema=source.schema,
-                            table=source.table,
-                            column=column_name,
-                        )
+                result.append(
+                    ResolvedColumn(
+                        schema=source.schema,
+                        table=source.table,
+                        column=column_name,
+                        logic=source.logic,
                     )
+                )
             if result:
                 return result
         
@@ -960,12 +952,13 @@ class SQLColumnParser:
                             schema=ref.schema,
                             table=ref.table,
                             column=column_name,
+                            logic=None,
                         )
                     )
             if result:
                 return result
         
-        return [ResolvedColumn(schema=None, table=None, column=column_name)]
+        return [ResolvedColumn(schema=None, table=None, column=column_name, logic=None)]
 
     def _resolve_subquery_column(
         self,
@@ -982,7 +975,7 @@ class SQLColumnParser:
             )
             if wildcard_sources:
                 return wildcard_sources
-        return [ResolvedColumn(schema=None, table=None, column=column_name)]
+        return [ResolvedColumn(schema=None, table=None, column=column_name, logic=None)]
 
     def _resolve_cte_subquery_column(
         self, context: QueryContext, column_name: str
@@ -1019,6 +1012,7 @@ class SQLColumnParser:
                     schema=source.schema,
                     table=source.table,
                     column=column_name,
+                    logic=source.logic,
                 )
             )
         return resolved
@@ -1041,6 +1035,7 @@ class SQLColumnParser:
                         schema=ref.schema,
                         table=ref.table,
                         column=column_name,
+                        logic=None,
                     )
                 )
         return resolved
@@ -1251,8 +1246,7 @@ class SQLColumnParser:
             key = output[0].lower()
             output_map.setdefault(key, [])
             for source in output[1]:
-                if source.table:
-                    output_map[key].append(source)
+                output_map[key].append(source)
             if output[2] and key not in logic_map:
                 logic_map[key] = output[2]
         return output_map, logic_map
@@ -1295,7 +1289,7 @@ class SQLColumnParser:
                 ):
                     star_logic = star_output.logic
                     outputs.append((star_output.target_column or "", [ResolvedColumn(
-                        star_output.source_schema, star_output.source_table, star_output.source_column
+                        star_output.source_schema, star_output.source_table, star_output.source_column, star_logic
                     )], star_logic))
                 continue
             target_name = self._output_column_name(projection, None, index)
@@ -1303,7 +1297,18 @@ class SQLColumnParser:
                 projection, query, context, normalizer
             )
             logic = normalizer.restore(projection.sql(dialect="postgres"))
-            outputs.append((target_name or "", sources, logic))
+            
+            result_sources: List[ResolvedColumn] = []
+            for src in sources:
+                result_sources.append(
+                    ResolvedColumn(
+                        schema=src.schema,
+                        table=src.table,
+                        column=src.column,
+                        logic=logic,
+                    )
+                )
+            outputs.append((target_name or "", result_sources, logic))
         return outputs
 
     def _output_column_name(
@@ -1376,7 +1381,7 @@ class SQLColumnParser:
                                 source_schema=normalizer.restore_identifier(resolved.schema),
                                 source_table=normalizer.restore_identifier(resolved.table),
                                 source_column=normalizer.restore_identifier(resolved.column),
-                                logic=normalizer.restore(projection_sql),
+                                logic=resolved.logic if resolved.logic else normalizer.restore(projection_sql),
                                 sql_process="select",
                             )
                         )
