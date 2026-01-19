@@ -798,6 +798,30 @@ class SQLColumnParser:
         if column.table:
             table_ref = context.table_refs.get(column.table.lower())
             if table_ref:
+                if table_ref.is_cte and table_ref.table:
+                    mapped = self._resolve_table_ref_column(
+                        table_ref, column_name, normalizer
+                    )
+                    if mapped:
+                        return mapped
+                    cte_sources = context.cte_sources.get(table_ref.table.lower())
+                    if cte_sources:
+                        return [
+                            ResolvedColumn(
+                                schema=ref.schema,
+                                table=ref.table,
+                                column=column_name,
+                            )
+                            for ref in cte_sources
+                            if ref.table
+                        ]
+                    return [
+                        ResolvedColumn(
+                            schema=table_ref.schema,
+                            table=table_ref.table,
+                            column=column_name,
+                        )
+                    ]
                 return self._resolve_table_ref_column(
                     table_ref, column_name, normalizer
                 )
@@ -883,7 +907,7 @@ class SQLColumnParser:
                 mapped = table_ref.columns.get(column_name.lower())
                 if mapped:
                     return mapped
-            return [ResolvedColumn(schema=None, table=table_ref.table, column=column_name)]
+            return []
         return [ResolvedColumn(schema=table_ref.schema, table=table_ref.table, column=column_name)]
 
     def _build_context(
@@ -895,6 +919,7 @@ class SQLColumnParser:
         if visited is None:
             visited = set()
         cte_maps: Dict[str, Dict[str, List[ResolvedColumn]]] = {}
+        cte_sources: Dict[str, List[TableRef]] = {}
         with_clause = query.args.get("with")
         if with_clause is not None:
             for cte in with_clause.expressions:
@@ -903,6 +928,7 @@ class SQLColumnParser:
                     continue
                 output_map = self._build_output_map(cte.this, normalizer, visited)
                 cte_maps[cte_name] = output_map
+                cte_sources[cte_name] = self._collect_cte_sources(cte.this, normalizer)
 
         table_refs: Dict[str, TableRef] = {}
         base_tables: List[TableRef] = []
@@ -920,7 +946,53 @@ class SQLColumnParser:
             table_refs=table_refs,
             base_tables=base_tables,
             cte_maps=cte_maps,
+            cte_sources=cte_sources,
         )
+
+    def _collect_cte_sources(
+        self, query: exp.Expression, normalizer: TemplateNormalizer
+    ) -> List[TableRef]:
+        sources: List[TableRef] = []
+        seen: Set[Tuple[Optional[str], Optional[str]]] = set()
+
+        def collect_from_select(select_expr: exp.Select) -> None:
+            with_clause = select_expr.args.get("with")
+            cte_names = {
+                (cte.alias_or_name or "").lower()
+                for cte in (with_clause.expressions if with_clause else [])
+            }
+            for source in self._iter_source_expressions(select_expr):
+                if isinstance(source, exp.Table):
+                    table_name = source.name
+                    if not table_name:
+                        continue
+                    if table_name.lower() in cte_names and not source.db:
+                        continue
+                    schema = normalizer.restore_identifier(source.db)
+                    table = normalizer.restore_identifier(table_name)
+                    key = (schema, table)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    sources.append(
+                        TableRef(schema=schema, table=table, alias=source.alias_or_name)
+                    )
+                elif isinstance(source, exp.Subquery):
+                    collect_from_expr(source.this)
+
+        def collect_from_expr(expr: exp.Expression) -> None:
+            if isinstance(expr, exp.Subquery):
+                collect_from_expr(expr.this)
+                return
+            if isinstance(expr, exp.SetOperation):
+                collect_from_expr(expr.this)
+                collect_from_expr(expr.expression)
+                return
+            if isinstance(expr, exp.Select):
+                collect_from_select(expr)
+
+        collect_from_expr(query)
+        return sources
 
     def _iter_source_expressions(self, query: exp.Select) -> Iterable[exp.Expression]:
         from_clause = query.args.get("from")
@@ -1237,6 +1309,7 @@ class QueryContext:
     table_refs: Dict[str, TableRef]
     base_tables: List[TableRef]
     cte_maps: Dict[str, Dict[str, List[ResolvedColumn]]]
+    cte_sources: Dict[str, List[TableRef]]
 
 
 class LineageBuilder:
