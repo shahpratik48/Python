@@ -90,6 +90,7 @@ class TableRef:
     is_cte: bool = False
     is_subquery: bool = False
     columns: Optional[Dict[str, List[ResolvedColumn]]] = None
+    column_logics: Optional[Dict[str, str]] = None
 
     def keys(self) -> List[str]:
         keys: List[str] = []
@@ -624,6 +625,17 @@ class SQLColumnParser:
                 projection, target_columns_override, index
             )
             logic = normalizer.restore(projection.sql(dialect="postgres"))
+            column_ref: Optional[exp.Column] = None
+            if isinstance(projection, exp.Column):
+                column_ref = projection
+            elif isinstance(projection, exp.Alias) and isinstance(
+                projection.this, exp.Column
+            ):
+                column_ref = projection.this
+            if column_ref is not None:
+                cte_logic = self._resolve_column_logic(column_ref, context)
+                if cte_logic:
+                    logic = cte_logic
             sources = self._resolve_expression_sources(
                 projection, query, context, normalizer
             )
@@ -961,6 +973,37 @@ class SQLColumnParser:
                 )
         return resolved
 
+    def _resolve_column_logic(
+        self, column: exp.Column, context: "QueryContext"
+    ) -> Optional[str]:
+        column_name = column.name
+        if column.table:
+            table_ref = context.table_refs.get(column.table.lower())
+            if table_ref and (table_ref.is_cte or table_ref.is_subquery):
+                if table_ref.column_logics:
+                    return table_ref.column_logics.get(column_name.lower())
+            cte_logic = context.cte_logics.get(column.table.lower())
+            if cte_logic:
+                return cte_logic.get(column_name.lower())
+            return None
+
+        matches: List[str] = []
+        seen: Set[int] = set()
+        for table_ref in context.table_refs.values():
+            if id(table_ref) in seen:
+                continue
+            seen.add(id(table_ref))
+            if not (table_ref.is_cte or table_ref.is_subquery):
+                continue
+            if not table_ref.column_logics:
+                continue
+            logic = table_ref.column_logics.get(column_name.lower())
+            if logic:
+                matches.append(logic)
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
     def _build_context(
         self,
         query: exp.Select,
@@ -971,21 +1014,25 @@ class SQLColumnParser:
             visited = set()
         cte_maps: Dict[str, Dict[str, List[ResolvedColumn]]] = {}
         cte_sources: Dict[str, List[TableRef]] = {}
+        cte_logics: Dict[str, Dict[str, str]] = {}
         with_clause = query.args.get("with")
         if with_clause is not None:
             for cte in with_clause.expressions:
                 cte_name = (cte.alias_or_name or "").lower()
                 if not cte_name:
                     continue
-                output_map = self._build_output_map(cte.this, normalizer, visited)
+                output_map, output_logics = self._build_output_details(
+                    cte.this, normalizer, visited
+                )
                 cte_maps[cte_name] = output_map
+                cte_logics[cte_name] = output_logics
                 cte_sources[cte_name] = self._collect_cte_sources(cte.this, normalizer)
 
         table_refs: Dict[str, TableRef] = {}
         base_tables: List[TableRef] = []
         for source in self._iter_source_expressions(query):
             table_ref = self._table_ref_from_expression(
-                source, normalizer, cte_maps, visited
+                source, normalizer, cte_maps, cte_logics, visited
             )
             if table_ref is None:
                 continue
@@ -998,6 +1045,7 @@ class SQLColumnParser:
             base_tables=base_tables,
             cte_maps=cte_maps,
             cte_sources=cte_sources,
+            cte_logics=cte_logics,
         )
 
     def _collect_cte_sources(
@@ -1062,6 +1110,7 @@ class SQLColumnParser:
         expr: exp.Expression,
         normalizer: TemplateNormalizer,
         cte_maps: Dict[str, Dict[str, List[ResolvedColumn]]],
+        cte_logics: Dict[str, Dict[str, str]],
         visited: Optional[Set[int]] = None,
     ) -> Optional[TableRef]:
         if isinstance(expr, exp.Table):
@@ -1070,33 +1119,67 @@ class SQLColumnParser:
             alias = expr.alias_or_name
             is_cte = table.lower() in cte_maps if table else False
             columns = cte_maps.get(table.lower()) if is_cte and table else None
+            column_logics = cte_logics.get(table.lower()) if is_cte and table else None
             return TableRef(
                 schema=schema,
                 table=table,
                 alias=alias,
                 is_cte=is_cte,
                 columns=columns,
+                column_logics=column_logics,
             )
         if isinstance(expr, exp.Subquery):
             alias = expr.alias_or_name
-            output_map = self._build_output_map(expr.this, normalizer, visited)
+            output_map, output_logics = self._build_output_details(
+                expr.this, normalizer, visited
+            )
             return TableRef(
                 schema=None,
                 table=alias,
                 alias=alias,
                 is_subquery=True,
                 columns=output_map,
+                column_logics=output_logics,
             )
         if isinstance(expr, exp.Select):
-            output_map = self._build_output_map(expr, normalizer, visited)
+            output_map, output_logics = self._build_output_details(
+                expr, normalizer, visited
+            )
             return TableRef(
                 schema=None,
                 table=None,
                 alias=None,
                 is_subquery=True,
                 columns=output_map,
+                column_logics=output_logics,
             )
         return None
+
+    def _build_output_details(
+        self,
+        query: exp.Expression,
+        normalizer: TemplateNormalizer,
+        visited: Optional[Set[int]] = None,
+    ) -> Tuple[Dict[str, List[ResolvedColumn]], Dict[str, str]]:
+        if query is None:
+            return {}, {}
+        if visited is None:
+            visited = set()
+        if id(query) in visited:
+            return {}, {}
+        visited.add(id(query))
+        output_list = self._build_output_list(query, normalizer, visited)
+        output_map: Dict[str, List[ResolvedColumn]] = {}
+        logic_map: Dict[str, str] = {}
+        for output in output_list:
+            if not output[0]:
+                continue
+            key = output[0].lower()
+            output_map.setdefault(key, [])
+            output_map[key].extend(output[1])
+            if output[2] and key not in logic_map:
+                logic_map[key] = output[2]
+        return output_map, logic_map
 
     def _build_output_map(
         self,
@@ -1104,21 +1187,7 @@ class SQLColumnParser:
         normalizer: TemplateNormalizer,
         visited: Optional[Set[int]] = None,
     ) -> Dict[str, List[ResolvedColumn]]:
-        if query is None:
-            return {}
-        if visited is None:
-            visited = set()
-        if id(query) in visited:
-            return {}
-        visited.add(id(query))
-        output_list = self._build_output_list(query, normalizer, visited)
-        output_map: Dict[str, List[ResolvedColumn]] = {}
-        for output in output_list:
-            if not output[0]:
-                continue
-            output_map.setdefault(output[0].lower(), [])
-            for resolved in output[1]:
-                output_map[output[0].lower()].append(resolved)
+        output_map, _ = self._build_output_details(query, normalizer, visited)
         return output_map
 
     def _build_output_list(
@@ -1126,36 +1195,39 @@ class SQLColumnParser:
         query: exp.Expression,
         normalizer: TemplateNormalizer,
         visited: Set[int],
-    ) -> List[Tuple[str, List[ResolvedColumn]]]:
+    ) -> List[Tuple[str, List[ResolvedColumn], Optional[str]]]:
         if isinstance(query, exp.Subquery):
             return self._build_output_list(query.this, normalizer, visited)
         if isinstance(query, exp.SetOperation):
             left_outputs = self._build_output_list(query.this, normalizer, visited)
             right_outputs = self._build_output_list(query.expression, normalizer, visited)
-            combined: List[Tuple[str, List[ResolvedColumn]]] = []
+            combined: List[Tuple[str, List[ResolvedColumn], Optional[str]]] = []
             for idx, left in enumerate(left_outputs):
                 right_sources = right_outputs[idx][1] if idx < len(right_outputs) else []
-                combined.append((left[0], left[1] + right_sources))
+                right_logic = right_outputs[idx][2] if idx < len(right_outputs) else None
+                combined.append((left[0], left[1] + right_sources, left[2] or right_logic))
             return combined
         if not isinstance(query, exp.Select):
             return []
 
         context = self._build_context(query, normalizer, visited)
-        outputs: List[Tuple[str, List[ResolvedColumn]]] = []
+        outputs: List[Tuple[str, List[ResolvedColumn], Optional[str]]] = []
         for index, projection in enumerate(query.expressions):
             if self._is_star_projection(projection):
                 for star_output in self._expand_star_projection(
                     projection, context, normalizer, map_only=True
                 ):
+                    star_logic = star_output.logic
                     outputs.append((star_output.target_column or "", [ResolvedColumn(
                         star_output.source_schema, star_output.source_table, star_output.source_column
-                    )]))
+                    )], star_logic))
                 continue
             target_name = self._output_column_name(projection, None, index)
             sources = self._resolve_expression_sources(
                 projection, query, context, normalizer
             )
-            outputs.append((target_name or "", sources))
+            logic = normalizer.restore(projection.sql(dialect="postgres"))
+            outputs.append((target_name or "", sources, logic))
         return outputs
 
     def _output_column_name(
@@ -1361,6 +1433,7 @@ class QueryContext:
     base_tables: List[TableRef]
     cte_maps: Dict[str, Dict[str, List[ResolvedColumn]]]
     cte_sources: Dict[str, List[TableRef]]
+    cte_logics: Dict[str, Dict[str, str]]
 
 
 class LineageBuilder:
