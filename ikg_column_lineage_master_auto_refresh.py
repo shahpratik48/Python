@@ -93,11 +93,18 @@ class TableRef:
     column_logics: Optional[Dict[str, str]] = None
 
     def keys(self) -> List[str]:
+        def normalize(value: Optional[str]) -> Optional[str]:
+            if not value:
+                return None
+            return value.strip('"').lower()
+
         keys: List[str] = []
-        if self.alias:
-            keys.append(self.alias.lower())
-        if self.table:
-            keys.append(self.table.lower())
+        alias_key = normalize(self.alias)
+        if alias_key:
+            keys.append(alias_key)
+        table_key = normalize(self.table)
+        if table_key:
+            keys.append(table_key)
         return keys
 
 
@@ -289,6 +296,12 @@ class MetadataResolver:
 class SQLColumnParser:
     def __init__(self, metadata_resolver: MetadataResolver) -> None:
         self._metadata_resolver = metadata_resolver
+
+    @staticmethod
+    def _normalize_key(value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        return value.strip('"').lower()
 
     def extract_records(self, sql_text: str) -> List[StatementLineage]:
         cleaned = self._remove_sql_comments(sql_text)
@@ -807,8 +820,9 @@ class SQLColumnParser:
         normalizer: TemplateNormalizer,
     ) -> List[ResolvedColumn]:
         column_name = column.name
-        if column.table:
-            table_ref = context.table_refs.get(column.table.lower())
+        table_key = self._normalize_key(column.table)
+        if table_key:
+            table_ref = context.table_refs.get(table_key)
             if table_ref:
                 if table_ref.is_cte and table_ref.table:
                     mapped = self._resolve_table_ref_column(
@@ -816,7 +830,9 @@ class SQLColumnParser:
                     )
                     if mapped:
                         return mapped
-                    cte_sources = context.cte_sources.get(table_ref.table.lower())
+                    cte_sources = context.cte_sources.get(
+                        self._normalize_key(table_ref.table) or ""
+                    )
                     if cte_sources:
                         return [
                             ResolvedColumn(
@@ -831,7 +847,7 @@ class SQLColumnParser:
                 return self._resolve_table_ref_column(
                     table_ref, column_name, normalizer
                 )
-            cte_map = context.cte_maps.get(column.table.lower())
+            cte_map = context.cte_maps.get(table_key)
             if cte_map:
                 mapped = cte_map.get(column_name.lower())
                 if mapped:
@@ -977,12 +993,13 @@ class SQLColumnParser:
         self, column: exp.Column, context: "QueryContext"
     ) -> Optional[str]:
         column_name = column.name
-        if column.table:
-            table_ref = context.table_refs.get(column.table.lower())
+        table_key = self._normalize_key(column.table)
+        if table_key:
+            table_ref = context.table_refs.get(table_key)
             if table_ref and (table_ref.is_cte or table_ref.is_subquery):
                 if table_ref.column_logics:
                     return table_ref.column_logics.get(column_name.lower())
-            cte_logic = context.cte_logics.get(column.table.lower())
+            cte_logic = context.cte_logics.get(table_key)
             if cte_logic:
                 return cte_logic.get(column_name.lower())
             return None
@@ -1018,7 +1035,7 @@ class SQLColumnParser:
         with_clause = query.args.get("with")
         if with_clause is not None:
             for cte in with_clause.expressions:
-                cte_name = (cte.alias_or_name or "").lower()
+                cte_name = self._normalize_key(cte.alias_or_name or "")
                 if not cte_name:
                     continue
                 output_map, output_logics = self._build_output_details(
@@ -1117,9 +1134,10 @@ class SQLColumnParser:
             schema = expr.db
             table = expr.name
             alias = expr.alias_or_name
-            is_cte = table.lower() in cte_maps if table else False
-            columns = cte_maps.get(table.lower()) if is_cte and table else None
-            column_logics = cte_logics.get(table.lower()) if is_cte and table else None
+            table_key = self._normalize_key(table)
+            is_cte = table_key in cte_maps if table_key else False
+            columns = cte_maps.get(table_key) if is_cte and table_key else None
+            column_logics = cte_logics.get(table_key) if is_cte and table_key else None
             return TableRef(
                 schema=schema,
                 table=table,
