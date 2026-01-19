@@ -117,13 +117,11 @@ class StatementLineage:
 
 
 def derive_process(file_path: str) -> str:
-    parts = Path(file_path).parts
-    prefix_len = len(SQL_PATH_PARTS)
-    if parts[:prefix_len] == SQL_PATH_PARTS:
-        rel_parts = parts[prefix_len:]
-        if len(rel_parts) > 1:
-            return rel_parts[-2]
-    return ""
+    parent = Path(file_path).parent
+    name = parent.name
+    if name in {"", "."}:
+        return ""
+    return name
 
 
 class TemplateNormalizer:
@@ -442,6 +440,11 @@ class SQLColumnParser:
     ) -> List[ColumnRecord]:
         target_columns_override = self._extract_insert_columns(statement)
         query = self._extract_statement_query(statement)
+        if isinstance(statement, exp.Create):
+            with_clause = statement.args.get("with")
+            if with_clause is not None and isinstance(query, exp.Select):
+                if query.args.get("with") is None:
+                    query.set("with", with_clause)
         if query is None:
             return self._extract_create_definition_records(statement, normalizer)
         return self._extract_query_records(query, normalizer, target_columns_override)
@@ -798,6 +801,20 @@ class SQLColumnParser:
                 return self._resolve_table_ref_column(
                     table_ref, column_name, normalizer
                 )
+            cte_map = context.cte_maps.get(column.table.lower())
+            if cte_map:
+                mapped = cte_map.get(column_name.lower())
+                if mapped:
+                    return mapped
+            if "." in column.table:
+                schema_part, table_part = column.table.split(".", 1)
+                return [
+                    ResolvedColumn(
+                        schema=schema_part or None,
+                        table=table_part or None,
+                        column=column_name,
+                    )
+                ]
             return [ResolvedColumn(schema=None, table=column.table, column=column_name)]
         if len(context.base_tables) == 1:
             base = context.base_tables[0]
@@ -832,10 +849,13 @@ class SQLColumnParser:
                 if id(ref) in seen:
                     continue
                 seen.add(id(ref))
+                if not ref.table:
+                    continue
                 resolved.append(
                     ResolvedColumn(schema=ref.schema, table=ref.table, column=column_name)
                 )
-            return resolved
+            if resolved:
+                return resolved
         return [ResolvedColumn(schema=None, table=None, column=column_name)]
 
     def _resolve_cte_subquery_column(
