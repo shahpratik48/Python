@@ -34,21 +34,7 @@ TARGET_READER = "erd_gpdb_prj_smart_insights_ro"
 GITLAB_TOKEN_ENV = "IKG_GITLAB_TOKEN"
 DB_PASSWORD_ENV = "IKG_DB_PASSWORD"
 SQL_PATH_PARTS = Path(SQL_PATH).parts
-LINEAGE_COLUMNS = [
-    "filename",
-    "filepath",
-    "process",
-    "target_table",
-    "sub_target_schema",
-    "sub_target_table",
-    "target_column",
-    "source_schema",
-    "source_table",
-    "source_column",
-    "logic",
-    "sql_process",
-    "current_timestamp",
-]
+LINEAGE_COLUMNS = ["filename", "filepath", "process", "target_table", "sub_target_schema", "sub_target_table", "target_column", "source_schema", "source_table", "source_column", "logic", "sql_process", "current_timestamp"]
 
 
 @dataclass(frozen=True)
@@ -80,6 +66,7 @@ class ResolvedColumn:
     schema: Optional[str]
     table: Optional[str]
     column: Optional[str]
+    logic: Optional[str] = None
 
 
 @dataclass
@@ -97,7 +84,6 @@ class TableRef:
             if not value:
                 return None
             return value.strip('"').lower()
-
         keys: List[str] = []
         alias_key = normalize(self.alias)
         if alias_key:
@@ -124,14 +110,22 @@ class StatementLineage:
     records: List[ColumnRecord]
 
 
+@dataclass
+class QueryContext:
+    table_refs: Dict[str, TableRef]
+    base_tables: List[TableRef]
+    cte_maps: Dict[str, Dict[str, List[ResolvedColumn]]]
+    cte_sources: Dict[str, List[TableRef]]
+    cte_logics: Dict[str, Dict[str, str]]
+
+
 def derive_process(file_path: str) -> str:
     parent = Path(file_path).parent
     name = parent.name
     if name in {"", "."}:
         return ""
     return name
-
-
+	
 class TemplateNormalizer:
     TEMPLATE_PATTERN = re.compile(r"{{\s*([^{}]+?)\s*}}")
     ENV_PATTERN = re.compile(r"\$\{[^}]+\}")
@@ -178,9 +172,7 @@ class GitLabSQLFetcher:
         self._exclude_folders = {folder.lower() for folder in exclude_folders}
 
     def iter_sql_paths(self) -> Iterable[str]:
-        tree = self._project.repository_tree(
-            path=SQL_PATH, ref=BRANCH, recursive=True, all=True
-        )
+        tree = self._project.repository_tree(path=SQL_PATH, ref=BRANCH, recursive=True, all=True)
         for node in tree:
             if node.get("type") != "blob":
                 continue
@@ -213,12 +205,7 @@ class MetadataResolver:
             self._conn.close()
         self._conn = None
 
-    def resolve_candidates(
-        self,
-        column: str,
-        candidates: Sequence[TableRef],
-        normalizer: TemplateNormalizer,
-    ) -> List[TableRef]:
+    def resolve_candidates(self, column: str, candidates: Sequence[TableRef], normalizer: "TemplateNormalizer") -> List[TableRef]:
         if not column:
             return []
         matches: List[TableRef] = []
@@ -233,9 +220,7 @@ class MetadataResolver:
                 matches.append(table_ref)
         return matches
 
-    def column_exists(
-        self, schema: Optional[str], table: Optional[str], column: Optional[str]
-    ) -> bool:
+    def column_exists(self, schema: Optional[str], table: Optional[str], column: Optional[str]) -> bool:
         if not table or not column:
             return False
         return self._column_exists(schema, table, column)
@@ -255,31 +240,17 @@ class MetadataResolver:
         query: str
         params: Tuple
         if schema:
-            query = """
-                SELECT column_name
-                FROM information_schema.columns
-                WHERE table_schema = %s
-                  AND table_name = %s
-            """
+            query = "SELECT column_name FROM information_schema.columns WHERE table_schema = %s AND table_name = %s"
             params = (schema, table)
         else:
-            query = """
-                SELECT column_name
-                FROM information_schema.columns
-                WHERE table_name = %s
-            """
+            query = "SELECT column_name FROM information_schema.columns WHERE table_name = %s"
             params = (table,)
         try:
             with conn.cursor() as cursor:
                 cursor.execute(query, params)
                 return {row[0].lower() for row in cursor.fetchall()}
-        except Exception as exc:  # noqa: BLE001
-            logging.warning(
-                "Failed metadata lookup for %s.%s: %s",
-                schema,
-                table,
-                exc,
-            )
+        except Exception as exc:
+            logging.warning("Failed metadata lookup for %s.%s: %s", schema, table, exc)
             return set()
 
     def _connect(self) -> Optional[psycopg2.extensions.connection]:
@@ -288,7 +259,7 @@ class MetadataResolver:
         try:
             self._conn = psycopg2.connect(**self._db_config)
             return self._conn
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logging.warning("Metadata connection unavailable: %s", exc)
             return None
 
@@ -317,48 +288,18 @@ class SQLColumnParser:
             if not regex_targets:
                 regex_targets = [TargetTable(schema=None, table=None)]
             if not regex_records:
-                regex_records = [
-                    ColumnRecord(
-                        target_column=None,
-                        source_schema=None,
-                        source_table=None,
-                        source_column=None,
-                        logic=None,
-                        sql_process=None,
-                    )
-                ]
+                regex_records = [ColumnRecord(target_column=None, source_schema=None, source_table=None, source_column=None, logic=None, sql_process=None)]
             return [StatementLineage(targets=regex_targets, records=regex_records)]
         statement_results: List[StatementLineage] = []
         for statement in statements:
             statement_targets = self._extract_targets(statement)
-            restored_targets = [
-                TargetTable(
-                    schema=normalizer.restore_identifier(target.schema),
-                    table=normalizer.restore_identifier(target.table),
-                    is_temp=target.is_temp,
-                )
-                for target in statement_targets
-            ]
+            restored_targets = [TargetTable(schema=normalizer.restore_identifier(target.schema), table=normalizer.restore_identifier(target.table), is_temp=target.is_temp) for target in statement_targets]
             statement_records = self._extract_statement_records(statement, normalizer)
             if not restored_targets:
                 restored_targets = [TargetTable(schema=None, table=None)]
             if not statement_records:
-                statement_records = [
-                    ColumnRecord(
-                        target_column=None,
-                        source_schema=None,
-                        source_table=None,
-                        source_column=None,
-                        logic=None,
-                        sql_process=None,
-                    )
-                ]
-            statement_results.append(
-                StatementLineage(
-                    targets=restored_targets,
-                    records=self._deduplicate_records(statement_records),
-                )
-            )
+                statement_records = [ColumnRecord(target_column=None, source_schema=None, source_table=None, source_column=None, logic=None, sql_process=None)]
+            statement_results.append(StatementLineage(targets=restored_targets, records=self._deduplicate_records(statement_records)))
         return statement_results
 
     def _parse_sql(self, sql_text: str) -> List[exp.Expression]:
@@ -377,10 +318,7 @@ class SQLColumnParser:
         return no_inline
 
     def _strip_template_blocks(self, sql_text: str) -> str:
-        patterns = [
-            r"\{\#.*?\#\}",
-            r"\{\%.*?\%\}",
-        ]
+        patterns = [r"\{\#.*?\#\}", r"\{\%.*?\%\}"]
         cleaned = sql_text
         for pattern in patterns:
             cleaned = re.sub(pattern, " ", cleaned, flags=re.S)
@@ -388,28 +326,15 @@ class SQLColumnParser:
 
     def _strip_do_blocks(self, sql_text: str) -> Tuple[str, List[str]]:
         blocks: List[str] = []
-        pattern = re.compile(
-            r"do\s+\$\$(.*?)\$\$\s*(?:language\s+\w+)?\s*;",
-            flags=re.I | re.S,
-        )
-
+        pattern = re.compile(r"do\s+\$\$(.*?)\$\$\s*(?:language\s+\w+)?\s*;", flags=re.I | re.S)
         def repl(match: Match) -> str:
             blocks.append(match.group(1))
             return ""
-
         stripped = pattern.sub(repl, sql_text)
         return stripped, blocks
 
     def _strip_vendor_specific(self, sql_text: str) -> str:
-        patterns = [
-            r"\bdistributed\s+by\s*\([^;]+?\)",
-            r"\bdistributed\s+replicated",
-            r"\bon\s+commit\s+preserve\s+rows",
-            r"\bwith\s*\(.*?appendonly.*?\)",
-            r"\bencode\s*'.*?'",
-            r"\borganization\s*\([^)]*\)",
-            r"\bpartition\s+by\s+range\s+\([^)]*\)",
-        ]
+        patterns = [r"\bdistributed\s+by\s*\([^;]+?\)", r"\bdistributed\s+replicated", r"\bon\s+commit\s+preserve\s+rows", r"\bwith\s*\(.*?appendonly.*?\)", r"\bencode\s*'.*?'", r"\borganization\s*\([^)]*\)", r"\bpartition\s+by\s+range\s+\([^)]*\)"]
         cleaned = sql_text
         for pattern in patterns:
             cleaned = re.sub(pattern, "", cleaned, flags=re.I | re.S)
@@ -434,9 +359,7 @@ class SQLColumnParser:
                 targets.append(target)
         return targets
 
-    def _target_from_table(
-        self, table_expr: Optional[exp.Expression], statement: exp.Expression
-    ) -> Optional[TargetTable]:
+    def _target_from_table(self, table_expr: Optional[exp.Expression], statement: exp.Expression) -> Optional[TargetTable]:
         if isinstance(table_expr, exp.Table):
             schema = table_expr.db
             table = table_expr.name
@@ -449,9 +372,7 @@ class SQLColumnParser:
             return TargetTable(schema=None, table=table_expr.name, is_temp=False)
         return None
 
-    def _extract_statement_records(
-        self, statement: exp.Expression, normalizer: TemplateNormalizer
-    ) -> List[ColumnRecord]:
+    def _extract_statement_records(self, statement: exp.Expression, normalizer: TemplateNormalizer) -> List[ColumnRecord]:
         target_columns_override = self._extract_insert_columns(statement)
         query = self._extract_statement_query(statement)
         if isinstance(statement, exp.Create):
@@ -463,15 +384,9 @@ class SQLColumnParser:
             return self._extract_create_definition_records(statement, normalizer)
         return self._extract_query_records(query, normalizer, target_columns_override)
 
-    def _extract_statement_query(
-        self, statement: exp.Expression
-    ) -> Optional[exp.Expression]:
+    def _extract_statement_query(self, statement: exp.Expression) -> Optional[exp.Expression]:
         if isinstance(statement, exp.Create):
-            return (
-                statement.args.get("expression")
-                or statement.args.get("query")
-                or statement.args.get("select")
-            )
+            return statement.args.get("expression") or statement.args.get("query") or statement.args.get("select")
         if isinstance(statement, exp.Insert):
             return statement.args.get("expression")
         if isinstance(statement, exp.Select) and statement.args.get("into"):
@@ -485,65 +400,23 @@ class SQLColumnParser:
                 return list(columns)
         return None
 
-    def _extract_create_definition_records(
-        self, statement: exp.Expression, normalizer: TemplateNormalizer
-    ) -> List[ColumnRecord]:
+    def _extract_create_definition_records(self, statement: exp.Expression, normalizer: TemplateNormalizer) -> List[ColumnRecord]:
         records: List[ColumnRecord] = []
         if isinstance(statement, exp.Create):
             for coldef in statement.find_all(exp.ColumnDef):
                 target_column = coldef.name
-                records.append(
-                    ColumnRecord(
-                        target_column=target_column,
-                        source_schema=None,
-                        source_table=None,
-                        source_column=None,
-                        logic=normalizer.restore(coldef.sql(dialect="postgres")),
-                        sql_process="create",
-                    )
-                )
+                records.append(ColumnRecord(target_column=target_column, source_schema=None, source_table=None, source_column=None, logic=normalizer.restore(coldef.sql(dialect="postgres")), sql_process="create"))
         if not records:
-            records.append(
-                ColumnRecord(
-                    target_column=None,
-                    source_schema=None,
-                    source_table=None,
-                    source_column=None,
-                    logic=None,
-                    sql_process="create",
-                )
-            )
+            records.append(ColumnRecord(target_column=None, source_schema=None, source_table=None, source_column=None, logic=None, sql_process="create"))
         return records
 
-    def _extract_query_records(
-        self,
-        query: exp.Expression,
-        normalizer: TemplateNormalizer,
-        target_columns_override: Optional[List[exp.Expression]] = None,
-    ) -> List[ColumnRecord]:
+    def _extract_query_records(self, query: exp.Expression, normalizer: TemplateNormalizer, target_columns_override: Optional[List[exp.Expression]] = None) -> List[ColumnRecord]:
         visited: Set[int] = set()
         records: List[ColumnRecord] = []
-        self._extract_query_records_recursive(
-            query=query,
-            normalizer=normalizer,
-            target_columns_override=target_columns_override,
-            visited=visited,
-            include_select=True,
-            in_cte=False,
-            records=records,
-        )
+        self._extract_query_records_recursive(query=query, normalizer=normalizer, target_columns_override=target_columns_override, visited=visited, include_select=True, in_cte=False, records=records)
         return self._deduplicate_records(records)
-
-    def _extract_query_records_recursive(
-        self,
-        query: exp.Expression,
-        normalizer: TemplateNormalizer,
-        target_columns_override: Optional[List[exp.Expression]],
-        visited: Set[int],
-        include_select: bool,
-        in_cte: bool,
-        records: List[ColumnRecord],
-    ) -> None:
+		
+def _extract_query_records_recursive(self, query: exp.Expression, normalizer: TemplateNormalizer, target_columns_override: Optional[List[exp.Expression]], visited: Set[int], include_select: bool, in_cte: bool, records: List[ColumnRecord]) -> None:
         if query is None or id(query) in visited:
             return
         visited.add(id(query))
@@ -552,48 +425,16 @@ class SQLColumnParser:
             main_query = query.this
             if isinstance(main_query, exp.Select) and main_query.args.get("with") is None:
                 main_query.set("with", query)
-            self._extract_query_records_recursive(
-                main_query,
-                normalizer,
-                target_columns_override,
-                visited,
-                include_select,
-                in_cte,
-                records,
-            )
+            self._extract_query_records_recursive(main_query, normalizer, target_columns_override, visited, include_select, in_cte, records)
             return
 
         if isinstance(query, exp.Subquery):
-            self._extract_query_records_recursive(
-                query.this,
-                normalizer,
-                target_columns_override,
-                visited,
-                False,
-                in_cte,
-                records,
-            )
+            self._extract_query_records_recursive(query.this, normalizer, target_columns_override, visited, False, in_cte, records)
             return
 
         if isinstance(query, exp.SetOperation):
-            self._extract_query_records_recursive(
-                query.this,
-                normalizer,
-                target_columns_override,
-                visited,
-                include_select,
-                in_cte,
-                records,
-            )
-            self._extract_query_records_recursive(
-                query.expression,
-                normalizer,
-                target_columns_override,
-                visited,
-                include_select,
-                in_cte,
-                records,
-            )
+            self._extract_query_records_recursive(query.this, normalizer, target_columns_override, visited, include_select, in_cte, records)
+            self._extract_query_records_recursive(query.expression, normalizer, target_columns_override, visited, include_select, in_cte, records)
             return
 
         if not isinstance(query, exp.Select):
@@ -601,105 +442,42 @@ class SQLColumnParser:
 
         context = self._build_context(query, normalizer)
         if include_select:
-            select_records = self._extract_select_records(
-                query, context, normalizer, target_columns_override
-            )
+            select_records = self._extract_select_records(query, context, normalizer, target_columns_override)
             records.extend(select_records)
         records.extend(self._extract_clause_records(query, context, normalizer, in_cte))
 
         with_clause = query.args.get("with")
         if with_clause is not None:
             for cte in with_clause.expressions:
-                self._extract_query_records_recursive(
-                    cte.this, normalizer, None, visited, False, True, records
-                )
+                self._extract_query_records_recursive(cte.this, normalizer, None, visited, False, True, records)
 
         for subquery in query.find_all(exp.Subquery):
-            self._extract_query_records_recursive(
-                subquery.this, normalizer, None, visited, False, in_cte, records
-            )
+            self._extract_query_records_recursive(subquery.this, normalizer, None, visited, False, in_cte, records)
 
-    def _extract_select_records(
-        self,
-        query: exp.Select,
-        context: "QueryContext",
-        normalizer: TemplateNormalizer,
-        target_columns_override: Optional[List[exp.Expression]] = None,
-    ) -> List[ColumnRecord]:
+    def _extract_select_records(self, query: exp.Select, context: QueryContext, normalizer: TemplateNormalizer, target_columns_override: Optional[List[exp.Expression]] = None) -> List[ColumnRecord]:
         records: List[ColumnRecord] = []
         projections = list(query.expressions)
         for index, projection in enumerate(projections):
             if self._is_star_projection(projection):
-                records.extend(
-                    self._expand_star_projection(projection, context, normalizer)
-                )
+                records.extend(self._expand_star_projection(projection, context, normalizer))
                 continue
-            target_column = self._output_column_name(
-                projection, target_columns_override, index
-            )
-            logic = normalizer.restore(projection.sql(dialect="postgres"))
-            column_ref: Optional[exp.Column] = None
-            if isinstance(projection, exp.Column):
-                column_ref = projection
-            elif isinstance(projection, exp.Alias) and isinstance(
-                projection.this, exp.Column
-            ):
-                column_ref = projection.this
-            if column_ref is not None:
-                cte_logic = self._resolve_column_logic(column_ref, context)
-                if cte_logic:
-                    logic = cte_logic
-            sources = self._resolve_expression_sources(
-                projection, query, context, normalizer
-            )
+            target_column = self._output_column_name(projection, target_columns_override, index)
+            sources = self._resolve_expression_sources_to_base(projection, query, context, normalizer)
             if not sources:
-                records.append(
-                    ColumnRecord(
-                        target_column=target_column,
-                        source_schema=None,
-                        source_table=None,
-                        source_column=None,
-                        logic=logic,
-                        sql_process="select",
-                    )
-                )
+                logic = normalizer.restore(projection.sql(dialect="postgres"))
+                records.append(ColumnRecord(target_column=target_column, source_schema=None, source_table=None, source_column=None, logic=logic, sql_process="select"))
             else:
                 for resolved in sources:
-                    records.append(
-                        ColumnRecord(
-                            target_column=target_column,
-                            source_schema=normalizer.restore_identifier(resolved.schema),
-                            source_table=normalizer.restore_identifier(resolved.table),
-                            source_column=normalizer.restore_identifier(resolved.column),
-                            logic=logic,
-                            sql_process="select",
-                        )
-                    )
+                    records.append(ColumnRecord(target_column=target_column, source_schema=normalizer.restore_identifier(resolved.schema), source_table=normalizer.restore_identifier(resolved.table), source_column=normalizer.restore_identifier(resolved.column), logic=normalizer.restore(resolved.logic) if resolved.logic else normalizer.restore(projection.sql(dialect="postgres")), sql_process="select"))
         return records
 
-    def _extract_clause_records(
-        self,
-        query: exp.Select,
-        context: "QueryContext",
-        normalizer: TemplateNormalizer,
-        in_cte: bool,
-    ) -> List[ColumnRecord]:
+    def _extract_clause_records(self, query: exp.Select, context: QueryContext, normalizer: TemplateNormalizer, in_cte: bool) -> List[ColumnRecord]:
         records: List[ColumnRecord] = []
         suffix = "-with" if in_cte else ""
         where_clause = query.args.get("where")
         if where_clause is not None:
             where_logic = f"where {where_clause.this.sql(dialect='postgres')}"
-            records.extend(
-                self._records_for_expression(
-                    where_clause.this,
-                    query,
-                    context,
-                    normalizer,
-                    f"where{suffix}",
-                    include_target=True,
-                    logic_override=normalizer.restore(where_logic),
-                )
-            )
+            records.extend(self._records_for_expression(where_clause.this, query, context, normalizer, f"where{suffix}", include_target=True, logic_override=normalizer.restore(where_logic)))
 
         for join in query.args.get("joins") or []:
             on_clause = join.args.get("on")
@@ -707,73 +485,27 @@ class SQLColumnParser:
                 continue
             join_expression = on_clause or join.args.get("using")
             join_logic = self._join_logic(query, join, normalizer, in_cte)
-            records.extend(
-                self._records_for_expression(
-                    join_expression,
-                    query,
-                    context,
-                    normalizer,
-                    f"join{suffix}",
-                    include_target=True,
-                    logic_override=join_logic,
-                )
-            )
+            records.extend(self._records_for_expression(join_expression, query, context, normalizer, f"join{suffix}", include_target=True, logic_override=join_logic))
 
         having_clause = query.args.get("having")
         if having_clause is not None:
             having_logic = f"having {having_clause.this.sql(dialect='postgres')}"
-            records.extend(
-                self._records_for_expression(
-                    having_clause.this,
-                    query,
-                    context,
-                    normalizer,
-                    f"having{suffix}",
-                    include_target=True,
-                    logic_override=normalizer.restore(having_logic),
-                )
-            )
+            records.extend(self._records_for_expression(having_clause.this, query, context, normalizer, f"having{suffix}", include_target=True, logic_override=normalizer.restore(having_logic)))
 
         return records
 
-    def _records_for_expression(
-        self,
-        expression: exp.Expression,
-        query: exp.Select,
-        context: "QueryContext",
-        normalizer: TemplateNormalizer,
-        sql_process: str,
-        include_target: bool,
-        logic_override: Optional[str] = None,
-    ) -> List[ColumnRecord]:
+    def _records_for_expression(self, expression: exp.Expression, query: exp.Select, context: QueryContext, normalizer: TemplateNormalizer, sql_process: str, include_target: bool, logic_override: Optional[str] = None) -> List[ColumnRecord]:
         records: List[ColumnRecord] = []
         if expression is None:
             return records
-        logic = logic_override or normalizer.restore(expression.sql(dialect="postgres"))
-        sources = self._resolve_expression_sources(expression, query, context, normalizer)
+        sources = self._resolve_expression_sources_to_base(expression, query, context, normalizer)
         for resolved in sources:
-            target_column = (
-                normalizer.restore_identifier(resolved.column) if include_target else None
-            )
-            records.append(
-                ColumnRecord(
-                    target_column=target_column,
-                    source_schema=normalizer.restore_identifier(resolved.schema),
-                    source_table=normalizer.restore_identifier(resolved.table),
-                    source_column=normalizer.restore_identifier(resolved.column),
-                    logic=logic,
-                    sql_process=sql_process,
-                )
-            )
+            target_column = normalizer.restore_identifier(resolved.column) if include_target else None
+            source_logic = normalizer.restore(resolved.logic) if resolved.logic else (logic_override or normalizer.restore(expression.sql(dialect="postgres")))
+            records.append(ColumnRecord(target_column=target_column, source_schema=normalizer.restore_identifier(resolved.schema), source_table=normalizer.restore_identifier(resolved.table), source_column=normalizer.restore_identifier(resolved.column), logic=source_logic, sql_process=sql_process))
         return records
 
-    def _join_logic(
-        self,
-        query: exp.Select,
-        join: exp.Join,
-        normalizer: TemplateNormalizer,
-        in_cte: bool,
-    ) -> str:
+    def _join_logic(self, query: exp.Select, join: exp.Join, normalizer: TemplateNormalizer, in_cte: bool) -> str:
         on_clause = join.args.get("on")
         if in_cte:
             if on_clause is not None:
@@ -789,244 +521,48 @@ class SQLColumnParser:
         left_sql = left_expr.sql(dialect="postgres")
         return normalizer.restore(f"{left_sql} {join_sql}")
 
-    def _resolve_expression_sources(
-        self,
-        expression: exp.Expression,
-        query: exp.Select,
-        context: "QueryContext",
-        normalizer: TemplateNormalizer,
-    ) -> List[ResolvedColumn]:
-        sources: List[ResolvedColumn] = []
+    def _resolve_expression_sources_to_base(self, expression: exp.Expression, query: exp.Select, context: QueryContext, normalizer: TemplateNormalizer) -> List[ResolvedColumn]:
+        base_sources: List[ResolvedColumn] = []
         for column in expression.find_all(exp.Column):
             if self._is_in_subquery(column, query):
                 continue
-            sources.extend(self._resolve_column(column, context, normalizer))
+            column_name = column.name
+            table_key = self._normalize_key(column.table)
+            if table_key:
+                table_ref = context.table_refs.get(table_key)
+                if table_ref:
+                    if table_ref.is_cte or table_ref.is_subquery:
+                        if table_ref.columns and column_name.lower() in table_ref.columns:
+                            base_sources.extend(table_ref.columns[column_name.lower()])
+                        continue
+                    else:
+                        base_sources.append(ResolvedColumn(schema=table_ref.schema, table=table_ref.table, column=column_name, logic=None))
+                        continue
+            if len(context.base_tables) == 1:
+                base = context.base_tables[0]
+                base_sources.append(ResolvedColumn(schema=base.schema, table=base.table, column=column_name, logic=None))
+            elif context.base_tables:
+                candidates = self._metadata_resolver.resolve_candidates(column_name, context.base_tables, normalizer)
+                if candidates:
+                    for ref in candidates:
+                        base_sources.append(ResolvedColumn(schema=ref.schema, table=ref.table, column=column_name, logic=None))
+                else:
+                    for ref in context.base_tables:
+                        base_sources.append(ResolvedColumn(schema=ref.schema, table=ref.table, column=column_name, logic=None))
         for subquery in expression.find_all(exp.Subquery):
             if subquery.this is query:
                 continue
-            output_map = self._build_output_map(subquery.this, normalizer)
-            for resolved_list in output_map.values():
-                sources.extend(resolved_list)
+            subquery_map = self._build_cte_column_map(subquery.this, normalizer, set())
+            for resolved_list in subquery_map.values():
+                base_sources.extend(resolved_list)
         unique: Dict[Tuple[Optional[str], Optional[str], Optional[str]], ResolvedColumn] = {}
-        for source in sources:
-            key = (source.schema, source.table, source.column)
-            unique[key] = source
+        for src in base_sources:
+            key = (src.schema, src.table, src.column)
+            if key not in unique:
+                unique[key] = src
         return list(unique.values())
 
-    def _resolve_column(
-        self,
-        column: exp.Column,
-        context: "QueryContext",
-        normalizer: TemplateNormalizer,
-    ) -> List[ResolvedColumn]:
-        column_name = column.name
-        table_key = self._normalize_key(column.table)
-        if table_key:
-            table_ref = context.table_refs.get(table_key)
-            if table_ref:
-                if table_ref.is_cte and table_ref.table:
-                    mapped = self._resolve_table_ref_column(
-                        table_ref, column_name, normalizer
-                    )
-                    if mapped:
-                        return mapped
-                    cte_sources = context.cte_sources.get(
-                        self._normalize_key(table_ref.table) or ""
-                    )
-                    if cte_sources:
-                        return [
-                            ResolvedColumn(
-                                schema=ref.schema,
-                                table=ref.table,
-                                column=column_name,
-                            )
-                            for ref in cte_sources
-                            if ref.table
-                        ]
-                    return [ResolvedColumn(schema=None, table=None, column=column_name)]
-                return self._resolve_table_ref_column(
-                    table_ref, column_name, normalizer
-                )
-            cte_map = context.cte_maps.get(table_key)
-            if cte_map:
-                mapped = cte_map.get(column_name.lower())
-                if mapped:
-                    return mapped
-            if "." in column.table:
-                schema_part, table_part = column.table.split(".", 1)
-                return [
-                    ResolvedColumn(
-                        schema=schema_part or None,
-                        table=table_part or None,
-                        column=column_name,
-                    )
-                ]
-            return [ResolvedColumn(schema=None, table=column.table, column=column_name)]
-        if len(context.base_tables) == 1:
-            base = context.base_tables[0]
-            return [ResolvedColumn(schema=base.schema, table=base.table, column=column_name)]
-
-        cte_matches = self._resolve_cte_subquery_column(context, column_name)
-        if cte_matches:
-            return cte_matches
-
-        candidates = self._metadata_resolver.resolve_candidates(
-            column_name, context.base_tables, normalizer
-        )
-        if candidates:
-            return [
-                ResolvedColumn(
-                    schema=ref.schema,
-                    table=ref.table,
-                    column=column_name,
-                )
-                for ref in candidates
-            ]
-
-        if context.base_tables:
-            return [
-                ResolvedColumn(schema=ref.schema, table=ref.table, column=column_name)
-                for ref in context.base_tables
-            ]
-        cte_fallback = self._resolve_cte_sources(context, column_name)
-        if cte_fallback:
-            return cte_fallback
-        if context.table_refs:
-            seen: Set[int] = set()
-            resolved: List[ResolvedColumn] = []
-            for ref in context.table_refs.values():
-                if id(ref) in seen:
-                    continue
-                seen.add(id(ref))
-                if not ref.table:
-                    continue
-                if ref.is_cte or ref.is_subquery:
-                    continue
-                resolved.append(
-                    ResolvedColumn(schema=ref.schema, table=ref.table, column=column_name)
-                )
-            if resolved:
-                return resolved
-        return [ResolvedColumn(schema=None, table=None, column=column_name)]
-
-    def _resolve_cte_subquery_column(
-        self, context: "QueryContext", column_name: str
-    ) -> List[ResolvedColumn]:
-        matches: List[ResolvedColumn] = []
-        for table_ref in context.table_refs.values():
-            if not (table_ref.is_cte or table_ref.is_subquery):
-                continue
-            if not table_ref.columns:
-                continue
-            key = column_name.lower()
-            if key in table_ref.columns:
-                matches.extend(table_ref.columns[key])
-                continue
-            matches.extend(
-                self._resolve_wildcard_sources(table_ref.columns, column_name)
-            )
-        return matches
-
-    def _resolve_table_ref_column(
-        self,
-        table_ref: TableRef,
-        column_name: str,
-        normalizer: TemplateNormalizer,
-    ) -> List[ResolvedColumn]:
-        if table_ref.is_cte or table_ref.is_subquery:
-            if table_ref.columns:
-                mapped = table_ref.columns.get(column_name.lower())
-                if mapped:
-                    return mapped
-                wildcard_sources = self._resolve_wildcard_sources(
-                    table_ref.columns, column_name
-                )
-                if wildcard_sources:
-                    return wildcard_sources
-            return []
-        return [ResolvedColumn(schema=table_ref.schema, table=table_ref.table, column=column_name)]
-
-    def _resolve_wildcard_sources(
-        self,
-        column_map: Dict[str, List[ResolvedColumn]],
-        column_name: str,
-    ) -> List[ResolvedColumn]:
-        wildcard_sources = column_map.get("*")
-        if not wildcard_sources:
-            return []
-        resolved: List[ResolvedColumn] = []
-        for source in wildcard_sources:
-            if source.schema is None and source.table is None and source.column is None:
-                continue
-            resolved.append(
-                ResolvedColumn(
-                    schema=source.schema,
-                    table=source.table,
-                    column=column_name,
-                )
-            )
-        return resolved
-
-    def _resolve_cte_sources(
-        self, context: "QueryContext", column_name: str
-    ) -> List[ResolvedColumn]:
-        resolved: List[ResolvedColumn] = []
-        seen: Set[Tuple[Optional[str], Optional[str]]] = set()
-        for sources in context.cte_sources.values():
-            for ref in sources:
-                if not ref.table:
-                    continue
-                key = (ref.schema, ref.table)
-                if key in seen:
-                    continue
-                seen.add(key)
-                resolved.append(
-                    ResolvedColumn(
-                        schema=ref.schema,
-                        table=ref.table,
-                        column=column_name,
-                    )
-                )
-        return resolved
-
-    def _resolve_column_logic(
-        self, column: exp.Column, context: "QueryContext"
-    ) -> Optional[str]:
-        column_name = column.name
-        table_key = self._normalize_key(column.table)
-        if table_key:
-            table_ref = context.table_refs.get(table_key)
-            if table_ref and (table_ref.is_cte or table_ref.is_subquery):
-                if table_ref.column_logics:
-                    return table_ref.column_logics.get(column_name.lower())
-            cte_logic = context.cte_logics.get(table_key)
-            if cte_logic:
-                return cte_logic.get(column_name.lower())
-            return None
-
-        matches: List[str] = []
-        seen: Set[int] = set()
-        for table_ref in context.table_refs.values():
-            if id(table_ref) in seen:
-                continue
-            seen.add(id(table_ref))
-            if not (table_ref.is_cte or table_ref.is_subquery):
-                continue
-            if not table_ref.column_logics:
-                continue
-            logic = table_ref.column_logics.get(column_name.lower())
-            if logic:
-                matches.append(logic)
-        if len(matches) == 1:
-            return matches[0]
-        return None
-
-    def _build_context(
-        self,
-        query: exp.Select,
-        normalizer: TemplateNormalizer,
-        visited: Optional[Set[int]] = None,
-    ) -> "QueryContext":
+    def _build_context(self, query: exp.Select, normalizer: TemplateNormalizer, visited: Optional[Set[int]] = None) -> QueryContext:
         if visited is None:
             visited = set()
         cte_maps: Dict[str, Dict[str, List[ResolvedColumn]]] = {}
@@ -1038,45 +574,129 @@ class SQLColumnParser:
                 cte_name = self._normalize_key(cte.alias_or_name or "")
                 if not cte_name:
                     continue
-                output_map, output_logics = self._build_output_details(
-                    cte.this, normalizer, visited
-                )
-                cte_maps[cte_name] = output_map
-                cte_logics[cte_name] = output_logics
+                cte_column_map = self._build_cte_column_map(cte.this, normalizer, visited)
+                cte_maps[cte_name] = cte_column_map
                 cte_sources[cte_name] = self._collect_cte_sources(cte.this, normalizer)
-
         table_refs: Dict[str, TableRef] = {}
         base_tables: List[TableRef] = []
         for source in self._iter_source_expressions(query):
-            table_ref = self._table_ref_from_expression(
-                source, normalizer, cte_maps, cte_logics, visited
-            )
+            table_ref = self._table_ref_from_expression(source, normalizer, cte_maps, cte_logics, visited)
             if table_ref is None:
                 continue
             for key in table_ref.keys():
                 table_refs[key] = table_ref
             if not table_ref.is_cte and not table_ref.is_subquery:
                 base_tables.append(table_ref)
-        return QueryContext(
-            table_refs=table_refs,
-            base_tables=base_tables,
-            cte_maps=cte_maps,
-            cte_sources=cte_sources,
-            cte_logics=cte_logics,
-        )
+        return QueryContext(table_refs=table_refs, base_tables=base_tables, cte_maps=cte_maps, cte_sources=cte_sources, cte_logics=cte_logics)
 
-    def _collect_cte_sources(
-        self, query: exp.Expression, normalizer: TemplateNormalizer
-    ) -> List[TableRef]:
+    def _build_cte_column_map(self, cte_query: exp.Expression, normalizer: TemplateNormalizer, visited: Set[int]) -> Dict[str, List[ResolvedColumn]]:
+        if not isinstance(cte_query, exp.Select):
+            return {}
+        if id(cte_query) in visited:
+            return {}
+        visited.add(id(cte_query))
+        cte_context = self._build_context(cte_query, normalizer, visited)
+        column_map: Dict[str, List[ResolvedColumn]] = {}
+        for projection in cte_query.expressions:
+            if self._is_star_projection(projection):
+                star_sources = self._resolve_star_to_base_tables(projection, cte_context, normalizer)
+                for src_column_name, src_list in star_sources.items():
+                    column_map.setdefault(src_column_name, [])
+                    column_map[src_column_name].extend(src_list)
+                continue
+            output_col_name = self._output_column_name(projection, None, 0)
+            if not output_col_name:
+                continue
+            column_key = output_col_name.lower()
+            projection_logic = projection.sql(dialect="postgres")
+            base_sources = self._resolve_projection_to_base_tables(projection, cte_query, cte_context, normalizer)
+            column_map[column_key] = []
+            for base_src in base_sources:
+                column_map[column_key].append(ResolvedColumn(schema=base_src.schema, table=base_src.table, column=base_src.column, logic=projection_logic))
+        return column_map
+
+    def _resolve_projection_to_base_tables(self, projection: exp.Expression, query: exp.Select, context: QueryContext, normalizer: TemplateNormalizer) -> List[ResolvedColumn]:
+        base_sources: List[ResolvedColumn] = []
+        for column in projection.find_all(exp.Column):
+            if self._is_in_subquery(column, query):
+                continue
+            column_name = column.name
+            table_key = self._normalize_key(column.table)
+            if table_key:
+                table_ref = context.table_refs.get(table_key)
+                if table_ref:
+                    if table_ref.is_cte or table_ref.is_subquery:
+                        if table_ref.columns and column_name.lower() in table_ref.columns:
+                            base_sources.extend(table_ref.columns[column_name.lower()])
+                        continue
+                    else:
+                        base_sources.append(ResolvedColumn(schema=table_ref.schema, table=table_ref.table, column=column_name, logic=None))
+                        continue
+            if len(context.base_tables) == 1:
+                base = context.base_tables[0]
+                base_sources.append(ResolvedColumn(schema=base.schema, table=base.table, column=column_name, logic=None))
+            elif context.base_tables:
+                candidates = self._metadata_resolver.resolve_candidates(column_name, context.base_tables, normalizer)
+                if candidates:
+                    for ref in candidates:
+                        base_sources.append(ResolvedColumn(schema=ref.schema, table=ref.table, column=column_name, logic=None))
+                else:
+                    for ref in context.base_tables:
+                        base_sources.append(ResolvedColumn(schema=ref.schema, table=ref.table, column=column_name, logic=None))
+        unique: Dict[Tuple[Optional[str], Optional[str], Optional[str]], ResolvedColumn] = {}
+        for src in base_sources:
+            key = (src.schema, src.table, src.column)
+            if key not in unique:
+                unique[key] = src
+        return list(unique.values())
+
+    def _resolve_star_to_base_tables(self, projection: exp.Expression, context: QueryContext, normalizer: TemplateNormalizer) -> Dict[str, List[ResolvedColumn]]:
+        result: Dict[str, List[ResolvedColumn]] = {}
+        projection_sql = projection.sql(dialect="postgres")
+        qualifier = None
+        if "." in projection_sql:
+            qualifier = projection_sql.split(".", 1)[0].strip('"')
+        table_refs: List[TableRef] = []
+        if qualifier:
+            ref = context.table_refs.get(qualifier.lower())
+            if ref:
+                table_refs = [ref]
+        elif context.base_tables:
+            table_refs = context.base_tables
+        else:
+            seen_ids: Set[int] = set()
+            for ref in context.table_refs.values():
+                if id(ref) in seen_ids:
+                    continue
+                seen_ids.add(id(ref))
+                table_refs.append(ref)
+        for table_ref in table_refs:
+            if not table_ref.table:
+                continue
+            if table_ref.is_cte or table_ref.is_subquery:
+                if table_ref.columns:
+                    for col_name, resolved_list in table_ref.columns.items():
+                        if col_name == "*":
+                            continue
+                        result.setdefault(col_name, [])
+                        result[col_name].extend(resolved_list)
+                continue
+            columns = self._metadata_columns(table_ref, normalizer)
+            if columns:
+                for col_name in columns:
+                    result.setdefault(col_name.lower(), [])
+                    result[col_name.lower()].append(ResolvedColumn(schema=table_ref.schema, table=table_ref.table, column=col_name, logic=None))
+            else:
+                result.setdefault("*", [])
+                result["*"].append(ResolvedColumn(schema=table_ref.schema, table=table_ref.table, column="*", logic=None))
+        return result
+
+    def _collect_cte_sources(self, query: exp.Expression, normalizer: TemplateNormalizer) -> List[TableRef]:
         sources: List[TableRef] = []
         seen: Set[Tuple[Optional[str], Optional[str]]] = set()
-
         def collect_from_select(select_expr: exp.Select) -> None:
             with_clause = select_expr.args.get("with")
-            cte_names = {
-                (cte.alias_or_name or "").lower()
-                for cte in (with_clause.expressions if with_clause else [])
-            }
+            cte_names = {(cte.alias_or_name or "").lower() for cte in (with_clause.expressions if with_clause else [])}
             for source in self._iter_source_expressions(select_expr):
                 if isinstance(source, exp.Table):
                     table_name = source.name
@@ -1084,18 +704,15 @@ class SQLColumnParser:
                         continue
                     if table_name.lower() in cte_names and not source.db:
                         continue
-                    schema = normalizer.restore_identifier(source.db)
-                    table = normalizer.restore_identifier(table_name)
+                    schema = source.db
+                    table = table_name
                     key = (schema, table)
                     if key in seen:
                         continue
                     seen.add(key)
-                    sources.append(
-                        TableRef(schema=schema, table=table, alias=source.alias_or_name)
-                    )
+                    sources.append(TableRef(schema=schema, table=table, alias=source.alias_or_name))
                 elif isinstance(source, exp.Subquery):
                     collect_from_expr(source.this)
-
         def collect_from_expr(expr: exp.Expression) -> None:
             if isinstance(expr, exp.Subquery):
                 collect_from_expr(expr.this)
@@ -1106,7 +723,6 @@ class SQLColumnParser:
                 return
             if isinstance(expr, exp.Select):
                 collect_from_select(expr)
-
         collect_from_expr(query)
         return sources
 
@@ -1122,14 +738,7 @@ class SQLColumnParser:
             if source is not None:
                 yield source
 
-    def _table_ref_from_expression(
-        self,
-        expr: exp.Expression,
-        normalizer: TemplateNormalizer,
-        cte_maps: Dict[str, Dict[str, List[ResolvedColumn]]],
-        cte_logics: Dict[str, Dict[str, str]],
-        visited: Optional[Set[int]] = None,
-    ) -> Optional[TableRef]:
+    def _table_ref_from_expression(self, expr: exp.Expression, normalizer: TemplateNormalizer, cte_maps: Dict[str, Dict[str, List[ResolvedColumn]]], cte_logics: Dict[str, Dict[str, str]], visited: Optional[Set[int]] = None) -> Optional[TableRef]:
         if isinstance(expr, exp.Table):
             schema = expr.db
             table = expr.name
@@ -1138,122 +747,18 @@ class SQLColumnParser:
             is_cte = table_key in cte_maps if table_key else False
             columns = cte_maps.get(table_key) if is_cte and table_key else None
             column_logics = cte_logics.get(table_key) if is_cte and table_key else None
-            return TableRef(
-                schema=schema,
-                table=table,
-                alias=alias,
-                is_cte=is_cte,
-                columns=columns,
-                column_logics=column_logics,
-            )
+            return TableRef(schema=schema, table=table, alias=alias, is_cte=is_cte, columns=columns, column_logics=column_logics)
         if isinstance(expr, exp.Subquery):
             alias = expr.alias_or_name
-            output_map, output_logics = self._build_output_details(
-                expr.this, normalizer, visited
-            )
-            return TableRef(
-                schema=None,
-                table=alias,
-                alias=alias,
-                is_subquery=True,
-                columns=output_map,
-                column_logics=output_logics,
-            )
+            subquery_column_map = self._build_cte_column_map(expr.this, normalizer, visited or set())
+            return TableRef(schema=None, table=alias, alias=alias, is_subquery=True, columns=subquery_column_map, column_logics=None)
         if isinstance(expr, exp.Select):
-            output_map, output_logics = self._build_output_details(
-                expr, normalizer, visited
-            )
-            return TableRef(
-                schema=None,
-                table=None,
-                alias=None,
-                is_subquery=True,
-                columns=output_map,
-                column_logics=output_logics,
-            )
+            subquery_column_map = self._build_cte_column_map(expr, normalizer, visited or set())
+            return TableRef(schema=None, table=None, alias=None, is_subquery=True, columns=subquery_column_map, column_logics=None)
         return None
-
-    def _build_output_details(
-        self,
-        query: exp.Expression,
-        normalizer: TemplateNormalizer,
-        visited: Optional[Set[int]] = None,
-    ) -> Tuple[Dict[str, List[ResolvedColumn]], Dict[str, str]]:
-        if query is None:
-            return {}, {}
-        if visited is None:
-            visited = set()
-        if id(query) in visited:
-            return {}, {}
-        visited.add(id(query))
-        output_list = self._build_output_list(query, normalizer, visited)
-        output_map: Dict[str, List[ResolvedColumn]] = {}
-        logic_map: Dict[str, str] = {}
-        for output in output_list:
-            if not output[0]:
-                continue
-            key = output[0].lower()
-            output_map.setdefault(key, [])
-            output_map[key].extend(output[1])
-            if output[2] and key not in logic_map:
-                logic_map[key] = output[2]
-        return output_map, logic_map
-
-    def _build_output_map(
-        self,
-        query: exp.Expression,
-        normalizer: TemplateNormalizer,
-        visited: Optional[Set[int]] = None,
-    ) -> Dict[str, List[ResolvedColumn]]:
-        output_map, _ = self._build_output_details(query, normalizer, visited)
-        return output_map
-
-    def _build_output_list(
-        self,
-        query: exp.Expression,
-        normalizer: TemplateNormalizer,
-        visited: Set[int],
-    ) -> List[Tuple[str, List[ResolvedColumn], Optional[str]]]:
-        if isinstance(query, exp.Subquery):
-            return self._build_output_list(query.this, normalizer, visited)
-        if isinstance(query, exp.SetOperation):
-            left_outputs = self._build_output_list(query.this, normalizer, visited)
-            right_outputs = self._build_output_list(query.expression, normalizer, visited)
-            combined: List[Tuple[str, List[ResolvedColumn], Optional[str]]] = []
-            for idx, left in enumerate(left_outputs):
-                right_sources = right_outputs[idx][1] if idx < len(right_outputs) else []
-                right_logic = right_outputs[idx][2] if idx < len(right_outputs) else None
-                combined.append((left[0], left[1] + right_sources, left[2] or right_logic))
-            return combined
-        if not isinstance(query, exp.Select):
-            return []
-
-        context = self._build_context(query, normalizer, visited)
-        outputs: List[Tuple[str, List[ResolvedColumn], Optional[str]]] = []
-        for index, projection in enumerate(query.expressions):
-            if self._is_star_projection(projection):
-                for star_output in self._expand_star_projection(
-                    projection, context, normalizer, map_only=True
-                ):
-                    star_logic = star_output.logic
-                    outputs.append((star_output.target_column or "", [ResolvedColumn(
-                        star_output.source_schema, star_output.source_table, star_output.source_column
-                    )], star_logic))
-                continue
-            target_name = self._output_column_name(projection, None, index)
-            sources = self._resolve_expression_sources(
-                projection, query, context, normalizer
-            )
-            logic = normalizer.restore(projection.sql(dialect="postgres"))
-            outputs.append((target_name or "", sources, logic))
-        return outputs
-
-    def _output_column_name(
-        self,
-        projection: exp.Expression,
-        target_columns_override: Optional[List[exp.Expression]],
-        index: int,
-    ) -> Optional[str]:
+		
+		
+def _output_column_name(self, projection: exp.Expression, target_columns_override: Optional[List[exp.Expression]], index: int) -> Optional[str]:
         if target_columns_override and index < len(target_columns_override):
             override = target_columns_override[index]
             if isinstance(override, exp.Column):
@@ -1276,18 +781,11 @@ class SQLColumnParser:
             return True
         return False
 
-    def _expand_star_projection(
-        self,
-        projection: exp.Expression,
-        context: "QueryContext",
-        normalizer: TemplateNormalizer,
-        map_only: bool = False,
-    ) -> List[ColumnRecord]:
+    def _expand_star_projection(self, projection: exp.Expression, context: QueryContext, normalizer: TemplateNormalizer, map_only: bool = False) -> List[ColumnRecord]:
         qualifier = None
         projection_sql = projection.sql(dialect="postgres")
         if "." in projection_sql:
             qualifier = projection_sql.split(".", 1)[0].strip('"')
-
         table_refs: List[TableRef] = []
         if qualifier:
             ref = context.table_refs.get(qualifier.lower())
@@ -1302,7 +800,6 @@ class SQLColumnParser:
                     continue
                 seen_ids.add(id(ref))
                 table_refs.append(ref)
-
         expanded_records: List[ColumnRecord] = []
         for table_ref in table_refs:
             if not table_ref.table:
@@ -1311,48 +808,20 @@ class SQLColumnParser:
                 if not table_ref.columns:
                     continue
                 for column_name, resolved_list in table_ref.columns.items():
+                    if column_name == "*":
+                        continue
                     for resolved in resolved_list:
-                        expanded_records.append(
-                            ColumnRecord(
-                                target_column=column_name,
-                                source_schema=normalizer.restore_identifier(resolved.schema),
-                                source_table=normalizer.restore_identifier(resolved.table),
-                                source_column=normalizer.restore_identifier(resolved.column),
-                                logic=normalizer.restore(projection_sql),
-                                sql_process="select",
-                            )
-                        )
+                        expanded_records.append(ColumnRecord(target_column=column_name, source_schema=normalizer.restore_identifier(resolved.schema), source_table=normalizer.restore_identifier(resolved.table), source_column=normalizer.restore_identifier(resolved.column), logic=normalizer.restore(resolved.logic) if resolved.logic else normalizer.restore(projection_sql), sql_process="select"))
                 continue
-
             columns = self._metadata_columns(table_ref, normalizer)
             if not columns:
-                expanded_records.append(
-                    ColumnRecord(
-                        target_column="*",
-                        source_schema=normalizer.restore_identifier(table_ref.schema),
-                        source_table=normalizer.restore_identifier(table_ref.table),
-                        source_column="*",
-                        logic=normalizer.restore(projection_sql),
-                        sql_process="select",
-                    )
-                )
+                expanded_records.append(ColumnRecord(target_column="*", source_schema=normalizer.restore_identifier(table_ref.schema), source_table=normalizer.restore_identifier(table_ref.table), source_column="*", logic=normalizer.restore(projection_sql), sql_process="select"))
                 continue
             for column_name in columns:
-                expanded_records.append(
-                    ColumnRecord(
-                        target_column=column_name,
-                        source_schema=normalizer.restore_identifier(table_ref.schema),
-                        source_table=normalizer.restore_identifier(table_ref.table),
-                        source_column=column_name,
-                        logic=normalizer.restore(projection_sql),
-                        sql_process="select",
-                    )
-                )
+                expanded_records.append(ColumnRecord(target_column=column_name, source_schema=normalizer.restore_identifier(table_ref.schema), source_table=normalizer.restore_identifier(table_ref.table), source_column=column_name, logic=normalizer.restore(projection_sql), sql_process="select"))
         return expanded_records
 
-    def _metadata_columns(
-        self, table_ref: TableRef, normalizer: TemplateNormalizer
-    ) -> List[str]:
+    def _metadata_columns(self, table_ref: TableRef, normalizer: TemplateNormalizer) -> List[str]:
         if not table_ref.table:
             return []
         schema = table_ref.schema
@@ -1371,42 +840,20 @@ class SQLColumnParser:
             return False
         return ancestor.this is not query
 
-    def _regex_fallback(
-        self, sanitized_sql: str, normalizer: TemplateNormalizer
-    ) -> List[ColumnRecord]:
-        pattern = re.compile(
-            r"""(?ix)
-            (?:select)\s+(?P<columns>.+?)\s+from\s+(?P<table>[a-z0-9_.]+)
-            """,
-        )
+    def _regex_fallback(self, sanitized_sql: str, normalizer: TemplateNormalizer) -> List[ColumnRecord]:
+        pattern = re.compile(r"""(?ix)(?:select)\s+(?P<columns>.+?)\s+from\s+(?P<table>[a-z0-9_.]+)""")
         records: List[ColumnRecord] = []
         for match in pattern.finditer(sanitized_sql):
             table_name = match.group("table")
             columns = [col.strip() for col in match.group("columns").split(",")]
             for col in columns:
                 column_name = col.split()[-1] if " " in col else col
-                records.append(
-                    ColumnRecord(
-                        target_column=normalizer.restore(column_name),
-                        source_schema=None,
-                        source_table=normalizer.restore(table_name),
-                        source_column=normalizer.restore(column_name),
-                        logic=normalizer.restore(col),
-                        sql_process="select",
-                    )
-                )
+                records.append(ColumnRecord(target_column=normalizer.restore(column_name), source_schema=None, source_table=normalizer.restore(table_name), source_column=normalizer.restore(column_name), logic=normalizer.restore(col), sql_process="select"))
         return records
 
-    def _regex_targets(
-        self, sanitized_sql: str, normalizer: TemplateNormalizer
-    ) -> List[TargetTable]:
+    def _regex_targets(self, sanitized_sql: str, normalizer: TemplateNormalizer) -> List[TargetTable]:
         targets: List[TargetTable] = []
-        pattern = re.compile(
-            r"""(?ix)
-            (?:create\s+(?:temporary|temp)?\s*table|insert\s+into)\s+
-            (?:if\s+not\s+exists\s+)?(?:(?P<schema>[a-z0-9_]+)\.)?(?P<table>[a-z0-9_]+)
-            """,
-        )
+        pattern = re.compile(r"""(?ix)(?:create\s+(?:temporary|temp)?\s*table|insert\s+into)\s+(?:if\s+not\s+exists\s+)?(?:(?P<schema>[a-z0-9_]+)\.)?(?P<table>[a-z0-9_]+)""")
         seen: Set[Tuple[Optional[str], Optional[str]]] = set()
         for match in pattern.finditer(sanitized_sql):
             schema = normalizer.restore(match.group("schema"))
@@ -1418,40 +865,12 @@ class SQLColumnParser:
             targets.append(TargetTable(schema=schema, table=table))
         return targets
 
-    def _deduplicate_records(
-        self, records: Sequence[ColumnRecord]
-    ) -> List[ColumnRecord]:
-        unique: Dict[
-            Tuple[
-                Optional[str],
-                Optional[str],
-                Optional[str],
-                Optional[str],
-                Optional[str],
-                Optional[str],
-            ],
-            ColumnRecord,
-        ] = {}
+    def _deduplicate_records(self, records: Sequence[ColumnRecord]) -> List[ColumnRecord]:
+        unique: Dict[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]], ColumnRecord] = {}
         for record in records:
-            key = (
-                record.target_column,
-                record.source_schema,
-                record.source_table,
-                record.source_column,
-                record.logic,
-                record.sql_process,
-            )
+            key = (record.target_column, record.source_schema, record.source_table, record.source_column, record.logic, record.sql_process)
             unique[key] = record
         return list(unique.values())
-
-
-@dataclass
-class QueryContext:
-    table_refs: Dict[str, TableRef]
-    base_tables: List[TableRef]
-    cte_maps: Dict[str, Dict[str, List[ResolvedColumn]]]
-    cte_sources: Dict[str, List[TableRef]]
-    cte_logics: Dict[str, Dict[str, str]]
 
 
 class LineageBuilder:
@@ -1459,11 +878,7 @@ class LineageBuilder:
         self._fetcher = fetcher
         self._parser = parser
 
-    def build(
-        self,
-        progress_callback: Optional[Callable[[Sequence[ColumnLineageRow]], None]] = None,
-        run_timestamp: Optional[datetime.datetime] = None,
-    ) -> List[ColumnLineageRow]:
+    def build(self, progress_callback: Optional[Callable[[Sequence[ColumnLineageRow]], None]] = None, run_timestamp: Optional[datetime.datetime] = None) -> List[ColumnLineageRow]:
         timestamp = run_timestamp or datetime.datetime.utcnow()
         rows: List[ColumnLineageRow] = []
         for file_path in self._fetcher.iter_sql_paths():
@@ -1478,24 +893,8 @@ class LineageBuilder:
                     for record in result.records:
                         targets = result.targets or [TargetTable(schema=None, table=None)]
                         for target in targets:
-                            rows.append(
-                                ColumnLineageRow(
-                                    filename=filename,
-                                    filepath=file_path,
-                                    process=process,
-                                    target_table=target_table,
-                                    sub_target_schema=target.schema,
-                                    sub_target_table=target.table,
-                                    target_column=record.target_column,
-                                    source_schema=record.source_schema,
-                                    source_table=record.source_table,
-                                    source_column=record.source_column,
-                                    logic=record.logic,
-                                    sql_process=record.sql_process,
-                                    current_timestamp=timestamp,
-                                )
-                            )
-            except Exception as exc:  # noqa: BLE001
+                            rows.append(ColumnLineageRow(filename=filename, filepath=file_path, process=process, target_table=target_table, sub_target_schema=target.schema, sub_target_table=target.table, target_column=record.target_column, source_schema=record.source_schema, source_table=record.source_table, source_column=record.source_column, logic=record.logic, sql_process=record.sql_process, current_timestamp=timestamp))
+            except Exception as exc:
                 logging.exception("Failed to process %s: %s", file_path, exc)
             finally:
                 if progress_callback:
@@ -1512,104 +911,22 @@ class DatabaseUploader:
         with psycopg2.connect(**self._db_config) as conn:
             conn.autocommit = False
             with conn.cursor() as cur:
-                cur.execute(
-                    sql.SQL("DROP TABLE IF EXISTS {}.{}").format(
-                        sql.Identifier(TARGET_SCHEMA), sql.Identifier(TARGET_TABLE)
-                    )
-                )
-                cur.execute(
-                    sql.SQL(
-                        """
-                        CREATE TABLE {}.{} (
-                            filename TEXT,
-                            filepath TEXT,
-                            process TEXT,
-                            target_table TEXT,
-                            sub_target_schema TEXT,
-                            sub_target_table TEXT,
-                            target_column TEXT,
-                            source_schema TEXT,
-                            source_table TEXT,
-                            source_column TEXT,
-                            logic TEXT,
-                            sql_process TEXT,
-                            "current_timestamp" TIMESTAMP
-                        )
-                        """
-                    ).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TARGET_TABLE))
-                )
-                values = [
-                    (
-                        row.filename,
-                        row.filepath,
-                        row.process,
-                        row.target_table,
-                        row.sub_target_schema,
-                        row.sub_target_table,
-                        row.target_column,
-                        row.source_schema,
-                        row.source_table,
-                        row.source_column,
-                        row.logic,
-                        row.sql_process,
-                        row.current_timestamp,
-                    )
-                    for row in rows
-                ]
+                cur.execute(sql.SQL("DROP TABLE IF EXISTS {}.{}").format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TARGET_TABLE)))
+                cur.execute(sql.SQL("""CREATE TABLE {}.{} (filename TEXT, filepath TEXT, process TEXT, target_table TEXT, sub_target_schema TEXT, sub_target_table TEXT, target_column TEXT, source_schema TEXT, source_table TEXT, source_column TEXT, logic TEXT, sql_process TEXT, "current_timestamp" TIMESTAMP)""").format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TARGET_TABLE)))
+                values = [(row.filename, row.filepath, row.process, row.target_table, row.sub_target_schema, row.sub_target_table, row.target_column, row.source_schema, row.source_table, row.source_column, row.logic, row.sql_process, row.current_timestamp) for row in rows]
                 if values:
-                    execute_values(
-                        cur,
-                        sql.SQL(
-                            'INSERT INTO {}.{} (filename, filepath, process, target_table, sub_target_schema, sub_target_table, target_column, source_schema, source_table, source_column, logic, sql_process, "current_timestamp") VALUES %s'
-                        ).format(
-                            sql.Identifier(TARGET_SCHEMA), sql.Identifier(TARGET_TABLE)
-                        ),
-                        values,
-                    )
-                cur.execute(
-                    sql.SQL("ALTER TABLE {}.{} OWNER TO {}").format(
-                        sql.Identifier(TARGET_SCHEMA),
-                        sql.Identifier(TARGET_TABLE),
-                        sql.Identifier(TARGET_OWNER),
-                    )
-                )
-                cur.execute(
-                    sql.SQL("GRANT SELECT ON {}.{} TO {}").format(
-                        sql.Identifier(TARGET_SCHEMA),
-                        sql.Identifier(TARGET_TABLE),
-                        sql.Identifier(TARGET_READER),
-                    )
-                )
+                    execute_values(cur, sql.SQL('INSERT INTO {}.{} (filename, filepath, process, target_table, sub_target_schema, sub_target_table, target_column, source_schema, source_table, source_column, logic, sql_process, "current_timestamp") VALUES %s').format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TARGET_TABLE)), values)
+                cur.execute(sql.SQL("ALTER TABLE {}.{} OWNER TO {}").format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TARGET_TABLE), sql.Identifier(TARGET_OWNER)))
+                cur.execute(sql.SQL("GRANT SELECT ON {}.{} TO {}").format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TARGET_TABLE), sql.Identifier(TARGET_READER)))
             conn.commit()
 
 
 def rows_to_dataframe(rows: Sequence[ColumnLineageRow]) -> pd.DataFrame:
-    data = [
-        {
-            "filename": row.filename,
-            "filepath": row.filepath,
-            "process": row.process,
-            "target_table": row.target_table,
-            "sub_target_schema": row.sub_target_schema,
-            "sub_target_table": row.sub_target_table,
-            "target_column": row.target_column,
-            "source_schema": row.source_schema,
-            "source_table": row.source_table,
-            "source_column": row.source_column,
-            "logic": row.logic,
-            "sql_process": row.sql_process,
-            "current_timestamp": row.current_timestamp,
-        }
-        for row in rows
-    ]
+    data = [{"filename": row.filename, "filepath": row.filepath, "process": row.process, "target_table": row.target_table, "sub_target_schema": row.sub_target_schema, "sub_target_table": row.sub_target_table, "target_column": row.target_column, "source_schema": row.source_schema, "source_table": row.source_table, "source_column": row.source_column, "logic": row.logic, "sql_process": row.sql_process, "current_timestamp": row.current_timestamp} for row in rows]
     return pd.DataFrame(data, columns=LINEAGE_COLUMNS)
 
 
-def write_to_excel(
-    df: pd.DataFrame,
-    run_timestamp: Optional[datetime.datetime] = None,
-    output_path: Optional[str] = None,
-) -> str:
+def write_to_excel(df: pd.DataFrame, run_timestamp: Optional[datetime.datetime] = None, output_path: Optional[str] = None) -> str:
     if output_path is None:
         if run_timestamp is None:
             raise ValueError("run_timestamp must be provided when output_path is None.")
@@ -1620,11 +937,7 @@ def write_to_excel(
     return output_path
 
 
-def _read_secret(
-    label: str,
-    env_key: str,
-    arg_value: Optional[str],
-) -> str:
+def _read_secret(label: str, env_key: str, arg_value: Optional[str]) -> str:
     if arg_value:
         return arg_value
     env_value = os.environ.get(env_key)
@@ -1635,53 +948,24 @@ def _read_secret(
     try:
         return input(label)
     except EOFError as exc:
-        raise RuntimeError(
-            f"Missing {env_key}. Provide CLI args or set the env var."
-        ) from exc
+        raise RuntimeError(f"Missing {env_key}. Provide CLI args or set the env var.") from exc
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="IKG Column Lineage Auto Refresh")
-    parser.add_argument(
-        "--gitlab-token",
-        dest="gitlab_token",
-        help=f"GitLab token (or set {GITLAB_TOKEN_ENV}).",
-    )
-    parser.add_argument(
-        "--db-password",
-        dest="db_password",
-        help=f"DB password (or set {DB_PASSWORD_ENV}).",
-    )
+    parser.add_argument("--gitlab-token", dest="gitlab_token", help=f"GitLab token (or set {GITLAB_TOKEN_ENV}).")
+    parser.add_argument("--db-password", dest="db_password", help=f"DB password (or set {DB_PASSWORD_ENV}).")
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
-    logging.basicConfig(
-        level=getattr(logging, LOG_LEVEL.upper(), logging.DEBUG),
-        format="%(asctime)s - %(levelname)s - %(message)s",
-    )
-
-    private_token = _read_secret(
-        f"Enter your private token (or set {GITLAB_TOKEN_ENV}): ",
-        GITLAB_TOKEN_ENV,
-        args.gitlab_token,
-    )
-    db_password = _read_secret(
-        f"Enter Password for DB User (or set {DB_PASSWORD_ENV}): ",
-        DB_PASSWORD_ENV,
-        args.db_password,
-    )
-
+    logging.basicConfig(level=getattr(logging, LOG_LEVEL.upper(), logging.DEBUG), format="%(asctime)s - %(levelname)s - %(message)s")
+    private_token = _read_secret(f"Enter your private token (or set {GITLAB_TOKEN_ENV}): ", GITLAB_TOKEN_ENV, args.gitlab_token)
+    db_password = _read_secret(f"Enter Password for DB User (or set {DB_PASSWORD_ENV}): ", DB_PASSWORD_ENV, args.db_password)
     exclude_folders = [folder for folder in EXCLUDE_FOLDER.split() if folder]
     fetcher = GitLabSQLFetcher(private_token=private_token, exclude_folders=exclude_folders)
-    db_config = {
-        "host": "greenplum-rdsp.zur.swissbank.com",
-        "port": "5432",
-        "dbname": "gprdsp",
-        "user": "ds_rdsp_dev",
-        "password": db_password,
-    }
+    db_config = {"host": "greenplum-rdsp.zur.swissbank.com", "port": "5432", "dbname": "gprdsp", "user": "ds_rdsp_dev", "password": db_password}
     metadata_resolver = MetadataResolver(db_config)
     parser = SQLColumnParser(metadata_resolver)
     builder = LineageBuilder(fetcher, parser)
@@ -1695,7 +979,6 @@ def main() -> None:
 
     rows = builder.build(progress_callback=flush_excel, run_timestamp=run_timestamp)
     logging.info("Captured %d column lineage rows", len(rows))
-
     uploader = DatabaseUploader(db_config)
     uploader.refresh_table(rows)
     metadata_resolver.close()
