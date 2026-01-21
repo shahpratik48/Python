@@ -1,11 +1,9 @@
-import argparse
 import base64
 import datetime
 import getpass
 import logging
 import os
 import re
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Match, Optional, Sequence, Set, Tuple
@@ -26,15 +24,27 @@ IKG_PROJECT_PATH = f"{GENESTS_GROUP_PATH}/ikg-dags"
 BRANCH = "ikg-master"
 SQL_PATH = "dags/ikg/scripts/sql"
 EXCLUDE_FOLDER = "ikg_new fa_shhp_map"
-OUTPUT_PREFIX = "ikg_column_lineage_master_auto_refresh"
+OUTPUT_PREFIX = "ikg_column_lineage_master"
 TARGET_SCHEMA = "sandbox_prj_smart_insights"
 TARGET_TABLE = "ikg_column_lineage_master_auto_refresh"
 TARGET_OWNER = "erd_gpdb_prj_smart_insights"
 TARGET_READER = "erd_gpdb_prj_smart_insights_ro"
-GITLAB_TOKEN_ENV = "IKG_GITLAB_TOKEN"
-DB_PASSWORD_ENV = "IKG_DB_PASSWORD"
 SQL_PATH_PARTS = Path(SQL_PATH).parts
-LINEAGE_COLUMNS = ["filename", "filepath", "process", "target_table", "sub_target_schema", "sub_target_table", "target_column", "source_schema", "source_table", "source_column", "logic", "sql_process", "current_timestamp"]
+LINEAGE_COLUMNS = [
+    "filename",
+    "filepath",
+    "process",
+    "target_table",
+    "sub_target_schema",
+    "sub_target_table",
+    "target_column",
+    "source_schema",
+    "source_table",
+    "source_column",
+    "logic",
+    "sql_process",
+    "current_timestamp",
+]
 
 
 @dataclass(frozen=True)
@@ -54,115 +64,14 @@ class ColumnLineageRow:
     current_timestamp: datetime.datetime
 
 
-@dataclass(frozen=True)
-class TargetTable:
-    schema: Optional[str]
-    table: Optional[str]
-    is_temp: bool = False
-
-
-@dataclass(frozen=True)
-class ResolvedColumn:
-    schema: Optional[str]
-    table: Optional[str]
-    column: Optional[str]
-    logic: Optional[str] = None
-
-
-@dataclass
-class TableRef:
-    schema: Optional[str]
-    table: Optional[str]
-    alias: Optional[str]
-    is_cte: bool = False
-    is_subquery: bool = False
-    columns: Optional[Dict[str, List[ResolvedColumn]]] = None
-    column_logics: Optional[Dict[str, str]] = None
-
-    def keys(self) -> List[str]:
-        def normalize(value: Optional[str]) -> Optional[str]:
-            if not value:
-                return None
-            return value.strip('"').lower()
-        keys: List[str] = []
-        alias_key = normalize(self.alias)
-        if alias_key:
-            keys.append(alias_key)
-        table_key = normalize(self.table)
-        if table_key:
-            keys.append(table_key)
-        return keys
-
-
-@dataclass(frozen=True)
-class ColumnRecord:
-    target_column: Optional[str]
-    source_schema: Optional[str]
-    source_table: Optional[str]
-    source_column: Optional[str]
-    logic: Optional[str]
-    sql_process: Optional[str]
-
-
-@dataclass(frozen=True)
-class StatementLineage:
-    targets: List[TargetTable]
-    records: List[ColumnRecord]
-
-
-@dataclass
-class QueryContext:
-    table_refs: Dict[str, TableRef]
-    base_tables: List[TableRef]
-    cte_maps: Dict[str, Dict[str, List[ResolvedColumn]]]
-    cte_sources: Dict[str, List[TableRef]]
-    cte_logics: Dict[str, Dict[str, str]]
-
-
 def derive_process(file_path: str) -> str:
-    parent = Path(file_path).parent
-    name = parent.name
-    if name in {"", "."}:
-        return ""
-    return name
-	
-class TemplateNormalizer:
-    TEMPLATE_PATTERN = re.compile(r"{{\s*([^{}]+?)\s*}}")
-    ENV_PATTERN = re.compile(r"\$\{[^}]+\}")
-
-    def __init__(self) -> None:
-        self._mapping: Dict[str, str] = {}
-
-    def normalize(self, sql_text: str) -> str:
-        def template_replace(match: Match) -> str:
-            token = f"TEMPLATE_TOKEN_{len(self._mapping)}"
-            self._mapping[token] = match.group(0)
-            return token
-
-        def env_replace(match: Match) -> str:
-            token = f"ENV_TOKEN_{len(self._mapping)}"
-            self._mapping[token] = match.group(0)
-            return token
-
-        sanitized = self.TEMPLATE_PATTERN.sub(template_replace, sql_text)
-        sanitized = self.ENV_PATTERN.sub(env_replace, sanitized)
-        return sanitized
-
-    def restore(self, text: Optional[str]) -> Optional[str]:
-        if text is None:
-            return None
-        restored = text
-        for token, raw in self._mapping.items():
-            restored = restored.replace(token, raw)
-        return restored
-
-    def restore_identifier(self, identifier: Optional[str]) -> Optional[str]:
-        return self.restore(identifier)
-
-    def is_placeholder(self, identifier: Optional[str]) -> bool:
-        if not identifier:
-            return False
-        return any(token in identifier for token in self._mapping.keys())
+    """Derive process from the last subfolder before the SQL file."""
+    parts = Path(file_path).parts
+    # Get the parent directory of the file (last folder before the .sql file)
+    if len(parts) >= 2:
+        # parts[-1] is the filename, parts[-2] is the last folder
+        return parts[-2]
+    return ""
 
 
 class GitLabSQLFetcher:
@@ -172,7 +81,9 @@ class GitLabSQLFetcher:
         self._exclude_folders = {folder.lower() for folder in exclude_folders}
 
     def iter_sql_paths(self) -> Iterable[str]:
-        tree = self._project.repository_tree(path=SQL_PATH, ref=BRANCH, recursive=True, all=True)
+        tree = self._project.repository_tree(
+            path=SQL_PATH, ref=BRANCH, recursive=True, all=True
+        )
         for node in tree:
             if node.get("type") != "blob":
                 continue
@@ -194,711 +105,1039 @@ class GitLabSQLFetcher:
         return any(part in self._exclude_folders for part in parts)
 
 
-class MetadataResolver:
-    def __init__(self, db_config: Dict[str, str]) -> None:
-        self._db_config = db_config
-        self._conn: Optional[psycopg2.extensions.connection] = None
-        self._cache: Dict[Tuple[Optional[str], str], Set[str]] = {}
-
-    def close(self) -> None:
-        if self._conn and not self._conn.closed:
-            self._conn.close()
-        self._conn = None
-
-    def resolve_candidates(self, column: str, candidates: Sequence[TableRef], normalizer: "TemplateNormalizer") -> List[TableRef]:
-        if not column:
-            return []
-        matches: List[TableRef] = []
-        for table_ref in candidates:
-            if table_ref.is_cte or table_ref.is_subquery or not table_ref.table:
-                continue
-            if normalizer.is_placeholder(table_ref.table):
-                continue
-            schema = table_ref.schema
-            schema_lookup = None if normalizer.is_placeholder(schema) else schema
-            if self._column_exists(schema_lookup, table_ref.table, column):
-                matches.append(table_ref)
-        return matches
-
-    def column_exists(self, schema: Optional[str], table: Optional[str], column: Optional[str]) -> bool:
-        if not table or not column:
-            return False
-        return self._column_exists(schema, table, column)
-
-    def _column_exists(self, schema: Optional[str], table: str, column: str) -> bool:
-        cache_key = (schema.lower() if schema else None, table.lower())
-        if cache_key in self._cache:
-            return column.lower() in self._cache[cache_key]
-        columns = self._fetch_columns(schema, table)
-        self._cache[cache_key] = columns
-        return column.lower() in columns
-
-    def _fetch_columns(self, schema: Optional[str], table: str) -> Set[str]:
-        conn = self._connect()
-        if not conn:
-            return set()
-        query: str
-        params: Tuple
-        if schema:
-            query = "SELECT column_name FROM information_schema.columns WHERE table_schema = %s AND table_name = %s"
-            params = (schema, table)
-        else:
-            query = "SELECT column_name FROM information_schema.columns WHERE table_name = %s"
-            params = (table,)
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute(query, params)
-                return {row[0].lower() for row in cursor.fetchall()}
-        except Exception as exc:
-            logging.warning("Failed metadata lookup for %s.%s: %s", schema, table, exc)
-            return set()
-
-    def _connect(self) -> Optional[psycopg2.extensions.connection]:
-        if self._conn and not self._conn.closed:
-            return self._conn
-        try:
-            self._conn = psycopg2.connect(**self._db_config)
-            return self._conn
-        except Exception as exc:
-            logging.warning("Metadata connection unavailable: %s", exc)
-            return None
-
-
-class SQLColumnParser:
-    def __init__(self, metadata_resolver: MetadataResolver) -> None:
-        self._metadata_resolver = metadata_resolver
-
-    @staticmethod
-    def _normalize_key(value: Optional[str]) -> Optional[str]:
-        if not value:
-            return None
-        return value.strip('"').lower()
-
-    def extract_records(self, sql_text: str) -> List[StatementLineage]:
+class ColumnLineageParser:
+    """Advanced SQL parser for extracting column-level lineage."""
+    
+    TEMPLATE_PATTERN = re.compile(r"{{\s*([^{}]+?)\s*}}")
+    
+    def __init__(self):
+        self.cte_definitions = {}  # Store CTE definitions for resolution
+        self.table_aliases = {}  # Store table aliases
+        
+    def extract_column_lineage(self, sql_text: str) -> List[Dict]:
+        """Extract column lineage from SQL text."""
+        # Store original SQL BEFORE any cleaning
+        self.original_sql = sql_text
+        
         cleaned = self._remove_sql_comments(sql_text)
-        cleaned = self._strip_template_blocks(cleaned)
+        # Store cleaned SQL (with comments removed but vendor-specific syntax intact)
+        self.cleaned_sql = cleaned
+        
+        # Now do vendor-specific stripping only for parsing
         normalized = self._strip_vendor_specific(cleaned)
-        normalizer = TemplateNormalizer()
-        sanitized = normalizer.normalize(normalized)
-        sanitized_no_do, _ = self._strip_do_blocks(sanitized)
-        statements = self._parse_sql(sanitized_no_do)
-        if not statements:
-            regex_records = self._regex_fallback(sanitized_no_do, normalizer)
-            regex_targets = self._regex_targets(sanitized_no_do, normalizer)
-            if not regex_targets:
-                regex_targets = [TargetTable(schema=None, table=None)]
-            if not regex_records:
-                regex_records = [ColumnRecord(target_column=None, source_schema=None, source_table=None, source_column=None, logic=None, sql_process=None)]
-            return [StatementLineage(targets=regex_targets, records=regex_records)]
-        statement_results: List[StatementLineage] = []
-        for statement in statements:
-            statement_targets = self._extract_targets(statement)
-            restored_targets = [TargetTable(schema=normalizer.restore_identifier(target.schema), table=normalizer.restore_identifier(target.table), is_temp=target.is_temp) for target in statement_targets]
-            statement_records = self._extract_statement_records(statement, normalizer)
-            if not restored_targets:
-                restored_targets = [TargetTable(schema=None, table=None)]
-            if not statement_records:
-                statement_records = [ColumnRecord(target_column=None, source_schema=None, source_table=None, source_column=None, logic=None, sql_process=None)]
-            statement_results.append(StatementLineage(targets=restored_targets, records=self._deduplicate_records(statement_records)))
-        return statement_results
-
-    def _parse_sql(self, sql_text: str) -> List[exp.Expression]:
-        if not sql_text.strip():
-            return []
+        sanitized, placeholders = self._replace_templates(normalized)
+        sanitized_no_do, do_blocks = self._strip_do_blocks(sanitized)
+        
+        lineage_records = []
+        
+        # Parse main SQL
         try:
-            parsed = sqlglot.parse(sql_text, read="postgres", error_level="ignore")
-        except sqlglot.errors.ParseError as exc:
-            logging.warning("sqlglot failed to parse SQL: %s", exc)
-            return []
-        return [statement for statement in parsed if statement is not None]
-
+            parsed = sqlglot.parse(sanitized_no_do, read="postgres", error_level="ignore")
+            for statement in parsed:
+                if statement:
+                    statement_records = self._process_statement(statement, placeholders)
+                    
+                    # Replace logic for CREATE statements with original SQL
+                    for record in statement_records:
+                        if record.get("_needs_original_sql"):
+                            record["logic"] = self._extract_create_statement_sql(
+                                record.get("sub_target_table"),
+                                self.cleaned_sql  # Use cleaned SQL (has DISTRIBUTED BY)
+                            )
+                            del record["_needs_original_sql"]
+                    
+                    lineage_records.extend(statement_records)
+        except Exception as e:
+            logging.warning(f"Failed to parse SQL: {e}")
+            
+        # Parse DO blocks
+        for block in do_blocks:
+            try:
+                block_prepared = self._prepare_do_block(block)
+                parsed_block = sqlglot.parse(block_prepared, read="postgres", error_level="ignore")
+                for statement in parsed_block:
+                    if statement:
+                        lineage_records.extend(self._process_statement(statement, placeholders))
+            except Exception as e:
+                logging.debug(f"Failed to parse DO block: {e}")
+                
+        return lineage_records
+    
+    def _extract_create_statement_sql(self, table_name: str, original_sql: str) -> str:
+        """Extract the original CREATE statement SQL for a specific table."""
+        if not table_name:
+            return original_sql
+        
+        # Find the CREATE statement for this table in the original SQL
+        # Look for patterns like: CREATE TEMP TABLE table_name ... ; or CREATE TABLE ...
+        import re
+        
+        # Pattern to match CREATE [TEMP/TEMPORARY] TABLE table_name ... up to the semicolon or next CREATE
+        pattern = rf'(?i)((?:DROP\s+TABLE\s+IF\s+EXISTS\s+{re.escape(table_name)}\s*;?\s*)?' \
+                  rf'CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?{re.escape(table_name)}\s+' \
+                  rf'(?:.*?)(?:;|\Z))'
+        
+        match = re.search(pattern, original_sql, re.DOTALL | re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+        
+        # If specific table not found, return the whole CREATE statement
+        create_match = re.search(r'(?i)CREATE\s+(?:.*?)(?:;|\Z)', original_sql, re.DOTALL)
+        if create_match:
+            return create_match.group(0).strip()
+        
+        return original_sql
+    
+    def _process_statement(self, statement: exp.Expression, placeholders: Dict[str, str]) -> List[Dict]:
+        """Process a single SQL statement to extract column lineage."""
+        records = []
+        
+        # Reset for each statement
+        self.cte_definitions = {}
+        self.table_aliases = {}
+        
+        # Handle CREATE TABLE / CREATE TEMP TABLE statements
+        if isinstance(statement, exp.Create):
+            records.extend(self._process_create_statement(statement, placeholders))
+        
+        # Handle SELECT statements
+        elif isinstance(statement, exp.Select):
+            records.extend(self._process_select_statement(statement, placeholders, None))
+            
+        # Handle INSERT statements
+        elif isinstance(statement, exp.Insert):
+            records.extend(self._process_insert_statement(statement, placeholders))
+            
+        return records
+    
+    def _process_create_statement(self, create_node: exp.Create, placeholders: Dict[str, str]) -> List[Dict]:
+        """Process CREATE TABLE statement."""
+        records = []
+        
+        # Get target table info
+        target_table = None
+        target_schema = None
+        
+        if create_node.this:
+            table_expr = create_node.this
+            if isinstance(table_expr, exp.Schema):
+                table_expr = table_expr.this
+            
+            if isinstance(table_expr, exp.Table):
+                target_table = table_expr.name
+                if table_expr.db:
+                    target_schema = self._resolve_template(table_expr.db, placeholders)
+        
+        # Get the SELECT part
+        select_expr = create_node.expression
+        
+        # Add a record for the whole table creation
+        # CRITICAL: Use the ORIGINAL SQL text, not the sqlglot-generated version
+        # We need to extract this from the original source
+        # For now, we'll store the create node and extract original later
+        records.append({
+            "sub_target_schema": None,
+            "sub_target_table": target_table,
+            "target_column": None,
+            "source_schema": None,
+            "source_table": None,
+            "source_column": None,
+            "logic": None,  # Will be filled with original SQL by caller
+            "sql_process": "create",
+            "_needs_original_sql": True  # Flag to replace with original
+        })
+        
+        if select_expr:
+            # Process the main SELECT (CTEs will be processed inside _process_select_for_target)
+            if isinstance(select_expr, exp.Select):
+                column_records = self._process_select_for_target(
+                    select_expr, 
+                    target_table, 
+                    target_schema,
+                    placeholders
+                )
+                records.extend(column_records)
+        
+        return records
+    
+    def _process_select_for_target(
+        self, 
+        select_node: exp.Select, 
+        target_table: Optional[str],
+        target_schema: Optional[str],
+        placeholders: Dict[str, str]
+    ) -> List[Dict]:
+        """Process SELECT statement for a target table."""
+        records = []
+        
+        # CRITICAL: Process CTEs FIRST before building table aliases
+        with_node = select_node.args.get("with")
+        if with_node:
+            self._extract_cte_definitions(with_node, placeholders)
+            
+            # IMPORTANT: Also process joins/where/having from WITHIN each CTE
+            cte_internal_records = self._process_cte_internals(
+                with_node, 
+                target_table, 
+                target_schema, 
+                placeholders
+            )
+            records.extend(cte_internal_records)
+        
+        # Build table alias map (now CTEs are already defined)
+        self._build_table_aliases(select_node, placeholders)
+        
+        # Process each column in SELECT clause
+        for projection in select_node.expressions:
+            column_info = self._extract_column_info(projection, placeholders)
+            
+            if column_info:
+                # Resolve source table for each source column
+                for col_data in column_info:
+                    source_records = self._resolve_source_column(
+                        col_data, 
+                        select_node, 
+                        placeholders
+                    )
+                    
+                    # Get the actual source logic from CTE if the column references a CTE
+                    original_logic = col_data.get("logic")
+                    source_col_expr = col_data.get("source_column_expr")
+                    
+                    if source_col_expr:
+                        table_ref = source_col_expr.get("table")
+                        column_name = source_col_expr.get("column")
+                        
+                        # Get actual source logic from CTE
+                        cte_source_logic = self._get_source_logic_detail(
+                            table_ref,
+                            column_name,
+                            select_node,
+                            placeholders
+                        )
+                        
+                        if cte_source_logic:
+                            # Use the CTE source logic instead
+                            original_logic = cte_source_logic
+                    
+                    for src_rec in source_records:
+                        records.append({
+                            "sub_target_schema": target_schema,
+                            "sub_target_table": target_table,
+                            "target_column": col_data.get("target_column"),
+                            "source_schema": src_rec.get("source_schema"),
+                            "source_table": src_rec.get("source_table"),
+                            "source_column": src_rec.get("source_column"),
+                            "logic": original_logic,
+                            "sql_process": "select"
+                        })
+        
+        # Process JOIN clauses - now with proper target table and column tracking
+        join_records = self._process_joins(select_node, placeholders, target_table, target_schema)
+        records.extend(join_records)
+        
+        # Process WHERE clause
+        where_records = self._process_where(select_node, placeholders, target_table, target_schema)
+        records.extend(where_records)
+        
+        # Process HAVING clause
+        having_records = self._process_having(select_node, placeholders, target_table, target_schema)
+        records.extend(having_records)
+        
+        return records
+    
+    def _process_cte_internals(
+        self,
+        with_node: exp.With,
+        target_table: Optional[str],
+        target_schema: Optional[str],
+        placeholders: Dict[str, str]
+    ) -> List[Dict]:
+        """Process joins/where/having from within CTE definitions."""
+        records = []
+        
+        for cte in with_node.expressions:
+            if isinstance(cte, exp.CTE):
+                cte_query = cte.this
+                
+                if isinstance(cte_query, exp.Select):
+                    # Save current state
+                    saved_aliases = self.table_aliases.copy()
+                    saved_ctes = self.cte_definitions.copy()
+                    
+                    # Process nested CTEs if any
+                    nested_with = cte_query.args.get("with")
+                    if nested_with:
+                        self._extract_cte_definitions(nested_with, placeholders)
+                    
+                    # Build table aliases for this CTE
+                    self._build_table_aliases(cte_query, placeholders)
+                    
+                    # Process joins/where/having within this CTE
+                    cte_joins = self._process_joins(cte_query, placeholders, target_table, target_schema)
+                    records.extend(cte_joins)
+                    
+                    cte_where = self._process_where(cte_query, placeholders, target_table, target_schema)
+                    records.extend(cte_where)
+                    
+                    cte_having = self._process_having(cte_query, placeholders, target_table, target_schema)
+                    records.extend(cte_having)
+                    
+                    # Restore state
+                    self.table_aliases = saved_aliases
+                    self.cte_definitions = saved_ctes
+        
+        return records
+    
+    def _extract_column_info(self, projection: exp.Expression, placeholders: Dict[str, str]) -> List[Dict]:
+        """Extract column information from a projection."""
+        results = []
+        
+        # Get the alias (target column name)
+        target_column = None
+        if isinstance(projection, exp.Alias):
+            target_column = projection.alias
+            source_expr = projection.this
+        else:
+            source_expr = projection
+            # If no alias, use the column name itself
+            if isinstance(source_expr, exp.Column):
+                target_column = source_expr.name
+            elif isinstance(source_expr, exp.Star):
+                # Handle SELECT *
+                return []
+        
+        # Get the logic
+        logic = projection.sql(dialect="postgres")
+        
+        # Extract source columns from the expression
+        source_columns = self._extract_source_columns_from_expr(source_expr)
+        
+        if source_columns:
+            for src_col in source_columns:
+                results.append({
+                    "target_column": target_column,
+                    "source_column_expr": src_col,
+                    "logic": logic
+                })
+        else:
+            # No source columns (e.g., constant)
+            results.append({
+                "target_column": target_column,
+                "source_column_expr": None,
+                "logic": logic
+            })
+        
+        return results
+    
+    def _extract_source_columns_from_expr(self, expr: exp.Expression) -> List[Dict]:
+        """Extract all source columns from an expression."""
+        columns = []
+        
+        for node in expr.walk():
+            if isinstance(node, exp.Column):
+                # Get the table reference from the column
+                table_ref = None
+                if hasattr(node, "table") and node.table:
+                    table_ref = node.table
+                # Also check for the 'this' attribute which sqlglot uses for table references
+                elif hasattr(node, "this") and isinstance(node.this, exp.Identifier):
+                    # The table might be in the parent
+                    pass
+                
+                # Extract table from the column's SQL if not found
+                if not table_ref:
+                    col_sql = node.sql(dialect="postgres")
+                    if "." in col_sql:
+                        parts = col_sql.split(".")
+                        if len(parts) == 2:
+                            table_ref = parts[0].strip()
+                
+                col_info = {
+                    "column": node.name,
+                    "table": table_ref
+                }
+                columns.append(col_info)
+        
+        return columns
+    
+    def _resolve_source_column(
+        self, 
+        column_data: Dict, 
+        select_node: exp.Select,
+        placeholders: Dict[str, str]
+    ) -> List[Dict]:
+        """Resolve the actual source table and schema for a column."""
+        results = []
+        
+        source_col_expr = column_data.get("source_column_expr")
+        
+        if not source_col_expr:
+            # No source column (constant or expression without columns)
+            return [{
+                "source_schema": None,
+                "source_table": None,
+                "source_column": None
+            }]
+        
+        table_ref = source_col_expr.get("table")
+        column_name = source_col_expr.get("column")
+        
+        # Resolve the table reference
+        if table_ref:
+            # CRITICAL FIX: Check table_aliases first (this includes both CTEs and real tables)
+            if table_ref in self.table_aliases:
+                table_info = self.table_aliases[table_ref]
+                
+                # Check if this is a CTE reference
+                if table_info.get("is_cte", False):
+                    # This is a CTE - resolve from the CTE definition
+                    cte_name = table_info.get("table")
+                    cte_results = self._resolve_from_cte(cte_name, column_name, placeholders)
+                    results.extend(cte_results)
+                else:
+                    # This is a real table
+                    results.append({
+                        "source_schema": table_info.get("schema"),
+                        "source_table": table_info.get("table"),
+                        "source_column": column_name
+                    })
+            # If not in table_aliases, check if it's directly a CTE name
+            elif table_ref in self.cte_definitions:
+                # Direct CTE reference (unlikely but handle it)
+                cte_results = self._resolve_from_cte(table_ref, column_name, placeholders)
+                results.extend(cte_results)
+            else:
+                # Direct table reference (not aliased, not CTE)
+                results.append({
+                    "source_schema": None,
+                    "source_table": table_ref,
+                    "source_column": column_name
+                })
+        else:
+            # No table reference - need to infer from FROM clause
+            from_tables = self._get_from_tables(select_node, placeholders)
+            
+            if len(from_tables) == 1:
+                # Only one table, so it must be from there
+                table_info = list(from_tables.values())[0]
+                
+                # Check if it's a CTE
+                if table_info.get("is_cte", False):
+                    cte_name = table_info.get("table")
+                    cte_results = self._resolve_from_cte(cte_name, column_name, placeholders)
+                    results.extend(cte_results)
+                else:
+                    results.append({
+                        "source_schema": table_info.get("schema"),
+                        "source_table": table_info.get("table"),
+                        "source_column": column_name
+                    })
+            else:
+                # Multiple tables - would need INFORMATION_SCHEMA lookup
+                # For now, return all possibilities
+                for table_info in from_tables.values():
+                    if table_info.get("is_cte", False):
+                        cte_name = table_info.get("table")
+                        cte_results = self._resolve_from_cte(cte_name, column_name, placeholders)
+                        results.extend(cte_results)
+                    else:
+                        results.append({
+                            "source_schema": table_info.get("schema"),
+                            "source_table": table_info.get("table"),
+                            "source_column": column_name
+                        })
+        
+        return results if results else [{
+            "source_schema": None,
+            "source_table": None,
+            "source_column": column_name
+        }]
+    
+    def _resolve_from_cte(self, cte_name: str, column_name: str, placeholders: Dict[str, str]) -> List[Dict]:
+        """Resolve column from a CTE definition."""
+        results = []
+        
+        cte_select = self.cte_definitions.get(cte_name)
+        if not cte_select:
+            return results
+        
+        # Build table aliases for this CTE's SELECT
+        saved_aliases = self.table_aliases.copy()
+        self._build_table_aliases(cte_select, placeholders)
+        
+        # Find the column in CTE's SELECT clause
+        for projection in cte_select.expressions:
+            proj_alias = None
+            proj_expr = projection
+            
+            if isinstance(projection, exp.Alias):
+                proj_alias = projection.alias
+                proj_expr = projection.this
+            elif isinstance(proj_expr, exp.Column):
+                proj_alias = proj_expr.name
+            
+            # Check if this projection matches our target column
+            if proj_alias == column_name:
+                # Extract source columns from this projection
+                source_cols = self._extract_source_columns_from_expr(proj_expr)
+                
+                if not source_cols:
+                    # This is a constant or expression without columns
+                    results.append({
+                        "source_schema": None,
+                        "source_table": None,
+                        "source_column": None
+                    })
+                else:
+                    # Recursively resolve each source column
+                    for src_col in source_cols:
+                        col_data = {
+                            "source_column_expr": src_col,
+                            "target_column": column_name
+                        }
+                        resolved = self._resolve_source_column(col_data, cte_select, placeholders)
+                        results.extend(resolved)
+                break
+        
+        # Restore the original table aliases
+        self.table_aliases = saved_aliases
+        
+        return results
+    
+    def _trace_logic_through_ctes(
+        self,
+        table_ref: Optional[str],
+        column_name: str,
+        original_logic: str,
+        select_node: exp.Select,
+        placeholders: Dict[str, str]
+    ) -> str:
+        """Trace the logic for a column back through CTEs to get the original source logic."""
+        if not table_ref:
+            return original_logic
+        
+        # Check if this table reference is a CTE alias
+        if table_ref in self.table_aliases:
+            table_info = self.table_aliases[table_ref]
+            
+            if table_info.get("is_cte", False):
+                # This is a CTE - get the original logic from the CTE definition
+                cte_name = table_info.get("table")
+                cte_select = self.cte_definitions.get(cte_name)
+                
+                if cte_select:
+                    # Find the column in the CTE's SELECT clause
+                    for projection in cte_select.expressions:
+                        proj_alias = None
+                        proj_expr = projection
+                        
+                        if isinstance(projection, exp.Alias):
+                            proj_alias = projection.alias
+                            proj_expr = projection.this
+                        elif isinstance(proj_expr, exp.Column):
+                            proj_alias = proj_expr.name
+                        
+                        if proj_alias == column_name:
+                            # Get the original logic from the CTE
+                            cte_logic = projection.sql(dialect="postgres")
+                            
+                            # Check if we need to trace further through nested CTEs
+                            source_cols = self._extract_source_columns_from_expr(proj_expr)
+                            if source_cols and len(source_cols) == 1:
+                                src_col = source_cols[0]
+                                src_table = src_col.get("table")
+                                src_column = src_col.get("column")
+                                
+                                # Recursively trace if this is also from a CTE
+                                return self._trace_logic_through_ctes(
+                                    src_table,
+                                    src_column,
+                                    cte_logic,
+                                    cte_select,
+                                    placeholders
+                                )
+                            
+                            return cte_logic
+        
+        return original_logic
+    
+    def _get_source_logic_detail(
+        self,
+        table_ref: Optional[str],
+        column_name: str,
+        select_node: exp.Select,
+        placeholders: Dict[str, str]
+    ) -> Optional[str]:
+        """Get the source logic detail for a column, particularly from CTEs."""
+        if not table_ref:
+            return None
+        
+        # Check if this table reference is a CTE alias
+        if table_ref in self.table_aliases:
+            table_info = self.table_aliases[table_ref]
+            
+            if table_info.get("is_cte", False):
+                # This is a CTE - get the original logic from the CTE definition
+                cte_name = table_info.get("table")
+                cte_select = self.cte_definitions.get(cte_name)
+                
+                if cte_select:
+                    # Find the column in the CTE's SELECT clause
+                    for projection in cte_select.expressions:
+                        proj_alias = None
+                        
+                        if isinstance(projection, exp.Alias):
+                            proj_alias = projection.alias
+                        elif isinstance(projection.this, exp.Column) if hasattr(projection, 'this') else isinstance(projection, exp.Column):
+                            proj_alias = projection.this.name if hasattr(projection, 'this') else projection.name
+                        
+                        if proj_alias == column_name:
+                            # Return the original logic from the CTE
+                            return projection.sql(dialect="postgres")
+        
+        return None
+    
+    def _build_table_aliases(self, select_node: exp.Select, placeholders: Dict[str, str]):
+        """Build a map of table aliases to actual tables."""
+        self.table_aliases = {}
+        
+        # Process FROM clause
+        from_expr = select_node.args.get("from")
+        if from_expr:
+            self._extract_table_from_source(from_expr.this, placeholders)
+        
+        # Process JOINs
+        joins = select_node.args.get("joins", [])
+        for join in joins:
+            self._extract_table_from_source(join.this, placeholders)
+    
+    def _extract_table_from_source(self, source: exp.Expression, placeholders: Dict[str, str]):
+        """Extract table information from a FROM/JOIN source."""
+        if isinstance(source, exp.Table):
+            table_name = source.name
+            schema_name = None
+            if source.db:
+                schema_name = self._resolve_template(source.db, placeholders)
+            
+            # Get the alias - this is the key used in column references
+            alias = source.alias if hasattr(source, "alias") and source.alias else table_name
+            
+            # CRITICAL FIX: Check if table_name is a CTE
+            if table_name in self.cte_definitions:
+                # This is a CTE reference - mark it as a CTE, not a real table
+                # Don't add to table_aliases as a real table
+                # The alias maps to the CTE name
+                self.table_aliases[alias] = {
+                    "table": table_name,
+                    "schema": None,
+                    "is_cte": True
+                }
+            else:
+                # This is a real table
+                self.table_aliases[alias] = {
+                    "table": table_name,
+                    "schema": schema_name,
+                    "is_cte": False
+                }
+        elif isinstance(source, exp.Subquery):
+            # Handle subqueries
+            if source.alias:
+                # This is a derived table, not tracked as real table
+                pass
+    
+    def _get_from_tables(self, select_node: exp.Select, placeholders: Dict[str, str]) -> Dict[str, Dict]:
+        """Get all tables from FROM and JOIN clauses."""
+        tables = {}
+        
+        # FROM clause
+        from_expr = select_node.args.get("from")
+        if from_expr and isinstance(from_expr.this, exp.Table):
+            table = from_expr.this
+            alias = table.alias if hasattr(table, "alias") and table.alias else table.name
+            
+            # Check if this is a CTE
+            if table.name in self.cte_definitions:
+                tables[alias] = {
+                    "table": table.name,
+                    "schema": None,
+                    "is_cte": True
+                }
+            else:
+                schema = None
+                if table.db:
+                    schema = self._resolve_template(table.db, placeholders)
+                
+                tables[alias] = {
+                    "table": table.name,
+                    "schema": schema,
+                    "is_cte": False
+                }
+        
+        # JOINs
+        joins = select_node.args.get("joins", [])
+        for join in joins:
+            if isinstance(join.this, exp.Table):
+                table = join.this
+                alias = table.alias if hasattr(table, "alias") and table.alias else table.name
+                
+                # Check if this is a CTE
+                if table.name in self.cte_definitions:
+                    tables[alias] = {
+                        "table": table.name,
+                        "schema": None,
+                        "is_cte": True
+                    }
+                else:
+                    schema = None
+                    if table.db:
+                        schema = self._resolve_template(table.db, placeholders)
+                    
+                    tables[alias] = {
+                        "table": table.name,
+                        "schema": schema,
+                        "is_cte": False
+                    }
+        
+        return tables
+    
+    def _extract_cte_definitions(self, with_node: exp.With, placeholders: Dict[str, str]):
+        """Extract all CTE definitions and process their internal joins/where/having."""
+        for cte in with_node.expressions:
+            if isinstance(cte, exp.CTE):
+                cte_name = cte.alias
+                cte_query = cte.this
+                
+                if isinstance(cte_query, exp.Select):
+                    # Store the CTE definition
+                    self.cte_definitions[cte_name] = cte_query
+                    
+                    # Recursively process nested CTEs
+                    nested_with = cte_query.args.get("with")
+                    if nested_with:
+                        self._extract_cte_definitions(nested_with, placeholders)
+    
+    def _process_joins(
+        self, 
+        select_node: exp.Select, 
+        placeholders: Dict[str, str],
+        target_table: Optional[str],
+        target_schema: Optional[str]
+    ) -> List[Dict]:
+        """Process JOIN clauses to extract column lineage with proper target column tracking."""
+        records = []
+        
+        joins = select_node.args.get("joins", [])
+        for join in joins:
+            on_condition = join.args.get("on")
+            if on_condition:
+                # Get the actual join condition (e.g., "ON a.x = b.x")
+                join_condition_sql = on_condition.sql(dialect="postgres")
+                
+                # Extract columns from ON condition
+                columns = self._extract_source_columns_from_expr(on_condition)
+                
+                # Check if this is from a CTE
+                sql_process = "join"
+                if select_node.args.get("with"):
+                    sql_process = "join-with"
+                
+                # Process each column in the join condition
+                for col_info in columns:
+                    col_data = {"source_column_expr": col_info}
+                    resolved = self._resolve_source_column(col_data, select_node, placeholders)
+                    
+                    # Get the target column name from the join condition
+                    target_col_name = col_info.get("column")
+                    table_alias = col_info.get("table")
+                    
+                    # Build the logic: "ON a.x = b.x (source: actual_table.actual_column)"
+                    for src_rec in resolved:
+                        # Get the original source logic from CTE if applicable
+                        source_logic_detail = self._get_source_logic_detail(
+                            table_alias,
+                            target_col_name,
+                            select_node,
+                            placeholders
+                        )
+                        
+                        if source_logic_detail:
+                            # Format: "ON a.x = b.x (a.x = actual_source_logic)"
+                            ref_expr = f"{table_alias}.{target_col_name}" if table_alias else target_col_name
+                            logic = f"ON {join_condition_sql} ({ref_expr} = {source_logic_detail})"
+                        else:
+                            logic = f"ON {join_condition_sql}"
+                        
+                        records.append({
+                            "sub_target_schema": target_schema,
+                            "sub_target_table": target_table,
+                            "target_column": target_col_name,
+                            "source_schema": src_rec.get("source_schema"),
+                            "source_table": src_rec.get("source_table"),
+                            "source_column": src_rec.get("source_column"),
+                            "logic": logic,
+                            "sql_process": sql_process
+                        })
+        
+        return records
+    
+    def _process_where(
+        self, 
+        select_node: exp.Select, 
+        placeholders: Dict[str, str],
+        target_table: Optional[str],
+        target_schema: Optional[str]
+    ) -> List[Dict]:
+        """Process WHERE clause to extract column lineage with proper target tracking."""
+        records = []
+        
+        where_expr = select_node.args.get("where")
+        if where_expr:
+            where_condition_sql = where_expr.sql(dialect="postgres")
+            columns = self._extract_source_columns_from_expr(where_expr.this)
+            
+            # Check if this is from a CTE
+            sql_process = "where"
+            if select_node.args.get("with"):
+                sql_process = "where-with"
+            
+            for col_info in columns:
+                col_data = {"source_column_expr": col_info}
+                resolved = self._resolve_source_column(col_data, select_node, placeholders)
+                
+                # Get the target column name
+                target_col_name = col_info.get("column")
+                table_alias = col_info.get("table")
+                
+                # Get actual source logic from CTE if applicable
+                source_logic_detail = self._get_source_logic_detail(
+                    table_alias,
+                    target_col_name,
+                    select_node,
+                    placeholders
+                )
+                
+                # Use the CTE source logic if available, otherwise use the WHERE condition
+                if source_logic_detail:
+                    logic = source_logic_detail
+                else:
+                    logic = where_condition_sql
+                
+                for src_rec in resolved:
+                    records.append({
+                        "sub_target_schema": target_schema,
+                        "sub_target_table": target_table,
+                        "target_column": target_col_name,
+                        "source_schema": src_rec.get("source_schema"),
+                        "source_table": src_rec.get("source_table"),
+                        "source_column": src_rec.get("source_column"),
+                        "logic": logic,
+                        "sql_process": sql_process
+                    })
+        
+        return records
+    
+    def _process_having(
+        self, 
+        select_node: exp.Select, 
+        placeholders: Dict[str, str],
+        target_table: Optional[str],
+        target_schema: Optional[str]
+    ) -> List[Dict]:
+        """Process HAVING clause to extract column lineage with proper target tracking."""
+        records = []
+        
+        having_expr = select_node.args.get("having")
+        if having_expr:
+            having_condition_sql = having_expr.sql(dialect="postgres")
+            columns = self._extract_source_columns_from_expr(having_expr.this)
+            
+            # Check if this is from a CTE
+            sql_process = "having"
+            if select_node.args.get("with"):
+                sql_process = "having-with"
+            
+            for col_info in columns:
+                col_data = {"source_column_expr": col_info}
+                resolved = self._resolve_source_column(col_data, select_node, placeholders)
+                
+                # Get the target column name
+                target_col_name = col_info.get("column")
+                table_alias = col_info.get("table")
+                
+                # Get actual source logic from CTE if applicable
+                source_logic_detail = self._get_source_logic_detail(
+                    table_alias,
+                    target_col_name,
+                    select_node,
+                    placeholders
+                )
+                
+                # Use the CTE source logic if available, otherwise use the HAVING condition
+                if source_logic_detail:
+                    logic = source_logic_detail
+                else:
+                    logic = having_condition_sql
+                
+                for src_rec in resolved:
+                    records.append({
+                        "sub_target_schema": target_schema,
+                        "sub_target_table": target_table,
+                        "target_column": target_col_name,
+                        "source_schema": src_rec.get("source_schema"),
+                        "source_table": src_rec.get("source_table"),
+                        "source_column": src_rec.get("source_column"),
+                        "logic": logic,
+                        "sql_process": sql_process
+                    })
+        
+        return records
+    
+    def _process_select_statement(
+        self, 
+        select_node: exp.Select, 
+        placeholders: Dict[str, str],
+        target_table: Optional[str]
+    ) -> List[Dict]:
+        """Process standalone SELECT statement."""
+        # For standalone SELECT, we don't have a target table
+        return self._process_select_for_target(select_node, None, None, placeholders)
+    
+    def _process_insert_statement(self, insert_node: exp.Insert, placeholders: Dict[str, str]) -> List[Dict]:
+        """Process INSERT statement."""
+        records = []
+        
+        # Get target table
+        target_table = None
+        target_schema = None
+        if insert_node.this and isinstance(insert_node.this, exp.Table):
+            target_table = insert_node.this.name
+            if insert_node.this.db:
+                target_schema = self._resolve_template(insert_node.this.db, placeholders)
+        
+        # Process the SELECT part
+        select_expr = insert_node.expression
+        if select_expr and isinstance(select_expr, exp.Select):
+            records.extend(self._process_select_for_target(
+                select_expr, target_table, target_schema, placeholders
+            ))
+        
+        return records
+    
+    def _resolve_template(self, template_str: str, placeholders: Dict[str, str]) -> str:
+        """Resolve a template placeholder to its original value."""
+        if template_str in placeholders:
+            return placeholders[template_str]
+        return template_str
+    
+    # Utility methods from original parser
     def _remove_sql_comments(self, sql_text: str) -> str:
         no_block = re.sub(r"/\*.*?\*/", "", sql_text, flags=re.S)
         no_inline = re.sub(r"--.*?$", "", no_block, flags=re.M)
         return no_inline
-
-    def _strip_template_blocks(self, sql_text: str) -> str:
-        patterns = [r"\{\#.*?\#\}", r"\{\%.*?\%\}"]
-        cleaned = sql_text
-        for pattern in patterns:
-            cleaned = re.sub(pattern, " ", cleaned, flags=re.S)
-        return cleaned
-
+    
     def _strip_do_blocks(self, sql_text: str) -> Tuple[str, List[str]]:
         blocks: List[str] = []
-        pattern = re.compile(r"do\s+\$\$(.*?)\$\$\s*(?:language\s+\w+)?\s*;", flags=re.I | re.S)
+        pattern = re.compile(
+            r"do\s+\$\$(.*?)\$\$\s*(?:language\s+\w+)?\s*;",
+            flags=re.I | re.S,
+        )
+
         def repl(match: Match) -> str:
             blocks.append(match.group(1))
             return ""
+
         stripped = pattern.sub(repl, sql_text)
         return stripped, blocks
-
+    
     def _strip_vendor_specific(self, sql_text: str) -> str:
-        patterns = [r"\bdistributed\s+by\s*\([^;]+?\)", r"\bdistributed\s+replicated", r"\bon\s+commit\s+preserve\s+rows", r"\bwith\s*\(.*?appendonly.*?\)", r"\bencode\s*'.*?'", r"\borganization\s*\([^)]*\)", r"\bpartition\s+by\s+range\s+\([^)]*\)"]
+        patterns = [
+            r"\bdistributed\s+by\s*\([^;]+?\)",
+            r"\bdistributed\s+replicated",
+            r"\bon\s+commit\s+preserve\s+rows",
+            r"\bwith\s*\(.*?appendonly.*?\)",
+            r"\bencode\s*'.*?'",
+            r"\borganization\s*\([^)]*\)",
+            r"\bpartition\s+by\s+range\s+\([^)]*\)",
+        ]
         cleaned = sql_text
         for pattern in patterns:
             cleaned = re.sub(pattern, "", cleaned, flags=re.I | re.S)
         return cleaned
+    
+    def _replace_templates(self, sql_text: str) -> Tuple[str, Dict[str, str]]:
+        placeholders: Dict[str, str] = {}
 
-    def _extract_targets(self, statement: exp.Expression) -> List[TargetTable]:
-        targets: List[TargetTable] = []
-        if isinstance(statement, exp.Create):
-            table_expr = statement.this
-            target = self._target_from_table(table_expr, statement)
-            if target:
-                targets.append(target)
-        elif isinstance(statement, exp.Insert):
-            table_expr = statement.this
-            target = self._target_from_table(table_expr, statement)
-            if target:
-                targets.append(target)
-        elif isinstance(statement, exp.Select) and statement.args.get("into"):
-            into_expr = statement.args.get("into")
-            target = self._target_from_table(into_expr, statement)
-            if target:
-                targets.append(target)
-        return targets
+        def repl(match: Match) -> str:
+            inner = re.sub(r"\s+", "", match.group(1))
+            token = f"TEMPLATE_TOKEN_{len(placeholders)}"
+            placeholders[token] = f"{{{{{inner}}}}}"
+            return token
 
-    def _target_from_table(self, table_expr: Optional[exp.Expression], statement: exp.Expression) -> Optional[TargetTable]:
-        if isinstance(table_expr, exp.Table):
-            schema = table_expr.db
-            table = table_expr.name
-            is_temp = bool(statement.args.get("temporary") or statement.args.get("temp"))
-            kind = statement.args.get("kind")
-            if isinstance(kind, str) and "temp" in kind.lower():
-                is_temp = True
-            return TargetTable(schema=schema, table=table, is_temp=is_temp)
-        if isinstance(table_expr, exp.Identifier):
-            return TargetTable(schema=None, table=table_expr.name, is_temp=False)
-        return None
-
-    def _extract_statement_records(self, statement: exp.Expression, normalizer: TemplateNormalizer) -> List[ColumnRecord]:
-        target_columns_override = self._extract_insert_columns(statement)
-        query = self._extract_statement_query(statement)
-        if isinstance(statement, exp.Create):
-            with_clause = statement.args.get("with")
-            if with_clause is not None and isinstance(query, exp.Select):
-                if query.args.get("with") is None:
-                    query.set("with", with_clause)
-        if query is None:
-            return self._extract_create_definition_records(statement, normalizer)
-        return self._extract_query_records(query, normalizer, target_columns_override)
-
-    def _extract_statement_query(self, statement: exp.Expression) -> Optional[exp.Expression]:
-        if isinstance(statement, exp.Create):
-            return statement.args.get("expression") or statement.args.get("query") or statement.args.get("select")
-        if isinstance(statement, exp.Insert):
-            return statement.args.get("expression")
-        if isinstance(statement, exp.Select) and statement.args.get("into"):
-            return statement
-        return None
-
-    def _extract_insert_columns(self, statement: exp.Expression) -> Optional[List[exp.Expression]]:
-        if isinstance(statement, exp.Insert):
-            columns = statement.args.get("columns")
-            if columns:
-                return list(columns)
-        return None
-
-    def _extract_create_definition_records(self, statement: exp.Expression, normalizer: TemplateNormalizer) -> List[ColumnRecord]:
-        records: List[ColumnRecord] = []
-        if isinstance(statement, exp.Create):
-            for coldef in statement.find_all(exp.ColumnDef):
-                target_column = coldef.name
-                records.append(ColumnRecord(target_column=target_column, source_schema=None, source_table=None, source_column=None, logic=normalizer.restore(coldef.sql(dialect="postgres")), sql_process="create"))
-        if not records:
-            records.append(ColumnRecord(target_column=None, source_schema=None, source_table=None, source_column=None, logic=None, sql_process="create"))
-        return records
-
-    def _extract_query_records(self, query: exp.Expression, normalizer: TemplateNormalizer, target_columns_override: Optional[List[exp.Expression]] = None) -> List[ColumnRecord]:
-        visited: Set[int] = set()
-        records: List[ColumnRecord] = []
-        self._extract_query_records_recursive(query=query, normalizer=normalizer, target_columns_override=target_columns_override, visited=visited, include_select=True, in_cte=False, records=records)
-        return self._deduplicate_records(records)
-		
-def _extract_query_records_recursive(self, query: exp.Expression, normalizer: TemplateNormalizer, target_columns_override: Optional[List[exp.Expression]], visited: Set[int], include_select: bool, in_cte: bool, records: List[ColumnRecord]) -> None:
-        if query is None or id(query) in visited:
-            return
-        visited.add(id(query))
-
-        if isinstance(query, exp.With):
-            main_query = query.this
-            if isinstance(main_query, exp.Select) and main_query.args.get("with") is None:
-                main_query.set("with", query)
-            self._extract_query_records_recursive(main_query, normalizer, target_columns_override, visited, include_select, in_cte, records)
-            return
-
-        if isinstance(query, exp.Subquery):
-            self._extract_query_records_recursive(query.this, normalizer, target_columns_override, visited, False, in_cte, records)
-            return
-
-        if isinstance(query, exp.SetOperation):
-            self._extract_query_records_recursive(query.this, normalizer, target_columns_override, visited, include_select, in_cte, records)
-            self._extract_query_records_recursive(query.expression, normalizer, target_columns_override, visited, include_select, in_cte, records)
-            return
-
-        if not isinstance(query, exp.Select):
-            return
-
-        context = self._build_context(query, normalizer)
-        if include_select:
-            select_records = self._extract_select_records(query, context, normalizer, target_columns_override)
-            records.extend(select_records)
-        records.extend(self._extract_clause_records(query, context, normalizer, in_cte))
-
-        with_clause = query.args.get("with")
-        if with_clause is not None:
-            for cte in with_clause.expressions:
-                self._extract_query_records_recursive(cte.this, normalizer, None, visited, False, True, records)
-
-        for subquery in query.find_all(exp.Subquery):
-            self._extract_query_records_recursive(subquery.this, normalizer, None, visited, False, in_cte, records)
-
-    def _extract_select_records(self, query: exp.Select, context: QueryContext, normalizer: TemplateNormalizer, target_columns_override: Optional[List[exp.Expression]] = None) -> List[ColumnRecord]:
-        records: List[ColumnRecord] = []
-        projections = list(query.expressions)
-        for index, projection in enumerate(projections):
-            if self._is_star_projection(projection):
-                records.extend(self._expand_star_projection(projection, context, normalizer))
-                continue
-            target_column = self._output_column_name(projection, target_columns_override, index)
-            sources = self._resolve_expression_sources_to_base(projection, query, context, normalizer)
-            if not sources:
-                logic = normalizer.restore(projection.sql(dialect="postgres"))
-                records.append(ColumnRecord(target_column=target_column, source_schema=None, source_table=None, source_column=None, logic=logic, sql_process="select"))
-            else:
-                for resolved in sources:
-                    records.append(ColumnRecord(target_column=target_column, source_schema=normalizer.restore_identifier(resolved.schema), source_table=normalizer.restore_identifier(resolved.table), source_column=normalizer.restore_identifier(resolved.column), logic=normalizer.restore(resolved.logic) if resolved.logic else normalizer.restore(projection.sql(dialect="postgres")), sql_process="select"))
-        return records
-
-    def _extract_clause_records(self, query: exp.Select, context: QueryContext, normalizer: TemplateNormalizer, in_cte: bool) -> List[ColumnRecord]:
-        records: List[ColumnRecord] = []
-        suffix = "-with" if in_cte else ""
-        where_clause = query.args.get("where")
-        if where_clause is not None:
-            where_logic = f"where {where_clause.this.sql(dialect='postgres')}"
-            records.extend(self._records_for_expression(where_clause.this, query, context, normalizer, f"where{suffix}", include_target=True, logic_override=normalizer.restore(where_logic)))
-
-        for join in query.args.get("joins") or []:
-            on_clause = join.args.get("on")
-            if on_clause is None and join.args.get("using") is None:
-                continue
-            join_expression = on_clause or join.args.get("using")
-            join_logic = self._join_logic(query, join, normalizer, in_cte)
-            records.extend(self._records_for_expression(join_expression, query, context, normalizer, f"join{suffix}", include_target=True, logic_override=join_logic))
-
-        having_clause = query.args.get("having")
-        if having_clause is not None:
-            having_logic = f"having {having_clause.this.sql(dialect='postgres')}"
-            records.extend(self._records_for_expression(having_clause.this, query, context, normalizer, f"having{suffix}", include_target=True, logic_override=normalizer.restore(having_logic)))
-
-        return records
-
-    def _records_for_expression(self, expression: exp.Expression, query: exp.Select, context: QueryContext, normalizer: TemplateNormalizer, sql_process: str, include_target: bool, logic_override: Optional[str] = None) -> List[ColumnRecord]:
-        records: List[ColumnRecord] = []
-        if expression is None:
-            return records
-        sources = self._resolve_expression_sources_to_base(expression, query, context, normalizer)
-        for resolved in sources:
-            target_column = normalizer.restore_identifier(resolved.column) if include_target else None
-            source_logic = normalizer.restore(resolved.logic) if resolved.logic else (logic_override or normalizer.restore(expression.sql(dialect="postgres")))
-            records.append(ColumnRecord(target_column=target_column, source_schema=normalizer.restore_identifier(resolved.schema), source_table=normalizer.restore_identifier(resolved.table), source_column=normalizer.restore_identifier(resolved.column), logic=source_logic, sql_process=sql_process))
-        return records
-
-    def _join_logic(self, query: exp.Select, join: exp.Join, normalizer: TemplateNormalizer, in_cte: bool) -> str:
-        on_clause = join.args.get("on")
-        if in_cte:
-            if on_clause is not None:
-                return normalizer.restore(f"on {on_clause.sql(dialect='postgres')}")
-            return normalizer.restore(join.sql(dialect="postgres"))
-        from_clause = query.args.get("from")
-        left_expr = None
-        if from_clause and from_clause.expressions:
-            left_expr = from_clause.expressions[0]
-        join_sql = join.sql(dialect="postgres")
-        if left_expr is None:
-            return normalizer.restore(join_sql)
-        left_sql = left_expr.sql(dialect="postgres")
-        return normalizer.restore(f"{left_sql} {join_sql}")
-
-    def _resolve_expression_sources_to_base(self, expression: exp.Expression, query: exp.Select, context: QueryContext, normalizer: TemplateNormalizer) -> List[ResolvedColumn]:
-        base_sources: List[ResolvedColumn] = []
-        for column in expression.find_all(exp.Column):
-            if self._is_in_subquery(column, query):
-                continue
-            column_name = column.name
-            table_key = self._normalize_key(column.table)
-            if table_key:
-                table_ref = context.table_refs.get(table_key)
-                if table_ref:
-                    if table_ref.is_cte or table_ref.is_subquery:
-                        if table_ref.columns and column_name.lower() in table_ref.columns:
-                            base_sources.extend(table_ref.columns[column_name.lower()])
-                        continue
-                    else:
-                        base_sources.append(ResolvedColumn(schema=table_ref.schema, table=table_ref.table, column=column_name, logic=None))
-                        continue
-            if len(context.base_tables) == 1:
-                base = context.base_tables[0]
-                base_sources.append(ResolvedColumn(schema=base.schema, table=base.table, column=column_name, logic=None))
-            elif context.base_tables:
-                candidates = self._metadata_resolver.resolve_candidates(column_name, context.base_tables, normalizer)
-                if candidates:
-                    for ref in candidates:
-                        base_sources.append(ResolvedColumn(schema=ref.schema, table=ref.table, column=column_name, logic=None))
-                else:
-                    for ref in context.base_tables:
-                        base_sources.append(ResolvedColumn(schema=ref.schema, table=ref.table, column=column_name, logic=None))
-        for subquery in expression.find_all(exp.Subquery):
-            if subquery.this is query:
-                continue
-            subquery_map = self._build_cte_column_map(subquery.this, normalizer, set())
-            for resolved_list in subquery_map.values():
-                base_sources.extend(resolved_list)
-        unique: Dict[Tuple[Optional[str], Optional[str], Optional[str]], ResolvedColumn] = {}
-        for src in base_sources:
-            key = (src.schema, src.table, src.column)
-            if key not in unique:
-                unique[key] = src
-        return list(unique.values())
-
-    def _build_context(self, query: exp.Select, normalizer: TemplateNormalizer, visited: Optional[Set[int]] = None) -> QueryContext:
-        if visited is None:
-            visited = set()
-        cte_maps: Dict[str, Dict[str, List[ResolvedColumn]]] = {}
-        cte_sources: Dict[str, List[TableRef]] = {}
-        cte_logics: Dict[str, Dict[str, str]] = {}
-        with_clause = query.args.get("with")
-        if with_clause is not None:
-            for cte in with_clause.expressions:
-                cte_name = self._normalize_key(cte.alias_or_name or "")
-                if not cte_name:
-                    continue
-                cte_column_map = self._build_cte_column_map(cte.this, normalizer, visited)
-                cte_maps[cte_name] = cte_column_map
-                cte_sources[cte_name] = self._collect_cte_sources(cte.this, normalizer)
-        table_refs: Dict[str, TableRef] = {}
-        base_tables: List[TableRef] = []
-        for source in self._iter_source_expressions(query):
-            table_ref = self._table_ref_from_expression(source, normalizer, cte_maps, cte_logics, visited)
-            if table_ref is None:
-                continue
-            for key in table_ref.keys():
-                table_refs[key] = table_ref
-            if not table_ref.is_cte and not table_ref.is_subquery:
-                base_tables.append(table_ref)
-        return QueryContext(table_refs=table_refs, base_tables=base_tables, cte_maps=cte_maps, cte_sources=cte_sources, cte_logics=cte_logics)
-
-    def _build_cte_column_map(self, cte_query: exp.Expression, normalizer: TemplateNormalizer, visited: Set[int]) -> Dict[str, List[ResolvedColumn]]:
-        if not isinstance(cte_query, exp.Select):
-            return {}
-        if id(cte_query) in visited:
-            return {}
-        visited.add(id(cte_query))
-        cte_context = self._build_context(cte_query, normalizer, visited)
-        column_map: Dict[str, List[ResolvedColumn]] = {}
-        for projection in cte_query.expressions:
-            if self._is_star_projection(projection):
-                star_sources = self._resolve_star_to_base_tables(projection, cte_context, normalizer)
-                for src_column_name, src_list in star_sources.items():
-                    column_map.setdefault(src_column_name, [])
-                    column_map[src_column_name].extend(src_list)
-                continue
-            output_col_name = self._output_column_name(projection, None, 0)
-            if not output_col_name:
-                continue
-            column_key = output_col_name.lower()
-            projection_logic = projection.sql(dialect="postgres")
-            base_sources = self._resolve_projection_to_base_tables(projection, cte_query, cte_context, normalizer)
-            column_map[column_key] = []
-            for base_src in base_sources:
-                column_map[column_key].append(ResolvedColumn(schema=base_src.schema, table=base_src.table, column=base_src.column, logic=projection_logic))
-        return column_map
-
-    def _resolve_projection_to_base_tables(self, projection: exp.Expression, query: exp.Select, context: QueryContext, normalizer: TemplateNormalizer) -> List[ResolvedColumn]:
-        base_sources: List[ResolvedColumn] = []
-        for column in projection.find_all(exp.Column):
-            if self._is_in_subquery(column, query):
-                continue
-            column_name = column.name
-            table_key = self._normalize_key(column.table)
-            if table_key:
-                table_ref = context.table_refs.get(table_key)
-                if table_ref:
-                    if table_ref.is_cte or table_ref.is_subquery:
-                        if table_ref.columns and column_name.lower() in table_ref.columns:
-                            base_sources.extend(table_ref.columns[column_name.lower()])
-                        continue
-                    else:
-                        base_sources.append(ResolvedColumn(schema=table_ref.schema, table=table_ref.table, column=column_name, logic=None))
-                        continue
-            if len(context.base_tables) == 1:
-                base = context.base_tables[0]
-                base_sources.append(ResolvedColumn(schema=base.schema, table=base.table, column=column_name, logic=None))
-            elif context.base_tables:
-                candidates = self._metadata_resolver.resolve_candidates(column_name, context.base_tables, normalizer)
-                if candidates:
-                    for ref in candidates:
-                        base_sources.append(ResolvedColumn(schema=ref.schema, table=ref.table, column=column_name, logic=None))
-                else:
-                    for ref in context.base_tables:
-                        base_sources.append(ResolvedColumn(schema=ref.schema, table=ref.table, column=column_name, logic=None))
-        unique: Dict[Tuple[Optional[str], Optional[str], Optional[str]], ResolvedColumn] = {}
-        for src in base_sources:
-            key = (src.schema, src.table, src.column)
-            if key not in unique:
-                unique[key] = src
-        return list(unique.values())
-
-    def _resolve_star_to_base_tables(self, projection: exp.Expression, context: QueryContext, normalizer: TemplateNormalizer) -> Dict[str, List[ResolvedColumn]]:
-        result: Dict[str, List[ResolvedColumn]] = {}
-        projection_sql = projection.sql(dialect="postgres")
-        qualifier = None
-        if "." in projection_sql:
-            qualifier = projection_sql.split(".", 1)[0].strip('"')
-        table_refs: List[TableRef] = []
-        if qualifier:
-            ref = context.table_refs.get(qualifier.lower())
-            if ref:
-                table_refs = [ref]
-        elif context.base_tables:
-            table_refs = context.base_tables
-        else:
-            seen_ids: Set[int] = set()
-            for ref in context.table_refs.values():
-                if id(ref) in seen_ids:
-                    continue
-                seen_ids.add(id(ref))
-                table_refs.append(ref)
-        for table_ref in table_refs:
-            if not table_ref.table:
-                continue
-            if table_ref.is_cte or table_ref.is_subquery:
-                if table_ref.columns:
-                    for col_name, resolved_list in table_ref.columns.items():
-                        if col_name == "*":
-                            continue
-                        result.setdefault(col_name, [])
-                        result[col_name].extend(resolved_list)
-                continue
-            columns = self._metadata_columns(table_ref, normalizer)
-            if columns:
-                for col_name in columns:
-                    result.setdefault(col_name.lower(), [])
-                    result[col_name.lower()].append(ResolvedColumn(schema=table_ref.schema, table=table_ref.table, column=col_name, logic=None))
-            else:
-                result.setdefault("*", [])
-                result["*"].append(ResolvedColumn(schema=table_ref.schema, table=table_ref.table, column="*", logic=None))
-        return result
-
-    def _collect_cte_sources(self, query: exp.Expression, normalizer: TemplateNormalizer) -> List[TableRef]:
-        sources: List[TableRef] = []
-        seen: Set[Tuple[Optional[str], Optional[str]]] = set()
-        def collect_from_select(select_expr: exp.Select) -> None:
-            with_clause = select_expr.args.get("with")
-            cte_names = {(cte.alias_or_name or "").lower() for cte in (with_clause.expressions if with_clause else [])}
-            for source in self._iter_source_expressions(select_expr):
-                if isinstance(source, exp.Table):
-                    table_name = source.name
-                    if not table_name:
-                        continue
-                    if table_name.lower() in cte_names and not source.db:
-                        continue
-                    schema = source.db
-                    table = table_name
-                    key = (schema, table)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    sources.append(TableRef(schema=schema, table=table, alias=source.alias_or_name))
-                elif isinstance(source, exp.Subquery):
-                    collect_from_expr(source.this)
-        def collect_from_expr(expr: exp.Expression) -> None:
-            if isinstance(expr, exp.Subquery):
-                collect_from_expr(expr.this)
-                return
-            if isinstance(expr, exp.SetOperation):
-                collect_from_expr(expr.this)
-                collect_from_expr(expr.expression)
-                return
-            if isinstance(expr, exp.Select):
-                collect_from_select(expr)
-        collect_from_expr(query)
-        return sources
-
-    def _iter_source_expressions(self, query: exp.Select) -> Iterable[exp.Expression]:
-        from_clause = query.args.get("from")
-        if from_clause is not None:
-            for expr in from_clause.expressions:
-                yield expr
-        for join in query.args.get("joins") or []:
-            source = join.this
-            if isinstance(source, exp.Lateral):
-                source = source.this
-            if source is not None:
-                yield source
-
-    def _table_ref_from_expression(self, expr: exp.Expression, normalizer: TemplateNormalizer, cte_maps: Dict[str, Dict[str, List[ResolvedColumn]]], cte_logics: Dict[str, Dict[str, str]], visited: Optional[Set[int]] = None) -> Optional[TableRef]:
-        if isinstance(expr, exp.Table):
-            schema = expr.db
-            table = expr.name
-            alias = expr.alias_or_name
-            table_key = self._normalize_key(table)
-            is_cte = table_key in cte_maps if table_key else False
-            columns = cte_maps.get(table_key) if is_cte and table_key else None
-            column_logics = cte_logics.get(table_key) if is_cte and table_key else None
-            return TableRef(schema=schema, table=table, alias=alias, is_cte=is_cte, columns=columns, column_logics=column_logics)
-        if isinstance(expr, exp.Subquery):
-            alias = expr.alias_or_name
-            subquery_column_map = self._build_cte_column_map(expr.this, normalizer, visited or set())
-            return TableRef(schema=None, table=alias, alias=alias, is_subquery=True, columns=subquery_column_map, column_logics=None)
-        if isinstance(expr, exp.Select):
-            subquery_column_map = self._build_cte_column_map(expr, normalizer, visited or set())
-            return TableRef(schema=None, table=None, alias=None, is_subquery=True, columns=subquery_column_map, column_logics=None)
-        return None
-		
-		
-def _output_column_name(self, projection: exp.Expression, target_columns_override: Optional[List[exp.Expression]], index: int) -> Optional[str]:
-        if target_columns_override and index < len(target_columns_override):
-            override = target_columns_override[index]
-            if isinstance(override, exp.Column):
-                return override.name
-            if isinstance(override, exp.Identifier):
-                return override.name
-            return override.sql(dialect="postgres")
-        if isinstance(projection, exp.Alias):
-            return projection.alias
-        if projection.alias_or_name:
-            return projection.alias_or_name
-        if isinstance(projection, exp.Column):
-            return projection.name
-        return projection.sql(dialect="postgres")
-
-    def _is_star_projection(self, projection: exp.Expression) -> bool:
-        if isinstance(projection, exp.Star):
-            return True
-        if isinstance(projection, exp.Column) and projection.name == "*":
-            return True
-        return False
-
-    def _expand_star_projection(self, projection: exp.Expression, context: QueryContext, normalizer: TemplateNormalizer, map_only: bool = False) -> List[ColumnRecord]:
-        qualifier = None
-        projection_sql = projection.sql(dialect="postgres")
-        if "." in projection_sql:
-            qualifier = projection_sql.split(".", 1)[0].strip('"')
-        table_refs: List[TableRef] = []
-        if qualifier:
-            ref = context.table_refs.get(qualifier.lower())
-            if ref:
-                table_refs = [ref]
-        elif context.base_tables:
-            table_refs = context.base_tables
-        else:
-            seen_ids: Set[int] = set()
-            for ref in context.table_refs.values():
-                if id(ref) in seen_ids:
-                    continue
-                seen_ids.add(id(ref))
-                table_refs.append(ref)
-        expanded_records: List[ColumnRecord] = []
-        for table_ref in table_refs:
-            if not table_ref.table:
-                continue
-            if table_ref.is_cte or table_ref.is_subquery:
-                if not table_ref.columns:
-                    continue
-                for column_name, resolved_list in table_ref.columns.items():
-                    if column_name == "*":
-                        continue
-                    for resolved in resolved_list:
-                        expanded_records.append(ColumnRecord(target_column=column_name, source_schema=normalizer.restore_identifier(resolved.schema), source_table=normalizer.restore_identifier(resolved.table), source_column=normalizer.restore_identifier(resolved.column), logic=normalizer.restore(resolved.logic) if resolved.logic else normalizer.restore(projection_sql), sql_process="select"))
-                continue
-            columns = self._metadata_columns(table_ref, normalizer)
-            if not columns:
-                expanded_records.append(ColumnRecord(target_column="*", source_schema=normalizer.restore_identifier(table_ref.schema), source_table=normalizer.restore_identifier(table_ref.table), source_column="*", logic=normalizer.restore(projection_sql), sql_process="select"))
-                continue
-            for column_name in columns:
-                expanded_records.append(ColumnRecord(target_column=column_name, source_schema=normalizer.restore_identifier(table_ref.schema), source_table=normalizer.restore_identifier(table_ref.table), source_column=column_name, logic=normalizer.restore(projection_sql), sql_process="select"))
-        return expanded_records
-
-    def _metadata_columns(self, table_ref: TableRef, normalizer: TemplateNormalizer) -> List[str]:
-        if not table_ref.table:
-            return []
-        schema = table_ref.schema
-        if normalizer.is_placeholder(schema) or normalizer.is_placeholder(table_ref.table):
-            return []
-        cache_key = (schema.lower() if schema else None, table_ref.table.lower())
-        columns = self._metadata_resolver._cache.get(cache_key)
-        if columns is None:
-            columns = self._metadata_resolver._fetch_columns(schema, table_ref.table)
-            self._metadata_resolver._cache[cache_key] = columns
-        return sorted(columns)
-
-    def _is_in_subquery(self, column: exp.Column, query: exp.Select) -> bool:
-        ancestor = column.find_ancestor(exp.Subquery)
-        if ancestor is None:
-            return False
-        return ancestor.this is not query
-
-    def _regex_fallback(self, sanitized_sql: str, normalizer: TemplateNormalizer) -> List[ColumnRecord]:
-        pattern = re.compile(r"""(?ix)(?:select)\s+(?P<columns>.+?)\s+from\s+(?P<table>[a-z0-9_.]+)""")
-        records: List[ColumnRecord] = []
-        for match in pattern.finditer(sanitized_sql):
-            table_name = match.group("table")
-            columns = [col.strip() for col in match.group("columns").split(",")]
-            for col in columns:
-                column_name = col.split()[-1] if " " in col else col
-                records.append(ColumnRecord(target_column=normalizer.restore(column_name), source_schema=None, source_table=normalizer.restore(table_name), source_column=normalizer.restore(column_name), logic=normalizer.restore(col), sql_process="select"))
-        return records
-
-    def _regex_targets(self, sanitized_sql: str, normalizer: TemplateNormalizer) -> List[TargetTable]:
-        targets: List[TargetTable] = []
-        pattern = re.compile(r"""(?ix)(?:create\s+(?:temporary|temp)?\s*table|insert\s+into)\s+(?:if\s+not\s+exists\s+)?(?:(?P<schema>[a-z0-9_]+)\.)?(?P<table>[a-z0-9_]+)""")
-        seen: Set[Tuple[Optional[str], Optional[str]]] = set()
-        for match in pattern.finditer(sanitized_sql):
-            schema = normalizer.restore(match.group("schema"))
-            table = normalizer.restore(match.group("table"))
-            key = (schema, table)
-            if key in seen:
-                continue
-            seen.add(key)
-            targets.append(TargetTable(schema=schema, table=table))
-        return targets
-
-    def _deduplicate_records(self, records: Sequence[ColumnRecord]) -> List[ColumnRecord]:
-        unique: Dict[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]], ColumnRecord] = {}
-        for record in records:
-            key = (record.target_column, record.source_schema, record.source_table, record.source_column, record.logic, record.sql_process)
-            unique[key] = record
-        return list(unique.values())
+        sanitized = self.TEMPLATE_PATTERN.sub(repl, sql_text)
+        return sanitized, placeholders
+    
+    def _prepare_do_block(self, block_text: str) -> str:
+        block = self._remove_raise_statements(block_text)
+        block = re.sub(r"\blanguage\s+\w+\s*;?", "", block, flags=re.I)
+        block = re.sub(r"^\s*begin\b", "", block, flags=re.I)
+        block = re.sub(r"\bend\s*;?\s*$", "", block, flags=re.I)
+        block = re.sub(r"\bif\b.+?\bthen\b", "", block, flags=re.I | re.S)
+        block = re.sub(r"\belse\b", "", block, flags=re.I)
+        block = re.sub(r"\bend\s+if\b", "", block, flags=re.I)
+        return block
+    
+    def _remove_raise_statements(self, sql_text: str) -> str:
+        return re.sub(r"\braise\s+(?:exception|error).*?;", "", sql_text, flags=re.I | re.S)
 
 
-class LineageBuilder:
-    def __init__(self, fetcher: GitLabSQLFetcher, parser: SQLColumnParser) -> None:
+class ColumnLineageBuilder:
+    def __init__(self, fetcher: GitLabSQLFetcher, parser: ColumnLineageParser) -> None:
         self._fetcher = fetcher
         self._parser = parser
 
-    def build(self, progress_callback: Optional[Callable[[Sequence[ColumnLineageRow]], None]] = None, run_timestamp: Optional[datetime.datetime] = None) -> List[ColumnLineageRow]:
+    def build(
+        self,
+        progress_callback: Optional[Callable[[Sequence[ColumnLineageRow]], None]] = None,
+        run_timestamp: Optional[datetime.datetime] = None,
+    ) -> List[ColumnLineageRow]:
         timestamp = run_timestamp or datetime.datetime.utcnow()
         rows: List[ColumnLineageRow] = []
+        
         for file_path in self._fetcher.iter_sql_paths():
             logging.info("Processing %s", file_path)
             try:
                 sql_text = self._fetcher.fetch_sql(file_path)
-                statement_results = self._parser.extract_records(sql_text)
+                lineage_records = self._parser.extract_column_lineage(sql_text)
+                
                 filename = Path(file_path).name
                 target_table = Path(filename).stem
                 process = derive_process(file_path)
-                for result in statement_results:
-                    for record in result.records:
-                        targets = result.targets or [TargetTable(schema=None, table=None)]
-                        for target in targets:
-                            rows.append(ColumnLineageRow(filename=filename, filepath=file_path, process=process, target_table=target_table, sub_target_schema=target.schema, sub_target_table=target.table, target_column=record.target_column, source_schema=record.source_schema, source_table=record.source_table, source_column=record.source_column, logic=record.logic, sql_process=record.sql_process, current_timestamp=timestamp))
-            except Exception as exc:
+                
+                for record in lineage_records:
+                    row = ColumnLineageRow(
+                        filename=filename,
+                        filepath=file_path,
+                        process=process,
+                        target_table=target_table,
+                        sub_target_schema=record.get("sub_target_schema"),
+                        sub_target_table=record.get("sub_target_table"),
+                        target_column=record.get("target_column"),
+                        source_schema=record.get("source_schema"),
+                        source_table=record.get("source_table"),
+                        source_column=record.get("source_column"),
+                        logic=record.get("logic"),
+                        sql_process=record.get("sql_process"),
+                        current_timestamp=timestamp,
+                    )
+                    rows.append(row)
+                    
+            except Exception as exc:  # noqa: BLE001
                 logging.exception("Failed to process %s: %s", file_path, exc)
             finally:
                 if progress_callback:
                     progress_callback(rows)
+        
         return rows
 
 
@@ -911,66 +1150,134 @@ class DatabaseUploader:
         with psycopg2.connect(**self._db_config) as conn:
             conn.autocommit = False
             with conn.cursor() as cur:
-                cur.execute(sql.SQL("DROP TABLE IF EXISTS {}.{}").format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TARGET_TABLE)))
-                cur.execute(sql.SQL("""CREATE TABLE {}.{} (filename TEXT, filepath TEXT, process TEXT, target_table TEXT, sub_target_schema TEXT, sub_target_table TEXT, target_column TEXT, source_schema TEXT, source_table TEXT, source_column TEXT, logic TEXT, sql_process TEXT, "current_timestamp" TIMESTAMP)""").format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TARGET_TABLE)))
-                values = [(row.filename, row.filepath, row.process, row.target_table, row.sub_target_schema, row.sub_target_table, row.target_column, row.source_schema, row.source_table, row.source_column, row.logic, row.sql_process, row.current_timestamp) for row in rows]
+                cur.execute(
+                    sql.SQL("DROP TABLE IF EXISTS {}.{}").format(
+                        sql.Identifier(TARGET_SCHEMA), sql.Identifier(TARGET_TABLE)
+                    )
+                )
+                cur.execute(
+                    sql.SQL(
+                        """
+                        CREATE TABLE {}.{} (
+                            filename TEXT,
+                            filepath TEXT,
+                            process TEXT,
+                            target_table TEXT,
+                            sub_target_schema TEXT,
+                            sub_target_table TEXT,
+                            target_column TEXT,
+                            source_schema TEXT,
+                            source_table TEXT,
+                            source_column TEXT,
+                            logic TEXT,
+                            sql_process TEXT,
+                            "current_timestamp" TIMESTAMP
+                        )
+                        """
+                    ).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TARGET_TABLE))
+                )
+                values = [
+                    (
+                        row.filename,
+                        row.filepath,
+                        row.process,
+                        row.target_table,
+                        row.sub_target_schema,
+                        row.sub_target_table,
+                        row.target_column,
+                        row.source_schema,
+                        row.source_table,
+                        row.source_column,
+                        row.logic,
+                        row.sql_process,
+                        row.current_timestamp,
+                    )
+                    for row in rows
+                ]
                 if values:
-                    execute_values(cur, sql.SQL('INSERT INTO {}.{} (filename, filepath, process, target_table, sub_target_schema, sub_target_table, target_column, source_schema, source_table, source_column, logic, sql_process, "current_timestamp") VALUES %s').format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TARGET_TABLE)), values)
-                cur.execute(sql.SQL("ALTER TABLE {}.{} OWNER TO {}").format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TARGET_TABLE), sql.Identifier(TARGET_OWNER)))
-                cur.execute(sql.SQL("GRANT SELECT ON {}.{} TO {}").format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TARGET_TABLE), sql.Identifier(TARGET_READER)))
+                    execute_values(
+                        cur,
+                        sql.SQL(
+                            'INSERT INTO {}.{} (filename, filepath, process, target_table, sub_target_schema, sub_target_table, target_column, source_schema, source_table, source_column, logic, sql_process, "current_timestamp") VALUES %s'
+                        ).format(
+                            sql.Identifier(TARGET_SCHEMA), sql.Identifier(TARGET_TABLE)
+                        ),
+                        values,
+                    )
+                cur.execute(
+                    sql.SQL(
+                        "ALTER TABLE {}.{} OWNER TO {}"
+                    ).format(
+                        sql.Identifier(TARGET_SCHEMA),
+                        sql.Identifier(TARGET_TABLE),
+                        sql.Identifier(TARGET_OWNER),
+                    )
+                )
+                cur.execute(
+                    sql.SQL(
+                        "GRANT SELECT ON {}.{} TO {}"
+                    ).format(
+                        sql.Identifier(TARGET_SCHEMA),
+                        sql.Identifier(TARGET_TABLE),
+                        sql.Identifier(TARGET_READER),
+                    )
+                )
             conn.commit()
 
 
 def rows_to_dataframe(rows: Sequence[ColumnLineageRow]) -> pd.DataFrame:
-    data = [{"filename": row.filename, "filepath": row.filepath, "process": row.process, "target_table": row.target_table, "sub_target_schema": row.sub_target_schema, "sub_target_table": row.sub_target_table, "target_column": row.target_column, "source_schema": row.source_schema, "source_table": row.source_table, "source_column": row.source_column, "logic": row.logic, "sql_process": row.sql_process, "current_timestamp": row.current_timestamp} for row in rows]
+    data = [
+        {
+            "filename": row.filename,
+            "filepath": row.filepath,
+            "process": row.process,
+            "target_table": row.target_table,
+            "sub_target_schema": row.sub_target_schema,
+            "sub_target_table": row.sub_target_table,
+            "target_column": row.target_column,
+            "source_schema": row.source_schema,
+            "source_table": row.source_table,
+            "source_column": row.source_column,
+            "logic": row.logic,
+            "sql_process": row.sql_process,
+            "current_timestamp": row.current_timestamp,
+        }
+        for row in rows
+    ]
     return pd.DataFrame(data, columns=LINEAGE_COLUMNS)
 
 
-def write_to_excel(df: pd.DataFrame, run_timestamp: Optional[datetime.datetime] = None, output_path: Optional[str] = None) -> str:
+def write_to_excel(
+    df: pd.DataFrame,
+    run_timestamp: Optional[datetime.datetime] = None,
+    output_path: Optional[str] = None,
+) -> str:
     if output_path is None:
         if run_timestamp is None:
             raise ValueError("run_timestamp must be provided when output_path is None.")
         timestamp_str = run_timestamp.strftime("%Y%m%d%H%M%S")
-        output_path = f"{OUTPUT_PREFIX}_{timestamp_str}.xlsx"
+        output_path = f"{OUTPUT_PREFIX}_auto_refresh_{timestamp_str}.xlsx"
     df.to_excel(output_path, index=False)
     logging.info("Wrote %s", output_path)
     return output_path
 
 
-def _read_secret(label: str, env_key: str, arg_value: Optional[str]) -> str:
-    if arg_value:
-        return arg_value
-    env_value = os.environ.get(env_key)
-    if env_value:
-        return env_value
-    if sys.stdin.isatty():
-        return getpass.getpass(label)
-    try:
-        return input(label)
-    except EOFError as exc:
-        raise RuntimeError(f"Missing {env_key}. Provide CLI args or set the env var.") from exc
-
-
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="IKG Column Lineage Auto Refresh")
-    parser.add_argument("--gitlab-token", dest="gitlab_token", help=f"GitLab token (or set {GITLAB_TOKEN_ENV}).")
-    parser.add_argument("--db-password", dest="db_password", help=f"DB password (or set {DB_PASSWORD_ENV}).")
-    return parser.parse_args()
-
-
 def main() -> None:
-    args = _parse_args()
-    logging.basicConfig(level=getattr(logging, LOG_LEVEL.upper(), logging.DEBUG), format="%(asctime)s - %(levelname)s - %(message)s")
-    private_token = _read_secret(f"Enter your private token (or set {GITLAB_TOKEN_ENV}): ", GITLAB_TOKEN_ENV, args.gitlab_token)
-    db_password = _read_secret(f"Enter Password for DB User (or set {DB_PASSWORD_ENV}): ", DB_PASSWORD_ENV, args.db_password)
+    logging.basicConfig(
+        level=getattr(logging, LOG_LEVEL.upper(), logging.DEBUG),
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
+
+    private_token = getpass.getpass("Enter your private token: ")
+    db_password = getpass.getpass("Enter Password for DB User: ")
+
     exclude_folders = [folder for folder in EXCLUDE_FOLDER.split() if folder]
     fetcher = GitLabSQLFetcher(private_token=private_token, exclude_folders=exclude_folders)
-    db_config = {"host": "greenplum-rdsp.zur.swissbank.com", "port": "5432", "dbname": "gprdsp", "user": "ds_rdsp_dev", "password": db_password}
-    metadata_resolver = MetadataResolver(db_config)
-    parser = SQLColumnParser(metadata_resolver)
-    builder = LineageBuilder(fetcher, parser)
+    parser = ColumnLineageParser()
+    builder = ColumnLineageBuilder(fetcher, parser)
     run_timestamp = datetime.datetime.utcnow()
-    output_file = f"{OUTPUT_PREFIX}_{run_timestamp.strftime('%Y%m%d%H%M%S')}.xlsx"
+    output_file = f"{OUTPUT_PREFIX}_auto_refresh_{run_timestamp.strftime('%Y%m%d%H%M%S')}.xlsx"
+    # Initialize the Excel file with headers
     write_to_excel(rows_to_dataframe([]), output_path=output_file)
 
     def flush_excel(current_rows: Sequence[ColumnLineageRow]) -> None:
@@ -979,9 +1286,16 @@ def main() -> None:
 
     rows = builder.build(progress_callback=flush_excel, run_timestamp=run_timestamp)
     logging.info("Captured %d column lineage rows", len(rows))
+
+    db_config = {
+        "host": "greenplum-rdsp.zur.swissbank.com",
+        "port": "5432",
+        "dbname": "gprdsp",
+        "user": "ds_rdsp_dev",
+        "password": db_password,
+    }
     uploader = DatabaseUploader(db_config)
     uploader.refresh_table(rows)
-    metadata_resolver.close()
 
 
 if __name__ == "__main__":
