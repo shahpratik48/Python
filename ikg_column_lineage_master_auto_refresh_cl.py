@@ -65,10 +65,12 @@ class ColumnLineageRow:
 
 
 def derive_process(file_path: str) -> str:
+    """Derive process from the last subfolder before the SQL file."""
     parts = Path(file_path).parts
-    prefix_len = len(SQL_PATH_PARTS)
-    if parts[:prefix_len] == SQL_PATH_PARTS and len(parts) > prefix_len:
-        return parts[prefix_len]
+    # Get the parent directory of the file (last folder before the .sql file)
+    if len(parts) >= 2:
+        # parts[-1] is the filename, parts[-2] is the last folder
+        return parts[-2]
     return ""
 
 
@@ -226,6 +228,15 @@ class ColumnLineageParser:
         with_node = select_node.args.get("with")
         if with_node:
             self._extract_cte_definitions(with_node, placeholders)
+            
+            # IMPORTANT: Also process joins/where/having from WITHIN each CTE
+            cte_internal_records = self._process_cte_internals(
+                with_node, 
+                target_table, 
+                target_schema, 
+                placeholders
+            )
+            records.extend(cte_internal_records)
         
         # Build table alias map (now CTEs are already defined)
         self._build_table_aliases(select_node, placeholders)
@@ -255,17 +266,60 @@ class ColumnLineageParser:
                             "sql_process": "select"
                         })
         
-        # Process JOIN clauses
-        join_records = self._process_joins(select_node, placeholders)
+        # Process JOIN clauses - now with proper target table and column tracking
+        join_records = self._process_joins(select_node, placeholders, target_table, target_schema)
         records.extend(join_records)
         
         # Process WHERE clause
-        where_records = self._process_where(select_node, placeholders)
+        where_records = self._process_where(select_node, placeholders, target_table, target_schema)
         records.extend(where_records)
         
         # Process HAVING clause
-        having_records = self._process_having(select_node, placeholders)
+        having_records = self._process_having(select_node, placeholders, target_table, target_schema)
         records.extend(having_records)
+        
+        return records
+    
+    def _process_cte_internals(
+        self,
+        with_node: exp.With,
+        target_table: Optional[str],
+        target_schema: Optional[str],
+        placeholders: Dict[str, str]
+    ) -> List[Dict]:
+        """Process joins/where/having from within CTE definitions."""
+        records = []
+        
+        for cte in with_node.expressions:
+            if isinstance(cte, exp.CTE):
+                cte_query = cte.this
+                
+                if isinstance(cte_query, exp.Select):
+                    # Save current state
+                    saved_aliases = self.table_aliases.copy()
+                    saved_ctes = self.cte_definitions.copy()
+                    
+                    # Process nested CTEs if any
+                    nested_with = cte_query.args.get("with")
+                    if nested_with:
+                        self._extract_cte_definitions(nested_with, placeholders)
+                    
+                    # Build table aliases for this CTE
+                    self._build_table_aliases(cte_query, placeholders)
+                    
+                    # Process joins/where/having within this CTE
+                    cte_joins = self._process_joins(cte_query, placeholders, target_table, target_schema)
+                    records.extend(cte_joins)
+                    
+                    cte_where = self._process_where(cte_query, placeholders, target_table, target_schema)
+                    records.extend(cte_where)
+                    
+                    cte_having = self._process_having(cte_query, placeholders, target_table, target_schema)
+                    records.extend(cte_having)
+                    
+                    # Restore state
+                    self.table_aliases = saved_aliases
+                    self.cte_definitions = saved_ctes
         
         return records
     
@@ -485,6 +539,63 @@ class ColumnLineageParser:
         
         return results
     
+    def _trace_logic_through_ctes(
+        self,
+        table_ref: Optional[str],
+        column_name: str,
+        original_logic: str,
+        select_node: exp.Select,
+        placeholders: Dict[str, str]
+    ) -> str:
+        """Trace the logic for a column back through CTEs to get the original source logic."""
+        if not table_ref:
+            return original_logic
+        
+        # Check if this table reference is a CTE alias
+        if table_ref in self.table_aliases:
+            table_info = self.table_aliases[table_ref]
+            
+            if table_info.get("is_cte", False):
+                # This is a CTE - get the original logic from the CTE definition
+                cte_name = table_info.get("table")
+                cte_select = self.cte_definitions.get(cte_name)
+                
+                if cte_select:
+                    # Find the column in the CTE's SELECT clause
+                    for projection in cte_select.expressions:
+                        proj_alias = None
+                        proj_expr = projection
+                        
+                        if isinstance(projection, exp.Alias):
+                            proj_alias = projection.alias
+                            proj_expr = projection.this
+                        elif isinstance(proj_expr, exp.Column):
+                            proj_alias = proj_expr.name
+                        
+                        if proj_alias == column_name:
+                            # Get the original logic from the CTE
+                            cte_logic = projection.sql(dialect="postgres")
+                            
+                            # Check if we need to trace further through nested CTEs
+                            source_cols = self._extract_source_columns_from_expr(proj_expr)
+                            if source_cols and len(source_cols) == 1:
+                                src_col = source_cols[0]
+                                src_table = src_col.get("table")
+                                src_column = src_col.get("column")
+                                
+                                # Recursively trace if this is also from a CTE
+                                return self._trace_logic_through_ctes(
+                                    src_table,
+                                    src_column,
+                                    cte_logic,
+                                    cte_select,
+                                    placeholders
+                                )
+                            
+                            return cte_logic
+        
+        return original_logic
+    
     def _build_table_aliases(self, select_node: exp.Select, placeholders: Dict[str, str]):
         """Build a map of table aliases to actual tables."""
         self.table_aliases = {}
@@ -589,7 +700,7 @@ class ColumnLineageParser:
         return tables
     
     def _extract_cte_definitions(self, with_node: exp.With, placeholders: Dict[str, str]):
-        """Extract all CTE definitions."""
+        """Extract all CTE definitions and process their internal joins/where/having."""
         for cte in with_node.expressions:
             if isinstance(cte, exp.CTE):
                 cte_name = cte.alias
@@ -604,8 +715,14 @@ class ColumnLineageParser:
                     if nested_with:
                         self._extract_cte_definitions(nested_with, placeholders)
     
-    def _process_joins(self, select_node: exp.Select, placeholders: Dict[str, str]) -> List[Dict]:
-        """Process JOIN clauses to extract column lineage."""
+    def _process_joins(
+        self, 
+        select_node: exp.Select, 
+        placeholders: Dict[str, str],
+        target_table: Optional[str],
+        target_schema: Optional[str]
+    ) -> List[Dict]:
+        """Process JOIN clauses to extract column lineage with proper target column tracking."""
         records = []
         
         joins = select_node.args.get("joins", [])
@@ -621,26 +738,45 @@ class ColumnLineageParser:
                 if select_node.args.get("with"):
                     sql_process = "join-with"
                 
+                # Process each column in the join condition
                 for col_info in columns:
                     col_data = {"source_column_expr": col_info}
                     resolved = self._resolve_source_column(col_data, select_node, placeholders)
                     
+                    # Get the target column name from the join condition
+                    target_col_name = col_info.get("column")
+                    
+                    # Trace the original logic through CTEs if applicable
+                    original_logic = self._trace_logic_through_ctes(
+                        col_info.get("table"),
+                        col_info.get("column"),
+                        logic,
+                        select_node,
+                        placeholders
+                    )
+                    
                     for src_rec in resolved:
                         records.append({
-                            "sub_target_schema": None,
-                            "sub_target_table": None,
-                            "target_column": None,
+                            "sub_target_schema": target_schema,
+                            "sub_target_table": target_table,
+                            "target_column": target_col_name,
                             "source_schema": src_rec.get("source_schema"),
                             "source_table": src_rec.get("source_table"),
                             "source_column": src_rec.get("source_column"),
-                            "logic": logic,
+                            "logic": original_logic,
                             "sql_process": sql_process
                         })
         
         return records
     
-    def _process_where(self, select_node: exp.Select, placeholders: Dict[str, str]) -> List[Dict]:
-        """Process WHERE clause to extract column lineage."""
+    def _process_where(
+        self, 
+        select_node: exp.Select, 
+        placeholders: Dict[str, str],
+        target_table: Optional[str],
+        target_schema: Optional[str]
+    ) -> List[Dict]:
+        """Process WHERE clause to extract column lineage with proper target tracking."""
         records = []
         
         where_expr = select_node.args.get("where")
@@ -657,22 +793,40 @@ class ColumnLineageParser:
                 col_data = {"source_column_expr": col_info}
                 resolved = self._resolve_source_column(col_data, select_node, placeholders)
                 
+                # Get the target column name
+                target_col_name = col_info.get("column")
+                
+                # Trace the original logic through CTEs
+                original_logic = self._trace_logic_through_ctes(
+                    col_info.get("table"),
+                    col_info.get("column"),
+                    logic,
+                    select_node,
+                    placeholders
+                )
+                
                 for src_rec in resolved:
                     records.append({
-                        "sub_target_schema": None,
-                        "sub_target_table": None,
-                        "target_column": None,
+                        "sub_target_schema": target_schema,
+                        "sub_target_table": target_table,
+                        "target_column": target_col_name,
                         "source_schema": src_rec.get("source_schema"),
                         "source_table": src_rec.get("source_table"),
                         "source_column": src_rec.get("source_column"),
-                        "logic": logic,
+                        "logic": original_logic,
                         "sql_process": sql_process
                     })
         
         return records
     
-    def _process_having(self, select_node: exp.Select, placeholders: Dict[str, str]) -> List[Dict]:
-        """Process HAVING clause to extract column lineage."""
+    def _process_having(
+        self, 
+        select_node: exp.Select, 
+        placeholders: Dict[str, str],
+        target_table: Optional[str],
+        target_schema: Optional[str]
+    ) -> List[Dict]:
+        """Process HAVING clause to extract column lineage with proper target tracking."""
         records = []
         
         having_expr = select_node.args.get("having")
@@ -689,15 +843,27 @@ class ColumnLineageParser:
                 col_data = {"source_column_expr": col_info}
                 resolved = self._resolve_source_column(col_data, select_node, placeholders)
                 
+                # Get the target column name
+                target_col_name = col_info.get("column")
+                
+                # Trace the original logic through CTEs
+                original_logic = self._trace_logic_through_ctes(
+                    col_info.get("table"),
+                    col_info.get("column"),
+                    logic,
+                    select_node,
+                    placeholders
+                )
+                
                 for src_rec in resolved:
                     records.append({
-                        "sub_target_schema": None,
-                        "sub_target_table": None,
-                        "target_column": None,
+                        "sub_target_schema": target_schema,
+                        "sub_target_table": target_table,
+                        "target_column": target_col_name,
                         "source_schema": src_rec.get("source_schema"),
                         "source_table": src_rec.get("source_table"),
                         "source_column": src_rec.get("source_column"),
-                        "logic": logic,
+                        "logic": original_logic,
                         "sql_process": sql_process
                     })
         
