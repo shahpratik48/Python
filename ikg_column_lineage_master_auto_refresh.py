@@ -760,15 +760,17 @@ class ColumnLineageParser:
             )
         
         # Create a record for each column
+        # IMPORTANT: target_column = source_column (same column name)
         for col_info in columns:
+            column_name = col_info.get("column_name")
             records.append({
                 "sub_target_schema": target_schema,
                 "sub_target_table": target_table,
-                "target_column": col_info.get("column_name"),
+                "target_column": column_name,  # Same as source_column
                 "source_schema": col_info.get("source_schema"),
                 "source_table": col_info.get("source_table"),
-                "source_column": col_info.get("column_name"),
-                "logic": col_info.get("logic", col_info.get("column_name")),
+                "source_column": column_name,  # Same as target_column
+                "logic": col_info.get("logic", column_name),
                 "sql_process": "select*"
             })
         
@@ -841,52 +843,99 @@ class ColumnLineageParser:
         """Extract column names and their source info from a SELECT statement."""
         columns = []
         
+        # First, check if we need to process CTEs for this SELECT
+        saved_ctes = self.cte_definitions.copy()
+        saved_aliases = self.table_aliases.copy()
+        
+        with_node = select_node.args.get("with")
+        if with_node:
+            self._extract_cte_definitions(with_node, placeholders)
+        
+        self._build_table_aliases(select_node, placeholders)
+        
         for projection in select_node.expressions:
             if isinstance(projection, exp.Star):
-                # Recursively expand * in CTE
+                # Handle * in CTE - recursively expand
+                table_qualifier = None
+                if hasattr(projection, 'table') and projection.table:
+                    table_qualifier = projection.table
+                
+                if table_qualifier:
+                    # Expand table.*
+                    expanded = self._get_columns_for_table(
+                        table_qualifier,
+                        select_node,
+                        placeholders
+                    )
+                    columns.extend(expanded)
+                else:
+                    # Expand *
+                    expanded = self._get_columns_for_all_tables(
+                        select_node,
+                        placeholders
+                    )
+                    columns.extend(expanded)
                 continue
             
             col_name = None
             col_logic = projection.sql(dialect="postgres")
+            source_schema = None
+            source_table = None
             
             if isinstance(projection, exp.Alias):
                 col_name = projection.alias
+                proj_expr = projection.this
             elif isinstance(projection, exp.Column):
                 col_name = projection.name
+                proj_expr = projection
+            else:
+                # Expression without alias
+                col_name = None
+                proj_expr = projection
             
             if col_name:
                 # Try to resolve source
-                col_info_list = self._extract_column_info(projection, placeholders)
+                source_cols = self._extract_source_columns_from_expr(proj_expr)
                 
-                if col_info_list and not col_info_list[0].get("is_star", False):
-                    col_data = col_info_list[0]
-                    source_col_expr = col_data.get("source_column_expr")
+                if source_cols and len(source_cols) > 0:
+                    # Get the first source column
+                    src_col = source_cols[0]
+                    table_ref = src_col.get("table")
                     
-                    if source_col_expr:
-                        # Resolve the source
-                        resolved = self._resolve_source_column(
-                            col_data,
-                            select_node,
-                            placeholders
-                        )
+                    # Resolve the source table
+                    if table_ref and table_ref in self.table_aliases:
+                        table_info = self.table_aliases[table_ref]
                         
-                        if resolved:
-                            src_rec = resolved[0]
-                            columns.append({
-                                "column_name": col_name,
-                                "source_schema": src_rec.get("source_schema"),
-                                "source_table": src_rec.get("source_table"),
-                                "logic": col_logic
-                            })
-                            continue
+                        if table_info.get("is_cte", False):
+                            # Resolve through CTE
+                            cte_name = table_info.get("table")
+                            cte_resolved = self._resolve_from_cte(
+                                cte_name,
+                                src_col.get("column"),
+                                placeholders
+                            )
+                            
+                            if cte_resolved and len(cte_resolved) > 0:
+                                source_schema = cte_resolved[0].get("source_schema")
+                                source_table = cte_resolved[0].get("source_table")
+                        else:
+                            # Direct table
+                            source_schema = table_info.get("schema")
+                            source_table = table_info.get("table")
+                    elif table_ref:
+                        # Direct table reference
+                        source_table = table_ref
                 
-                # Fallback
                 columns.append({
                     "column_name": col_name,
-                    "source_schema": None,
-                    "source_table": None,
+                    "source_schema": source_schema,
+                    "source_table": source_table,
                     "logic": col_logic
                 })
+        
+        # Restore state
+        self.cte_definitions = saved_ctes
+        self.table_aliases = saved_aliases
         
         return columns
     
@@ -896,13 +945,47 @@ class ColumnLineageParser:
         table_name: str,
         placeholders: Dict[str, str]
     ) -> List[Dict]:
-        """Get columns from information_schema (placeholder - requires DB connection)."""
-        # This is a placeholder for future implementation
-        # Would require database connection to query information_schema.columns
-        # For now, return empty list
+        """Get columns from information_schema.
+        
+        This is a placeholder for future implementation that requires database connection.
+        
+        To implement with database connection, add this to the __init__ method:
+            self.db_connection = psycopg2.connect(**db_config)  # or pass connection
+        
+        Then implement this method as:
+            def _get_columns_from_information_schema(self, schema, table_name, placeholders):
+                if not hasattr(self, 'db_connection') or not self.db_connection:
+                    return []
+                
+                try:
+                    with self.db_connection.cursor() as cur:
+                        query = '''
+                            SELECT column_name
+                            FROM information_schema.columns
+                            WHERE table_schema = %s
+                            AND table_name = %s
+                            ORDER BY ordinal_position
+                        '''
+                        cur.execute(query, (schema, table_name))
+                        
+                        columns = []
+                        for row in cur.fetchall():
+                            columns.append({
+                                "column_name": row[0],
+                                "source_schema": schema,
+                                "source_table": table_name,
+                                "logic": row[0]
+                            })
+                        return columns
+                except Exception as e:
+                    logging.warning(f"Failed to get columns for {schema}.{table_name}: {e}")
+                    return []
+        
+        For now, returns empty list.
+        """
         logging.debug(
             f"Cannot get columns from information_schema for {schema}.{table_name} "
-            f"(requires database connection)"
+            f"(requires database connection - currently not implemented)"
         )
         return []
     
