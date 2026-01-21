@@ -113,9 +113,13 @@ class ColumnLineageParser:
     def __init__(self):
         self.cte_definitions = {}  # Store CTE definitions for resolution
         self.table_aliases = {}  # Store table aliases
+        self.created_tables_columns = {}  # Store columns of tables created in this script
         
     def extract_column_lineage(self, sql_text: str) -> List[Dict]:
         """Extract column lineage from SQL text."""
+        # Reset for each new file
+        self.created_tables_columns = {}
+        
         # Store original SQL BEFORE any cleaning
         self.original_sql = sql_text
         
@@ -250,6 +254,11 @@ class ColumnLineageParser:
         if select_expr:
             # Process the main SELECT (CTEs will be processed inside _process_select_for_target)
             if isinstance(select_expr, exp.Select):
+                # Extract and store columns for this table
+                if target_table:
+                    table_columns = self._extract_columns_from_select(select_expr, placeholders)
+                    self.created_tables_columns[target_table] = table_columns
+                
                 column_records = self._process_select_for_target(
                     select_expr, 
                     target_table, 
@@ -292,45 +301,57 @@ class ColumnLineageParser:
             column_info = self._extract_column_info(projection, placeholders)
             
             if column_info:
-                # Resolve source table for each source column
+                # Check if this is a SELECT * or table.*
                 for col_data in column_info:
-                    source_records = self._resolve_source_column(
-                        col_data, 
-                        select_node, 
-                        placeholders
-                    )
-                    
-                    # Get the actual source logic from CTE if the column references a CTE
-                    original_logic = col_data.get("logic")
-                    source_col_expr = col_data.get("source_column_expr")
-                    
-                    if source_col_expr:
-                        table_ref = source_col_expr.get("table")
-                        column_name = source_col_expr.get("column")
-                        
-                        # Get actual source logic from CTE
-                        cte_source_logic = self._get_source_logic_detail(
-                            table_ref,
-                            column_name,
+                    if col_data.get("is_star", False):
+                        # Handle SELECT * or table.*
+                        star_records = self._expand_star_projection(
+                            col_data,
                             select_node,
+                            target_table,
+                            target_schema,
+                            placeholders
+                        )
+                        records.extend(star_records)
+                    else:
+                        # Regular column processing
+                        source_records = self._resolve_source_column(
+                            col_data, 
+                            select_node, 
                             placeholders
                         )
                         
-                        if cte_source_logic:
-                            # Use the CTE source logic instead
-                            original_logic = cte_source_logic
-                    
-                    for src_rec in source_records:
-                        records.append({
-                            "sub_target_schema": target_schema,
-                            "sub_target_table": target_table,
-                            "target_column": col_data.get("target_column"),
-                            "source_schema": src_rec.get("source_schema"),
-                            "source_table": src_rec.get("source_table"),
-                            "source_column": src_rec.get("source_column"),
-                            "logic": original_logic,
-                            "sql_process": "select"
-                        })
+                        # Get the actual source logic from CTE if the column references a CTE
+                        original_logic = col_data.get("logic")
+                        source_col_expr = col_data.get("source_column_expr")
+                        
+                        if source_col_expr:
+                            table_ref = source_col_expr.get("table")
+                            column_name = source_col_expr.get("column")
+                            
+                            # Get actual source logic from CTE
+                            cte_source_logic = self._get_source_logic_detail(
+                                table_ref,
+                                column_name,
+                                select_node,
+                                placeholders
+                            )
+                            
+                            if cte_source_logic:
+                                # Use the CTE source logic instead
+                                original_logic = cte_source_logic
+                        
+                        for src_rec in source_records:
+                            records.append({
+                                "sub_target_schema": target_schema,
+                                "sub_target_table": target_table,
+                                "target_column": col_data.get("target_column"),
+                                "source_schema": src_rec.get("source_schema"),
+                                "source_table": src_rec.get("source_table"),
+                                "source_column": src_rec.get("source_column"),
+                                "logic": original_logic,
+                                "sql_process": "select"
+                            })
         
         # Process JOIN clauses - now with proper target table and column tracking
         join_records = self._process_joins(select_node, placeholders, target_table, target_schema)
@@ -393,6 +414,21 @@ class ColumnLineageParser:
         """Extract column information from a projection."""
         results = []
         
+        # Check if this is a SELECT * or table.*
+        if isinstance(projection, exp.Star):
+            # This is SELECT * or table.*
+            table_qualifier = None
+            if hasattr(projection, 'table') and projection.table:
+                table_qualifier = projection.table
+            
+            return [{
+                "is_star": True,
+                "table_qualifier": table_qualifier,
+                "target_column": None,
+                "source_column_expr": None,
+                "logic": projection.sql(dialect="postgres")
+            }]
+        
         # Get the alias (target column name)
         target_column = None
         if isinstance(projection, exp.Alias):
@@ -403,9 +439,6 @@ class ColumnLineageParser:
             # If no alias, use the column name itself
             if isinstance(source_expr, exp.Column):
                 target_column = source_expr.name
-            elif isinstance(source_expr, exp.Star):
-                # Handle SELECT *
-                return []
         
         # Get the logic
         logic = projection.sql(dialect="postgres")
@@ -416,6 +449,7 @@ class ColumnLineageParser:
         if source_columns:
             for src_col in source_columns:
                 results.append({
+                    "is_star": False,
                     "target_column": target_column,
                     "source_column_expr": src_col,
                     "logic": logic
@@ -423,6 +457,7 @@ class ColumnLineageParser:
         else:
             # No source columns (e.g., constant)
             results.append({
+                "is_star": False,
                 "target_column": target_column,
                 "source_column_expr": None,
                 "logic": logic
@@ -697,6 +732,179 @@ class ColumnLineageParser:
                             return projection.sql(dialect="postgres")
         
         return None
+    
+    def _expand_star_projection(
+        self,
+        star_data: Dict,
+        select_node: exp.Select,
+        target_table: Optional[str],
+        target_schema: Optional[str],
+        placeholders: Dict[str, str]
+    ) -> List[Dict]:
+        """Expand SELECT * or table.* into individual column records."""
+        records = []
+        table_qualifier = star_data.get("table_qualifier")
+        
+        if table_qualifier:
+            # This is table.* - get columns for specific table
+            columns = self._get_columns_for_table(
+                table_qualifier,
+                select_node,
+                placeholders
+            )
+        else:
+            # This is SELECT * - get columns from all tables in FROM/JOIN
+            columns = self._get_columns_for_all_tables(
+                select_node,
+                placeholders
+            )
+        
+        # Create a record for each column
+        for col_info in columns:
+            records.append({
+                "sub_target_schema": target_schema,
+                "sub_target_table": target_table,
+                "target_column": col_info.get("column_name"),
+                "source_schema": col_info.get("source_schema"),
+                "source_table": col_info.get("source_table"),
+                "source_column": col_info.get("column_name"),
+                "logic": col_info.get("logic", col_info.get("column_name")),
+                "sql_process": "select*"
+            })
+        
+        return records
+    
+    def _get_columns_for_table(
+        self,
+        table_ref: str,
+        select_node: exp.Select,
+        placeholders: Dict[str, str]
+    ) -> List[Dict]:
+        """Get all columns for a specific table (CTE, created table, or existing table)."""
+        columns = []
+        
+        # Check if this is a CTE alias
+        if table_ref in self.table_aliases:
+            table_info = self.table_aliases[table_ref]
+            
+            if table_info.get("is_cte", False):
+                # Get columns from CTE definition
+                cte_name = table_info.get("table")
+                cte_select = self.cte_definitions.get(cte_name)
+                
+                if cte_select:
+                    columns = self._extract_columns_from_select(cte_select, placeholders)
+            else:
+                # This is a real table
+                actual_table = table_info.get("table")
+                schema = table_info.get("schema")
+                
+                # Check if this table was created in the current script
+                if actual_table in self.created_tables_columns:
+                    columns = self.created_tables_columns[actual_table]
+                else:
+                    # Try to get from information_schema (will be empty if no DB connection)
+                    columns = self._get_columns_from_information_schema(
+                        schema,
+                        actual_table,
+                        placeholders
+                    )
+        
+        return columns
+    
+    def _get_columns_for_all_tables(
+        self,
+        select_node: exp.Select,
+        placeholders: Dict[str, str]
+    ) -> List[Dict]:
+        """Get columns from all tables in FROM and JOIN clauses."""
+        all_columns = []
+        
+        # Get all tables from FROM and JOIN
+        from_tables = self._get_from_tables(select_node, placeholders)
+        
+        for table_alias, table_info in from_tables.items():
+            table_columns = self._get_columns_for_table(
+                table_alias,
+                select_node,
+                placeholders
+            )
+            all_columns.extend(table_columns)
+        
+        return all_columns
+    
+    def _extract_columns_from_select(
+        self,
+        select_node: exp.Select,
+        placeholders: Dict[str, str]
+    ) -> List[Dict]:
+        """Extract column names and their source info from a SELECT statement."""
+        columns = []
+        
+        for projection in select_node.expressions:
+            if isinstance(projection, exp.Star):
+                # Recursively expand * in CTE
+                continue
+            
+            col_name = None
+            col_logic = projection.sql(dialect="postgres")
+            
+            if isinstance(projection, exp.Alias):
+                col_name = projection.alias
+            elif isinstance(projection, exp.Column):
+                col_name = projection.name
+            
+            if col_name:
+                # Try to resolve source
+                col_info_list = self._extract_column_info(projection, placeholders)
+                
+                if col_info_list and not col_info_list[0].get("is_star", False):
+                    col_data = col_info_list[0]
+                    source_col_expr = col_data.get("source_column_expr")
+                    
+                    if source_col_expr:
+                        # Resolve the source
+                        resolved = self._resolve_source_column(
+                            col_data,
+                            select_node,
+                            placeholders
+                        )
+                        
+                        if resolved:
+                            src_rec = resolved[0]
+                            columns.append({
+                                "column_name": col_name,
+                                "source_schema": src_rec.get("source_schema"),
+                                "source_table": src_rec.get("source_table"),
+                                "logic": col_logic
+                            })
+                            continue
+                
+                # Fallback
+                columns.append({
+                    "column_name": col_name,
+                    "source_schema": None,
+                    "source_table": None,
+                    "logic": col_logic
+                })
+        
+        return columns
+    
+    def _get_columns_from_information_schema(
+        self,
+        schema: Optional[str],
+        table_name: str,
+        placeholders: Dict[str, str]
+    ) -> List[Dict]:
+        """Get columns from information_schema (placeholder - requires DB connection)."""
+        # This is a placeholder for future implementation
+        # Would require database connection to query information_schema.columns
+        # For now, return empty list
+        logging.debug(
+            f"Cannot get columns from information_schema for {schema}.{table_name} "
+            f"(requires database connection)"
+        )
+        return []
     
     def _build_table_aliases(self, select_node: exp.Select, placeholders: Dict[str, str]):
         """Build a map of table aliases to actual tables."""
