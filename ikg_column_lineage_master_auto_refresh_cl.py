@@ -200,12 +200,7 @@ class ColumnLineageParser:
         })
         
         if select_expr:
-            # Process CTEs first
-            with_node = select_expr.args.get("with")
-            if with_node:
-                self._extract_cte_definitions(with_node, placeholders)
-            
-            # Process the main SELECT
+            # Process the main SELECT (CTEs will be processed inside _process_select_for_target)
             if isinstance(select_expr, exp.Select):
                 column_records = self._process_select_for_target(
                     select_expr, 
@@ -227,7 +222,12 @@ class ColumnLineageParser:
         """Process SELECT statement for a target table."""
         records = []
         
-        # Build table alias map
+        # CRITICAL: Process CTEs FIRST before building table aliases
+        with_node = select_node.args.get("with")
+        if with_node:
+            self._extract_cte_definitions(with_node, placeholders)
+        
+        # Build table alias map (now CTEs are already defined)
         self._build_table_aliases(select_node, placeholders)
         
         # Process each column in SELECT clause
@@ -316,9 +316,26 @@ class ColumnLineageParser:
         
         for node in expr.walk():
             if isinstance(node, exp.Column):
+                # Get the table reference from the column
+                table_ref = None
+                if hasattr(node, "table") and node.table:
+                    table_ref = node.table
+                # Also check for the 'this' attribute which sqlglot uses for table references
+                elif hasattr(node, "this") and isinstance(node.this, exp.Identifier):
+                    # The table might be in the parent
+                    pass
+                
+                # Extract table from the column's SQL if not found
+                if not table_ref:
+                    col_sql = node.sql(dialect="postgres")
+                    if "." in col_sql:
+                        parts = col_sql.split(".")
+                        if len(parts) == 2:
+                            table_ref = parts[0].strip()
+                
                 col_info = {
                     "column": node.name,
-                    "table": node.table if hasattr(node, "table") and node.table else None
+                    "table": table_ref
                 }
                 columns.append(col_info)
         
@@ -348,21 +365,30 @@ class ColumnLineageParser:
         
         # Resolve the table reference
         if table_ref:
-            # Check if it's a CTE
-            if table_ref in self.cte_definitions:
-                # Recursively resolve from CTE
+            # CRITICAL FIX: Check table_aliases first (this includes both CTEs and real tables)
+            if table_ref in self.table_aliases:
+                table_info = self.table_aliases[table_ref]
+                
+                # Check if this is a CTE reference
+                if table_info.get("is_cte", False):
+                    # This is a CTE - resolve from the CTE definition
+                    cte_name = table_info.get("table")
+                    cte_results = self._resolve_from_cte(cte_name, column_name, placeholders)
+                    results.extend(cte_results)
+                else:
+                    # This is a real table
+                    results.append({
+                        "source_schema": table_info.get("schema"),
+                        "source_table": table_info.get("table"),
+                        "source_column": column_name
+                    })
+            # If not in table_aliases, check if it's directly a CTE name
+            elif table_ref in self.cte_definitions:
+                # Direct CTE reference (unlikely but handle it)
                 cte_results = self._resolve_from_cte(table_ref, column_name, placeholders)
                 results.extend(cte_results)
-            # Check if it's a table alias
-            elif table_ref in self.table_aliases:
-                table_info = self.table_aliases[table_ref]
-                results.append({
-                    "source_schema": table_info.get("schema"),
-                    "source_table": table_info.get("table"),
-                    "source_column": column_name
-                })
             else:
-                # Direct table reference
+                # Direct table reference (not aliased, not CTE)
                 results.append({
                     "source_schema": None,
                     "source_table": table_ref,
@@ -375,20 +401,32 @@ class ColumnLineageParser:
             if len(from_tables) == 1:
                 # Only one table, so it must be from there
                 table_info = list(from_tables.values())[0]
-                results.append({
-                    "source_schema": table_info.get("schema"),
-                    "source_table": table_info.get("table"),
-                    "source_column": column_name
-                })
-            else:
-                # Multiple tables - would need INFORMATION_SCHEMA lookup
-                # For now, return all possibilities
-                for table_info in from_tables.values():
+                
+                # Check if it's a CTE
+                if table_info.get("is_cte", False):
+                    cte_name = table_info.get("table")
+                    cte_results = self._resolve_from_cte(cte_name, column_name, placeholders)
+                    results.extend(cte_results)
+                else:
                     results.append({
                         "source_schema": table_info.get("schema"),
                         "source_table": table_info.get("table"),
                         "source_column": column_name
                     })
+            else:
+                # Multiple tables - would need INFORMATION_SCHEMA lookup
+                # For now, return all possibilities
+                for table_info in from_tables.values():
+                    if table_info.get("is_cte", False):
+                        cte_name = table_info.get("table")
+                        cte_results = self._resolve_from_cte(cte_name, column_name, placeholders)
+                        results.extend(cte_results)
+                    else:
+                        results.append({
+                            "source_schema": table_info.get("schema"),
+                            "source_table": table_info.get("table"),
+                            "source_column": column_name
+                        })
         
         return results if results else [{
             "source_schema": None,
@@ -403,6 +441,10 @@ class ColumnLineageParser:
         cte_select = self.cte_definitions.get(cte_name)
         if not cte_select:
             return results
+        
+        # Build table aliases for this CTE's SELECT
+        saved_aliases = self.table_aliases.copy()
+        self._build_table_aliases(cte_select, placeholders)
         
         # Find the column in CTE's SELECT clause
         for projection in cte_select.expressions:
@@ -420,15 +462,26 @@ class ColumnLineageParser:
                 # Extract source columns from this projection
                 source_cols = self._extract_source_columns_from_expr(proj_expr)
                 
-                # Recursively resolve each source column
-                for src_col in source_cols:
-                    col_data = {
-                        "source_column_expr": src_col,
-                        "target_column": column_name
-                    }
-                    resolved = self._resolve_source_column(col_data, cte_select, placeholders)
-                    results.extend(resolved)
+                if not source_cols:
+                    # This is a constant or expression without columns
+                    results.append({
+                        "source_schema": None,
+                        "source_table": None,
+                        "source_column": None
+                    })
+                else:
+                    # Recursively resolve each source column
+                    for src_col in source_cols:
+                        col_data = {
+                            "source_column_expr": src_col,
+                            "target_column": column_name
+                        }
+                        resolved = self._resolve_source_column(col_data, cte_select, placeholders)
+                        results.extend(resolved)
                 break
+        
+        # Restore the original table aliases
+        self.table_aliases = saved_aliases
         
         return results
     
@@ -454,13 +507,25 @@ class ColumnLineageParser:
             if source.db:
                 schema_name = self._resolve_template(source.db, placeholders)
             
+            # Get the alias - this is the key used in column references
             alias = source.alias if hasattr(source, "alias") and source.alias else table_name
             
-            # Check if this is a CTE reference
-            if table_name not in self.cte_definitions:
+            # CRITICAL FIX: Check if table_name is a CTE
+            if table_name in self.cte_definitions:
+                # This is a CTE reference - mark it as a CTE, not a real table
+                # Don't add to table_aliases as a real table
+                # The alias maps to the CTE name
                 self.table_aliases[alias] = {
                     "table": table_name,
-                    "schema": schema_name
+                    "schema": None,
+                    "is_cte": True
+                }
+            else:
+                # This is a real table
+                self.table_aliases[alias] = {
+                    "table": table_name,
+                    "schema": schema_name,
+                    "is_cte": False
                 }
         elif isinstance(source, exp.Subquery):
             # Handle subqueries
@@ -478,14 +543,22 @@ class ColumnLineageParser:
             table = from_expr.this
             alias = table.alias if hasattr(table, "alias") and table.alias else table.name
             
-            if table.name not in self.cte_definitions:
+            # Check if this is a CTE
+            if table.name in self.cte_definitions:
+                tables[alias] = {
+                    "table": table.name,
+                    "schema": None,
+                    "is_cte": True
+                }
+            else:
                 schema = None
                 if table.db:
                     schema = self._resolve_template(table.db, placeholders)
                 
                 tables[alias] = {
                     "table": table.name,
-                    "schema": schema
+                    "schema": schema,
+                    "is_cte": False
                 }
         
         # JOINs
@@ -495,14 +568,22 @@ class ColumnLineageParser:
                 table = join.this
                 alias = table.alias if hasattr(table, "alias") and table.alias else table.name
                 
-                if table.name not in self.cte_definitions:
+                # Check if this is a CTE
+                if table.name in self.cte_definitions:
+                    tables[alias] = {
+                        "table": table.name,
+                        "schema": None,
+                        "is_cte": True
+                    }
+                else:
                     schema = None
                     if table.db:
                         schema = self._resolve_template(table.db, placeholders)
                     
                     tables[alias] = {
                         "table": table.name,
-                        "schema": schema
+                        "schema": schema,
+                        "is_cte": False
                     }
         
         return tables
