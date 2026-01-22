@@ -204,8 +204,8 @@ class ColumnLineageParser:
         if isinstance(statement, exp.Create):
             records.extend(self._process_create_statement(statement, placeholders))
         
-        # Handle SELECT statements
-        elif isinstance(statement, exp.Select):
+        # Handle SELECT statements (including UNION)
+        elif isinstance(statement, (exp.Select, exp.Union, exp.Intersect, exp.Except)):
             records.extend(self._process_select_statement(statement, placeholders, None))
             
         # Handle INSERT statements
@@ -279,6 +279,31 @@ class ColumnLineageParser:
         """Process SELECT statement for a target table."""
         records = []
         
+        # FIX Issue 8: Check if this is a UNION query
+        if isinstance(select_node, (exp.Union, exp.Intersect, exp.Except)):
+            # Process each part of the UNION separately
+            # Each UNION branch produces the same target columns but different sources
+            left = select_node.left
+            right = select_node.right
+            
+            if isinstance(left, exp.Select):
+                records.extend(self._process_select_for_target(
+                    left, target_table, target_schema, placeholders
+                ))
+            
+            if isinstance(right, exp.Select):
+                records.extend(self._process_select_for_target(
+                    right, target_table, target_schema, placeholders
+                ))
+            
+            # Also handle chained UNIONs
+            if isinstance(right, (exp.Union, exp.Intersect, exp.Except)):
+                records.extend(self._process_select_for_target(
+                    right, target_table, target_schema, placeholders
+                ))
+            
+            return records
+        
         # CRITICAL: Process CTEs FIRST before building table aliases
         with_node = select_node.args.get("with")
         if with_node:
@@ -325,7 +350,35 @@ class ColumnLineageParser:
                         original_logic = col_data.get("logic")
                         source_col_expr = col_data.get("source_column_expr")
                         
+                        # FIX Issue 6 & 7: Handle template variables and literals
                         if source_col_expr:
+                            if source_col_expr.get("is_template_var"):
+                                # This is a template variable - store it as source
+                                records.append({
+                                    "sub_target_schema": target_schema,
+                                    "sub_target_table": target_table,
+                                    "target_column": col_data.get("target_column"),
+                                    "source_schema": None,
+                                    "source_table": None,
+                                    "source_column": source_col_expr.get("column"),  # {{params.xxx}}
+                                    "logic": original_logic,
+                                    "sql_process": "select"
+                                })
+                                continue
+                            elif source_col_expr.get("is_literal"):
+                                # This is a literal/constant - store as source
+                                records.append({
+                                    "sub_target_schema": target_schema,
+                                    "sub_target_table": target_table,
+                                    "target_column": col_data.get("target_column"),
+                                    "source_schema": None,
+                                    "source_table": None,
+                                    "source_column": source_col_expr.get("column"),  # The literal value
+                                    "logic": original_logic,
+                                    "sql_process": "select"
+                                })
+                                continue
+                            
                             table_ref = source_col_expr.get("table")
                             column_name = source_col_expr.get("column")
                             
@@ -436,15 +489,63 @@ class ColumnLineageParser:
             source_expr = projection.this
         else:
             source_expr = projection
-            # If no alias, use the column name itself
+            # If no alias, derive target column from expression
             if isinstance(source_expr, exp.Column):
                 target_column = source_expr.name
+            # FIX Issue 5: Handle CAST without alias - column name is the source column
+            elif isinstance(source_expr, exp.Cast):
+                # Extract the column being cast
+                cast_expr = source_expr.this
+                if isinstance(cast_expr, exp.Column):
+                    target_column = cast_expr.name
+                # FIX Issue 6: Handle template variable cast
+                elif isinstance(cast_expr, exp.Identifier):
+                    ident_name = cast_expr.name
+                    if ident_name in placeholders:
+                        # This is a template variable - use it as both source and target
+                        target_column = ident_name.replace("TEMPLATE_TOKEN_", "").replace("PROFILE_DATE_VAR_", "")
+                        # Actually, we want the full template
+                        target_column = None  # Will be handled by logic extraction
         
-        # Get the logic
-        logic = projection.sql(dialect="postgres")
+        # Get the logic - IMPORTANT: resolve any template tokens back to original
+        logic_sql = projection.sql(dialect="postgres")
+        logic = self._resolve_logic_templates(logic_sql, placeholders)
         
         # Extract source columns from the expression
         source_columns = self._extract_source_columns_from_expr(source_expr)
+        
+        # FIX Issue 6 & 7: Check if the expression is a template variable or quoted string
+        if isinstance(source_expr, exp.Cast):
+            cast_this = source_expr.this
+            # Check if casting a template variable
+            if isinstance(cast_this, exp.Identifier):
+                ident_name = cast_this.name
+                if ident_name in placeholders:
+                    # This is template variable cast: CAST({{params.xxx}} AS type) AS alias
+                    template_value = placeholders[ident_name]
+                    if target_column:
+                        results.append({
+                            "is_star": False,
+                            "target_column": target_column,
+                            "source_column_expr": {"column": template_value, "table": None, "is_template_var": True},
+                            "logic": logic
+                        })
+                        return results
+        
+        # FIX Issue 7: Check for quoted strings (literals)
+        if isinstance(source_expr, exp.Literal):
+            # This is a constant/literal value
+            if target_column:
+                literal_value = source_expr.sql(dialect="postgres")
+                # Resolve any templates in the literal
+                literal_value = self._resolve_logic_templates(literal_value, placeholders)
+                results.append({
+                    "is_star": False,
+                    "target_column": target_column,
+                    "source_column_expr": {"column": literal_value, "table": None, "is_literal": True},
+                    "logic": logic
+                })
+                return results
         
         if source_columns:
             for src_col in source_columns:
@@ -1032,10 +1133,23 @@ class ColumnLineageParser:
                     "is_cte": False
                 }
         elif isinstance(source, exp.Subquery):
-            # Handle subqueries
+            # FIX Issue 3: Handle subqueries (inner queries)
             if source.alias:
-                # This is a derived table, not tracked as real table
-                pass
+                subquery_alias = source.alias
+                # The subquery is treated like a CTE - extract its columns
+                subquery_select = source.this
+                
+                if isinstance(subquery_select, exp.Select):
+                    # Store this subquery as a temporary CTE
+                    self.cte_definitions[f"__subquery_{subquery_alias}"] = subquery_select
+                    
+                    # Map the alias to this subquery
+                    self.table_aliases[subquery_alias] = {
+                        "table": f"__subquery_{subquery_alias}",
+                        "schema": None,
+                        "is_cte": True,
+                        "is_subquery": True
+                    }
     
     def _get_from_tables(self, select_node: exp.Select, placeholders: Dict[str, str]) -> Dict[str, Dict]:
         """Get all tables from FROM and JOIN clauses."""
@@ -1298,7 +1412,7 @@ class ColumnLineageParser:
         """Process INSERT statement."""
         records = []
         
-        # Get target table
+        # Get target table from INSERT INTO
         target_table = None
         target_schema = None
         if insert_node.this and isinstance(insert_node.this, exp.Table):
@@ -1309,6 +1423,11 @@ class ColumnLineageParser:
         # Process the SELECT part
         select_expr = insert_node.expression
         if select_expr and isinstance(select_expr, exp.Select):
+            # Extract and store columns for this table if it's a new insert
+            if target_table and target_table not in self.created_tables_columns:
+                table_columns = self._extract_columns_from_select(select_expr, placeholders)
+                self.created_tables_columns[target_table] = table_columns
+            
             records.extend(self._process_select_for_target(
                 select_expr, target_table, target_schema, placeholders
             ))
@@ -1317,9 +1436,25 @@ class ColumnLineageParser:
     
     def _resolve_template(self, template_str: str, placeholders: Dict[str, str]) -> str:
         """Resolve a template placeholder to its original value."""
-        if template_str in placeholders:
-            return placeholders[template_str]
+        # Check if this is a TEMPLATE_TOKEN that was created during sanitization
+        if template_str.startswith("TEMPLATE_TOKEN_"):
+            # Look it up in placeholders to get back original {{...}}
+            if template_str in placeholders:
+                return placeholders[template_str]
+        
+        # Return as-is (might already be the original {{params.xxx}} format)
         return template_str
+    
+    def _resolve_logic_templates(self, logic_sql: str, placeholders: Dict[str, str]) -> str:
+        """Resolve all template tokens in logic SQL back to original {{params.xxx}} format."""
+        resolved = logic_sql
+        
+        # Replace all TEMPLATE_TOKEN_xxx and PROFILE_DATE_VAR_xxx with original {{...}}
+        for token, original in placeholders.items():
+            if token in resolved:
+                resolved = resolved.replace(token, original)
+        
+        return resolved
     
     # Utility methods from original parser
     def _remove_sql_comments(self, sql_text: str) -> str:
@@ -1361,8 +1496,19 @@ class ColumnLineageParser:
 
         def repl(match: Match) -> str:
             inner = re.sub(r"\s+", "", match.group(1))
+            original = f"{{{{{inner}}}}}"
+            
+            # Check if this is a profile_date or similar variable (not a schema)
+            # These should NOT be treated as schemas
+            if 'profile_date' in inner.lower() or '_date' in inner.lower():
+                # This is a date variable, not a schema - keep as placeholder for parsing
+                token = f"PROFILE_DATE_VAR_{len(placeholders)}"
+                placeholders[token] = original
+                return token
+            
+            # Regular template (like schema names)
             token = f"TEMPLATE_TOKEN_{len(placeholders)}"
-            placeholders[token] = f"{{{{{inner}}}}}"
+            placeholders[token] = original
             return token
 
         sanitized = self.TEMPLATE_PATTERN.sub(repl, sql_text)
