@@ -348,7 +348,9 @@ def main():
     
     # Merge with issues and branches
     logger.info("Merging issues, branches, and merge requests...")
-    df_issues_branches_merge_requests = pd.merge(df_issues, df_branches, df_merge_requests, how='left', on='name')
+    df_issues_branches = pd.merge(df_issues, df_branches, how='left', on='id')
+    df_issues_branches_merge_requests = pd.merge(df_issues_branches, df_merge_requests, how='left', left_on='name', right_on='source_branch')
+    
     df_issues_mr = pd.merge(df_issues, df_merge_requests, how='left', on='id')
     df_issues_mr = df_issues_mr[~df_issues_mr['source_branch'].isin(df_branches['name'])]
     
@@ -356,7 +358,7 @@ def main():
     df_issues_mr = df_issues_mr[
         (df_issues_mr['source_branch'].notna()) &
         (df_issues_mr['source_branch'].astype(str).str.strip() != '') &
-        (df_issues_mr['state'] == 'merged')
+        (df_issues_mr['state_y'] == 'merged')
     ]
     
     # Categorize branches
@@ -393,8 +395,8 @@ def main():
     df_issues_branches_merge_requests['ikg_branch_name'] = df_issues_branches_merge_requests['ikg_branch_name'].astype(str)
     conditions = [
         (df_issues_branches_merge_requests['ikg_branch_name'].str.strip() == ''),
-        ((df_issues_branches_merge_requests['ikg_branch_name'].str.strip() != '') & (df_issues_branches_merge_requests['state'] == 'merged')),
-        ((df_issues_branches_merge_requests['ikg_branch_name'].str.strip() != '') & (df_issues_branches_merge_requests['state'] != 'merged'))
+        ((df_issues_branches_merge_requests['ikg_branch_name'].str.strip() != '') & (df_issues_branches_merge_requests['state_y'] == 'merged')),
+        ((df_issues_branches_merge_requests['ikg_branch_name'].str.strip() != '') & (df_issues_branches_merge_requests['state_y'] != 'merged'))
     ]
     choices = ['', 'Yes', 'No']
     df_issues_branches_merge_requests['ikg_merged'] = np.select(conditions, choices, default='')
@@ -403,8 +405,8 @@ def main():
     df_issues_branches_merge_requests['nlg_branch_name'] = df_issues_branches_merge_requests['nlg_branch_name'].astype(str)
     conditions = [
         (df_issues_branches_merge_requests['nlg_branch_name'].str.strip() == ''),
-        ((df_issues_branches_merge_requests['nlg_branch_name'].str.strip() != '') & (df_issues_branches_merge_requests['state'] == 'merged')),
-        ((df_issues_branches_merge_requests['nlg_branch_name'].str.strip() != '') & (df_issues_branches_merge_requests['state'] != 'merged'))
+        ((df_issues_branches_merge_requests['nlg_branch_name'].str.strip() != '') & (df_issues_branches_merge_requests['state_y'] == 'merged')),
+        ((df_issues_branches_merge_requests['nlg_branch_name'].str.strip() != '') & (df_issues_branches_merge_requests['state_y'] != 'merged'))
     ]
     df_issues_branches_merge_requests['nlg_merged'] = np.select(conditions, choices, default='')
     
@@ -412,8 +414,8 @@ def main():
     df_issues_branches_merge_requests['odm_branch_name'] = df_issues_branches_merge_requests['odm_branch_name'].astype(str)
     conditions = [
         (df_issues_branches_merge_requests['odm_branch_name'].str.strip() == ''),
-        ((df_issues_branches_merge_requests['odm_branch_name'].str.strip() != '') & (df_issues_branches_merge_requests['state'] == 'merged')),
-        ((df_issues_branches_merge_requests['odm_branch_name'].str.strip() != '') & (df_issues_branches_merge_requests['state'] != 'merged'))
+        ((df_issues_branches_merge_requests['odm_branch_name'].str.strip() != '') & (df_issues_branches_merge_requests['state_y'] == 'merged')),
+        ((df_issues_branches_merge_requests['odm_branch_name'].str.strip() != '') & (df_issues_branches_merge_requests['state_y'] != 'merged'))
     ]
     df_issues_branches_merge_requests['odm_merged'] = np.select(conditions, choices, default='')
     
@@ -441,13 +443,13 @@ def main():
     df_issues_branches_merge_requests['iteration'] = iteration
     
     # Filter closed state
-    df_issues_branches_merge_requests = df_issues_branches_merge_requests[df_issues_branches_merge_requests['state'] != 'closed']
+    df_issues_branches_merge_requests = df_issues_branches_merge_requests[df_issues_branches_merge_requests['state_x'] != 'closed']
     
     # Group by issue ID and concatenate multiple values
     logger.info("Grouping by issue ID and aggregating data...")
     agg_dict = {
-        'title': 'first',
-        'state': 'first',
+        'title_x': 'first',
+        'state_x': 'first',
         'weight': 'first',
         'labels': 'first',
         'epic': 'first',
@@ -467,6 +469,9 @@ def main():
     }
     
     df_final = df_issues_branches_merge_requests.groupby('id', as_index=False).agg(agg_dict)
+    
+    # Rename columns back to original names
+    df_final = df_final.rename(columns={'title_x': 'title', 'state_x': 'state'})
     
     # Calculate iteration dates
     iteration_end = datetime.strptime(iteration_end_date, '%Y-%m-%d')
