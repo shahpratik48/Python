@@ -506,6 +506,14 @@ class ColumnLineageParser:
                         target_column = ident_name.replace("TEMPLATE_TOKEN_", "").replace("PROFILE_DATE_VAR_", "")
                         # Actually, we want the full template
                         target_column = None  # Will be handled by logic extraction
+            # FIX Issue 3: Handle SQL functions without alias (COALESCE, TO_DATE, etc.)
+            elif isinstance(source_expr, (exp.Anonymous, exp.Func)):
+                # Extract first column from function arguments
+                # For COALESCE(a.col, 0) -> target_column = col
+                # For TO_DATE(a.date_str, 'YYYY-MM-DD') -> target_column = date_str
+                first_col = self._extract_first_column_from_func(source_expr)
+                if first_col:
+                    target_column = first_col
         
         # Get the logic - IMPORTANT: resolve any template tokens back to original
         logic_sql = projection.sql(dialect="postgres")
@@ -532,13 +540,21 @@ class ColumnLineageParser:
                         })
                         return results
         
-        # FIX Issue 7: Check for quoted strings (literals)
+        # FIX Issue 5 & 7: Check for quoted strings (literals)
         if isinstance(source_expr, exp.Literal):
             # This is a constant/literal value
             if target_column:
                 literal_value = source_expr.sql(dialect="postgres")
                 # Resolve any templates in the literal
                 literal_value = self._resolve_logic_templates(literal_value, placeholders)
+                
+                # Ensure quotes are preserved for string literals
+                # Check if this is a string literal
+                if hasattr(source_expr, 'is_string') and source_expr.is_string:
+                    # Ensure single quotes are present
+                    if not (literal_value.startswith("'") or literal_value.startswith('"')):
+                        literal_value = f"'{literal_value}'"
+                
                 results.append({
                     "is_star": False,
                     "target_column": target_column,
@@ -565,6 +581,14 @@ class ColumnLineageParser:
             })
         
         return results
+    
+    def _extract_first_column_from_func(self, func_expr: exp.Expression) -> Optional[str]:
+        """Extract the first column name from a function expression."""
+        # Walk through the function arguments to find the first column
+        for node in func_expr.walk():
+            if isinstance(node, exp.Column):
+                return node.name
+        return None
     
     def _extract_source_columns_from_expr(self, expr: exp.Expression) -> List[Dict]:
         """Extract all source columns from an expression."""
@@ -621,10 +645,18 @@ class ColumnLineageParser:
         
         # Resolve the table reference
         if table_ref:
-            # CRITICAL FIX: Check table_aliases first (this includes both CTEs and real tables)
+            # FIX Issue 2: Case-insensitive lookup
+            table_ref_lower = table_ref.lower()
+            
+            # Check table_aliases (case-insensitive)
             if table_ref in self.table_aliases:
                 table_info = self.table_aliases[table_ref]
-                
+            elif hasattr(self, 'table_aliases_lower') and table_ref_lower in self.table_aliases_lower:
+                table_info = self.table_aliases_lower[table_ref_lower]
+            else:
+                table_info = None
+            
+            if table_info:
                 # Check if this is a CTE reference
                 if table_info.get("is_cte", False):
                     # This is a CTE - resolve from the CTE definition
@@ -639,9 +671,10 @@ class ColumnLineageParser:
                         "source_column": column_name
                     })
             # If not in table_aliases, check if it's directly a CTE name
-            elif table_ref in self.cte_definitions:
-                # Direct CTE reference (unlikely but handle it)
-                cte_results = self._resolve_from_cte(table_ref, column_name, placeholders)
+            elif table_ref in self.cte_definitions or table_ref_lower in {k.lower(): k for k in self.cte_definitions.keys()}.keys():
+                # Direct CTE reference
+                actual_cte_name = table_ref if table_ref in self.cte_definitions else {k.lower(): k for k in self.cte_definitions.keys()}[table_ref_lower]
+                cte_results = self._resolve_from_cte(actual_cte_name, column_name, placeholders)
                 results.extend(cte_results)
             else:
                 # Direct table reference (not aliased, not CTE)
@@ -1103,6 +1136,10 @@ class ColumnLineageParser:
         joins = select_node.args.get("joins", [])
         for join in joins:
             self._extract_table_from_source(join.this, placeholders)
+        
+        # FIX Issue 2: Create case-insensitive lookup
+        # Store both original case and lowercase versions
+        self.table_aliases_lower = {k.lower(): v for k, v in self.table_aliases.items()}
     
     def _extract_table_from_source(self, source: exp.Expression, placeholders: Dict[str, str]):
         """Extract table information from a FROM/JOIN source."""
@@ -1299,6 +1336,22 @@ class ColumnLineageParser:
         where_expr = select_node.args.get("where")
         if where_expr:
             where_condition_sql = where_expr.sql(dialect="postgres")
+            
+            # FIX Issue 4: Check for subqueries in WHERE clause
+            # Process any subqueries found in WHERE
+            for node in where_expr.walk():
+                if isinstance(node, exp.Subquery):
+                    subquery_select = node.this
+                    if isinstance(subquery_select, exp.Select):
+                        # Process this subquery
+                        subquery_records = self._process_select_for_target(
+                            subquery_select,
+                            target_table,
+                            target_schema,
+                            placeholders
+                        )
+                        records.extend(subquery_records)
+            
             columns = self._extract_source_columns_from_expr(where_expr.this)
             
             # Check if this is from a CTE
@@ -1418,7 +1471,9 @@ class ColumnLineageParser:
         if insert_node.this and isinstance(insert_node.this, exp.Table):
             target_table = insert_node.this.name
             if insert_node.this.db:
-                target_schema = self._resolve_template(insert_node.this.db, placeholders)
+                # CRITICAL: Resolve template for schema
+                schema_token = insert_node.this.db
+                target_schema = self._resolve_template(schema_token, placeholders)
         
         # Process the SELECT part
         select_expr = insert_node.expression
