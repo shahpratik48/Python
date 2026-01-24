@@ -349,7 +349,8 @@ def main():
     # Merge with issues and branches
     logger.info("Merging issues, branches, and merge requests...")
     df_issues_branches = pd.merge(df_issues, df_branches, how='left', on='id')
-    df_issues_branches_merge_requests = pd.merge(df_issues_branches, df_merge_requests, how='left', left_on='name', right_on='source_branch')
+    df_merge_requests['name'] = df_merge_requests['source_branch'].astype(str)
+    df_issues_branches_merge_requests = pd.merge(df_issues_branches, df_merge_requests, how='left', on='name')
     
     df_issues_mr = pd.merge(df_issues, df_merge_requests, how='left', on='id')
     df_issues_mr = df_issues_mr[~df_issues_mr['source_branch'].isin(df_branches['name'])]
@@ -443,7 +444,7 @@ def main():
     df_issues_branches_merge_requests['iteration'] = iteration
     
     # Filter closed state
-    df_issues_branches_merge_requests = df_issues_branches_merge_requests[df_issues_branches_merge_requests['state_x'] != 'closed']
+    df_issues_branches_merge_requests = df_issues_branches_merge_requests[df_issues_branches_merge_requests['state_y'] != 'closed']
     
     # Group by issue ID and concatenate multiple values
     logger.info("Grouping by issue ID and aggregating data...")
@@ -468,7 +469,7 @@ def main():
         'link_type': lambda x: ', '.join(filter(None, x.unique())),
     }
     
-    df_final = df_issues_branches_merge_requests.groupby('id', as_index=False).agg(agg_dict)
+    df_final = df_issues_branches_merge_requests.groupby('id_x', as_index=False).agg(agg_dict)
     
     # Rename columns back to original names
     df_final = df_final.rename(columns={'title_x': 'title', 'state_x': 'state'})
@@ -485,7 +486,7 @@ def main():
     
     # Reorder columns
     col_order = [
-        'iteration', 'id', 'title', 'state', 'weight', 'labels', 'epic',
+        'iteration', 'id_x', 'title', 'state', 'weight', 'labels', 'epic',
         'cid', 'swat', 'ikg_merged', 'ikg_branch_name', 'nlg_merged', 'nlg_branch_name',
         'odm_merged', 'odm_branch_name', 'linked_issue_id', 'linked_project_id',
         'linked_issue_title', 'link_type', 'iteration_start_date', 'iteration_end_date',
@@ -547,7 +548,7 @@ def main():
         odm_details_list = []
         
         for _, issue_row in odm_issues.iterrows():
-            issue_id = issue_row['id']
+            issue_id = issue_row['id_x']
             odm_branches = [b.strip() for b in str(issue_row['odm_branch_name']).split(',') if b.strip()]
             
             for branch_name in odm_branches:
