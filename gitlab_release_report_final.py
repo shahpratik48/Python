@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 GITLAB_URL = 'https://devcloud.ubs.net'
 GROUP_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-insights-ci/commons'
-PROJECT_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-insights-ci/commons/staat-ds-insights-home'
+PROJECT_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-insights-home'
 IKG_PROJECT_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-genesis/genesis-platform/ikg-dags'
 NLG_PROJECT_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-genesis/genesis-platform/nlg-dags'
 ODM_PROJECT_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-genesis/genesis-platform/odm-dags'
@@ -60,11 +60,12 @@ def extract_digits(text):
 
 
 def clean_labels(labels):
-    """Remove status:: prefix from labels"""
+    """Remove status:: prefix and @ prefix from labels"""
     if pd.isna(labels) or labels == '':
         return ''
     label_list = [l.strip() for l in str(labels).split(',')]
-    cleaned = [l for l in label_list if not l.startswith('status::')]
+    # Remove labels starting with 'status::' or '@'
+    cleaned = [l for l in label_list if not l.startswith('status::') and not l.startswith('@')]
     return ', '.join(cleaned)
 
 
@@ -150,7 +151,7 @@ def collect_odm_release_details(odm_project, base_branch, df_final):
     odm_details_list = []
     
     for idx, issue_row in odm_issues.iterrows():
-        issue_id = issue_row['id_x']
+        issue_id = issue_row['id']
         odm_branches = [b.strip() for b in str(issue_row['odm_branch_name']).split(',') if b.strip()]
         
         for branch_name in odm_branches:
@@ -225,7 +226,7 @@ def collect_odm_release_details(odm_project, base_branch, df_final):
                             'issue_title': issue_row['title'],
                             'issue_state': issue_row['state'],
                             'issue_weight': issue_row['weight'],
-                            'issue_labels': issue_row['labels'],
+                            'issue_labels': clean_labels(issue_row['labels']),
                             'issue_epic': issue_row['epic'],
                             'branch_name': branch_name,
                             'file_name': file_name,
@@ -435,8 +436,7 @@ def main():
     # Merge with issues and branches
     logger.info("Merging issues, branches, and merge requests...")
     df_issues_branches = pd.merge(df_issues, df_branches, how='left', on='id')
-    df_merge_requests['name'] = df_merge_requests['source_branch'].astype(str)
-    df_issues_branches_merge_requests = pd.merge(df_issues_branches, df_merge_requests, how='left', on='name')
+    df_issues_branches_merge_requests = pd.merge(df_issues_branches, df_merge_requests, how='left', left_on='name', right_on='source_branch')
     
     # Categorize branches
     logger.info("Categorizing branches...")
@@ -509,7 +509,7 @@ def main():
     
     # Filter closed state
     df_issues_branches_merge_requests = df_issues_branches_merge_requests[
-        df_issues_branches_merge_requests['state_y'] != 'closed'
+        df_issues_branches_merge_requests['state_x'] != 'closed'
     ]
     
     # Group by issue ID
@@ -535,8 +535,25 @@ def main():
         'link_type': lambda x: ', '.join(filter(None, x.unique())),
     }
     
-    df_final = df_issues_branches_merge_requests.groupby('id_x', as_index=False).agg(agg_dict)
+    df_final = df_issues_branches_merge_requests.groupby('id', as_index=False).agg(agg_dict)
     df_final = df_final.rename(columns={'title_x': 'title', 'state_x': 'state'})
+    
+    # Convert linked_issue_id and linked_project_id to integers (remove decimals)
+    def convert_to_int_list(val):
+        if pd.isna(val) or val == '':
+            return ''
+        parts = [p.strip() for p in str(val).split(',') if p.strip()]
+        int_parts = []
+        for p in parts:
+            try:
+                # Convert to int to remove decimal
+                int_parts.append(str(int(float(p))))
+            except (ValueError, TypeError):
+                int_parts.append(p)
+        return ', '.join(int_parts)
+    
+    df_final['linked_issue_id'] = df_final['linked_issue_id'].apply(convert_to_int_list)
+    df_final['linked_project_id'] = df_final['linked_project_id'].apply(convert_to_int_list)
     
     # Calculate iteration dates
     iteration_end = datetime.strptime(iteration_end_date, '%Y-%m-%d')
@@ -550,11 +567,12 @@ def main():
     
     # Reorder columns
     col_order = [
-        'iteration', 'id_x', 'title', 'state', 'weight', 'labels', 'epic',
-        'cid', 'swat', 'ikg_merged', 'ikg_branch_name', 'nlg_merged', 'nlg_branch_name',
-        'odm_merged', 'odm_branch_name', 'linked_issue_id', 'linked_project_id',
-        'linked_issue_title', 'link_type', 'iteration_start_date', 'iteration_end_date',
-        'preprod_release_date', 'prod_release_date'
+        'iteration', 'state', 'iteration_end_date', 'title', 'id', 'weight', 'labels', 'epic',
+        'swat', 'preprod_release_date', 'prod_release_date', 
+        'ikg_merged', 'ikg_branch_name', 'nlg_merged', 'nlg_branch_name',
+        'odm_merged', 'odm_branch_name', 'cid', 
+        'linked_issue_id', 'linked_project_id', 'linked_issue_title', 'link_type',
+        'iteration_start_date'
     ]
     df_final = df_final[col_order]
     
