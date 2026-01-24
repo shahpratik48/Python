@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 GITLAB_URL = 'https://devcloud.ubs.net'
 GROUP_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-insights-ci/commons'
-PROJECT_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-insights-home'
+PROJECT_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-insights-ci/commons/staat-ds-insights-home'
 IKG_PROJECT_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-genesis/genesis-platform/ikg-dags'
 NLG_PROJECT_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-genesis/genesis-platform/nlg-dags'
 ODM_PROJECT_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-genesis/genesis-platform/odm-dags'
@@ -150,7 +150,7 @@ def collect_odm_release_details(odm_project, base_branch, df_final):
     odm_details_list = []
     
     for idx, issue_row in odm_issues.iterrows():
-        issue_id = issue_row['id']
+        issue_id = issue_row['id_x']
         odm_branches = [b.strip() for b in str(issue_row['odm_branch_name']).split(',') if b.strip()]
         
         for branch_name in odm_branches:
@@ -435,7 +435,8 @@ def main():
     # Merge with issues and branches
     logger.info("Merging issues, branches, and merge requests...")
     df_issues_branches = pd.merge(df_issues, df_branches, how='left', on='id')
-    df_issues_branches_merge_requests = pd.merge(df_issues_branches, df_merge_requests, how='left', left_on='name', right_on='source_branch')
+    df_merge_requests['name'] = df_merge_requests['source_branch'].astype(str)
+    df_issues_branches_merge_requests = pd.merge(df_issues_branches, df_merge_requests, how='left', on='name')
     
     # Categorize branches
     logger.info("Categorizing branches...")
@@ -508,7 +509,7 @@ def main():
     
     # Filter closed state
     df_issues_branches_merge_requests = df_issues_branches_merge_requests[
-        df_issues_branches_merge_requests['state_x'] != 'closed'
+        df_issues_branches_merge_requests['state_y'] != 'closed'
     ]
     
     # Group by issue ID
@@ -534,7 +535,7 @@ def main():
         'link_type': lambda x: ', '.join(filter(None, x.unique())),
     }
     
-    df_final = df_issues_branches_merge_requests.groupby('id', as_index=False).agg(agg_dict)
+    df_final = df_issues_branches_merge_requests.groupby('id_x', as_index=False).agg(agg_dict)
     df_final = df_final.rename(columns={'title_x': 'title', 'state_x': 'state'})
     
     # Calculate iteration dates
@@ -549,7 +550,7 @@ def main():
     
     # Reorder columns
     col_order = [
-        'iteration', 'id', 'title', 'state', 'weight', 'labels', 'epic',
+        'iteration', 'id_x', 'title', 'state', 'weight', 'labels', 'epic',
         'cid', 'swat', 'ikg_merged', 'ikg_branch_name', 'nlg_merged', 'nlg_branch_name',
         'odm_merged', 'odm_branch_name', 'linked_issue_id', 'linked_project_id',
         'linked_issue_title', 'link_type', 'iteration_start_date', 'iteration_end_date',
