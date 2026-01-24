@@ -27,8 +27,8 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 GITLAB_URL = 'https://devcloud.ubs.net'
-GROUP_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-insights-ci/commons'
-PROJECT_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-insights-ci/commons/staat-ds-insights-home'
+GROUP_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-insights-cl/commons'
+PROJECT_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-insights-cl/commons/staat-ds-insights-home'
 IKG_PROJECT_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-genesis/genesis-platform/ikg-dags'
 NLG_PROJECT_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-genesis/genesis-platform/nlg-dags'
 ODM_PROJECT_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-genesis/genesis-platform/odm-dags'
@@ -60,19 +60,20 @@ def extract_digits(text):
 
 
 def clean_labels(labels):
-    """Remove status:: prefix and @ symbol from labels"""
+    """Remove status:: prefix (case insensitive) and @ symbol from labels"""
     if pd.isna(labels) or labels == '':
         return ''
     label_list = [l.strip() for l in str(labels).split(',')]
     cleaned = []
     for l in label_list:
-        # Skip labels starting with 'status::'
-        if l.startswith('status::'):
+        # Skip labels starting with 'status::' (case insensitive)
+        if l.lower().startswith('status::'):
             continue
         # Remove @ symbol from the beginning
         if l.startswith('@'):
-            l = l[1:]
-        cleaned.append(l)
+            l = l[1:].strip()
+        if l:  # Only add non-empty labels
+            cleaned.append(l)
     return ', '.join(cleaned)
 
 
@@ -215,7 +216,8 @@ def collect_odm_release_details(odm_project, base_branch, df_final):
                             continue
                         
                         file_name = Path(file_path).name
-                        rule_name = Path(file_path).stem  # Filename without extension
+                        # rule_name only for .sql files, otherwise blank
+                        rule_name = Path(file_path).stem if file_path.endswith('.sql') else ''
                         change_type = infer_change_type(diff)
                         
                         # Extract target_type for SQL files
@@ -229,17 +231,25 @@ def collect_odm_release_details(odm_project, base_branch, df_final):
                                 logger.warning(f"Could not read SQL file {file_path}: {e}")
                         
                         odm_details_list.append({
+                            'iteration_end_date': issue_row.get('iteration_end_date', ''),
                             'issue_id': issue_id,
                             'issue_title': issue_row['title'],
                             'issue_state': issue_row['state'],
                             'issue_weight': issue_row['weight'],
                             'issue_labels': clean_labels(issue_row['labels']),
                             'issue_epic': issue_row['epic'],
+                            'swat': issue_row.get('swat', ''),
                             'branch_name': branch_name,
                             'file_name': file_name,
                             'rule_name': rule_name,
                             'target_type': target_type,
                             'change_type': change_type,
+                            'prod_release_date': issue_row.get('prod_release_date', ''),
+                            'linked_issue_id': issue_row.get('linked_issue_id', ''),
+                            'linked_project_id': issue_row.get('linked_project_id', ''),
+                            'linked_issue_title': issue_row.get('linked_issue_title', ''),
+                            'link_type': issue_row.get('link_type', ''),
+                            'iteration_start_date': issue_row.get('iteration_start_date', ''),
                             'file_path': diff.get("new_path", ""),
                             'old_path': diff.get("old_path", ""),
                             'new_path': diff.get("new_path", ""),
