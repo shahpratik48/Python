@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 GITLAB_URL = 'https://devcloud.ubs.net'
 GROUP_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-insights-ci/commons'
-PROJECT_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-insights-home'
+PROJECT_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-insights-ci/commons/staat-ds-insights-home'
 IKG_PROJECT_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-genesis/genesis-platform/ikg-dags'
 NLG_PROJECT_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-genesis/genesis-platform/nlg-dags'
 ODM_PROJECT_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-genesis/genesis-platform/odm-dags'
@@ -60,12 +60,19 @@ def extract_digits(text):
 
 
 def clean_labels(labels):
-    """Remove status:: prefix and @ prefix from labels"""
+    """Remove status:: prefix and @ symbol from labels"""
     if pd.isna(labels) or labels == '':
         return ''
     label_list = [l.strip() for l in str(labels).split(',')]
-    # Remove labels starting with 'status::' or '@'
-    cleaned = [l for l in label_list if not l.startswith('status::') and not l.startswith('@')]
+    cleaned = []
+    for l in label_list:
+        # Skip labels starting with 'status::'
+        if l.startswith('status::'):
+            continue
+        # Remove @ symbol from the beginning
+        if l.startswith('@'):
+            l = l[1:]
+        cleaned.append(l)
     return ', '.join(cleaned)
 
 
@@ -151,7 +158,7 @@ def collect_odm_release_details(odm_project, base_branch, df_final):
     odm_details_list = []
     
     for idx, issue_row in odm_issues.iterrows():
-        issue_id = issue_row['id']
+        issue_id = issue_row['id_x']
         odm_branches = [b.strip() for b in str(issue_row['odm_branch_name']).split(',') if b.strip()]
         
         for branch_name in odm_branches:
@@ -436,7 +443,8 @@ def main():
     # Merge with issues and branches
     logger.info("Merging issues, branches, and merge requests...")
     df_issues_branches = pd.merge(df_issues, df_branches, how='left', on='id')
-    df_issues_branches_merge_requests = pd.merge(df_issues_branches, df_merge_requests, how='left', left_on='name', right_on='source_branch')
+    df_merge_requests['name'] = df_merge_requests['source_branch'].astype(str)
+    df_issues_branches_merge_requests = pd.merge(df_issues_branches, df_merge_requests, how='left', on='name')
     
     # Categorize branches
     logger.info("Categorizing branches...")
@@ -470,6 +478,7 @@ def main():
     choices = ['', 'Yes', 'No']
     
     # IKG merged
+    df_issues_branches_merge_requests['ikg_branch_name'] = df_issues_branches_merge_requests['ikg_branch_name'].astype(str)
     conditions = [
         (df_issues_branches_merge_requests['ikg_branch_name'].str.strip() == ''),
         ((df_issues_branches_merge_requests['ikg_branch_name'].str.strip() != '') & (df_issues_branches_merge_requests['state_y'] == 'merged')),
@@ -478,6 +487,7 @@ def main():
     df_issues_branches_merge_requests['ikg_merged'] = np.select(conditions, choices, default='')
     
     # NLG merged
+    df_issues_branches_merge_requests['nlg_branch_name'] = df_issues_branches_merge_requests['nlg_branch_name'].astype(str)
     conditions = [
         (df_issues_branches_merge_requests['nlg_branch_name'].str.strip() == ''),
         ((df_issues_branches_merge_requests['nlg_branch_name'].str.strip() != '') & (df_issues_branches_merge_requests['state_y'] == 'merged')),
@@ -486,6 +496,7 @@ def main():
     df_issues_branches_merge_requests['nlg_merged'] = np.select(conditions, choices, default='')
     
     # ODM merged
+    df_issues_branches_merge_requests['odm_branch_name'] = df_issues_branches_merge_requests['odm_branch_name'].astype(str)
     conditions = [
         (df_issues_branches_merge_requests['odm_branch_name'].str.strip() == ''),
         ((df_issues_branches_merge_requests['odm_branch_name'].str.strip() != '') & (df_issues_branches_merge_requests['state_y'] == 'merged')),
@@ -509,34 +520,109 @@ def main():
     
     # Filter closed state
     df_issues_branches_merge_requests = df_issues_branches_merge_requests[
-        df_issues_branches_merge_requests['state_x'] != 'closed'
+        df_issues_branches_merge_requests['state_y'] != 'closed'
     ]
     
     # Group by issue ID
     logger.info("Grouping by issue ID and aggregating data...")
-    agg_dict = {
-        'title_x': 'first',
-        'state_x': 'first',
-        'weight': 'first',
-        'labels': 'first',
-        'epic': 'first',
-        'cid': 'first',
-        'swat': 'first',
-        'iteration': 'first',
-        'ikg_merged': lambda x: ', '.join(filter(None, x.unique())),
-        'ikg_branch_name': lambda x: ', '.join(filter(None, x.unique())),
-        'nlg_merged': lambda x: ', '.join(filter(None, x.unique())),
-        'nlg_branch_name': lambda x: ', '.join(filter(None, x.unique())),
-        'odm_merged': lambda x: ', '.join(filter(None, x.unique())),
-        'odm_branch_name': lambda x: ', '.join(filter(None, x.unique())),
-        'linked_issue_id': lambda x: ', '.join(filter(None, [str(v) for v in x.unique() if pd.notna(v)])),
-        'linked_project_id': lambda x: ', '.join(filter(None, [str(v) for v in x.unique() if pd.notna(v)])),
-        'linked_issue_title': lambda x: ', '.join(filter(None, x.unique())),
-        'link_type': lambda x: ', '.join(filter(None, x.unique())),
-    }
     
-    df_final = df_issues_branches_merge_requests.groupby('id', as_index=False).agg(agg_dict)
-    df_final = df_final.rename(columns={'title_x': 'title', 'state_x': 'state'})
+    # Create a list to hold expanded rows with individual branch merge status
+    expanded_rows = []
+    
+    for issue_id, group in df_issues_branches_merge_requests.groupby('id_x'):
+        # Get basic issue info
+        issue_info = {
+            'id_x': issue_id,
+            'title': group['title_x'].iloc[0],
+            'state': group['state_x'].iloc[0],
+            'weight': group['weight'].iloc[0],
+            'labels': group['labels'].iloc[0],
+            'epic': group['epic'].iloc[0],
+            'cid': group['cid'].iloc[0],
+            'swat': group['swat'].iloc[0],
+            'iteration': group['iteration'].iloc[0],
+        }
+        
+        # Collect all branches (regardless of category)
+        all_branches = []
+        ikg_branches_list = []
+        nlg_branches_list = []
+        odm_branches_list = []
+        ikg_merged_list = []
+        nlg_merged_list = []
+        odm_merged_list = []
+        
+        for _, row in group.iterrows():
+            branch = row.get('name', '')
+            if pd.notna(branch) and str(branch).strip():
+                all_branches.append(str(branch).strip())
+                
+                # Categorize by type
+                if row['ikg_branch_name']:
+                    ikg_branches_list.append(str(row['ikg_branch_name']).strip())
+                    ikg_merged_list.append(row['ikg_merged'])
+                
+                if row['nlg_branch_name']:
+                    nlg_branches_list.append(str(row['nlg_branch_name']).strip())
+                    nlg_merged_list.append(row['nlg_merged'])
+                
+                if row['odm_branch_name']:
+                    odm_branches_list.append(str(row['odm_branch_name']).strip())
+                    odm_merged_list.append(row['odm_merged'])
+        
+        # Remove duplicates while preserving order
+        all_branches = list(dict.fromkeys(all_branches))
+        ikg_branches_list = list(dict.fromkeys(ikg_branches_list))
+        nlg_branches_list = list(dict.fromkeys(nlg_branches_list))
+        odm_branches_list = list(dict.fromkeys(odm_branches_list))
+        
+        # Handle merged status for multiple branches of same type
+        ikg_merged_final = ', '.join(ikg_merged_list) if ikg_merged_list else ''
+        nlg_merged_final = ', '.join(nlg_merged_list) if nlg_merged_list else ''
+        odm_merged_final = ', '.join(odm_merged_list) if odm_merged_list else ''
+        
+        issue_info.update({
+            'branch_name': ', '.join(all_branches),
+            'ikg_branch_name': ', '.join(ikg_branches_list),
+            'nlg_branch_name': ', '.join(nlg_branches_list),
+            'odm_branch_name': ', '.join(odm_branches_list),
+            'ikg_merged': ikg_merged_final,
+            'nlg_merged': nlg_merged_final,
+            'odm_merged': odm_merged_final,
+        })
+        
+        # Aggregate linked issues
+        linked_issue_ids = []
+        linked_project_ids = []
+        linked_issue_titles = []
+        link_types = []
+        
+        for _, row in group.iterrows():
+            if pd.notna(row.get('linked_issue_id')) and str(row.get('linked_issue_id')).strip():
+                linked_issue_ids.append(str(row['linked_issue_id']).strip())
+            if pd.notna(row.get('linked_project_id')) and str(row.get('linked_project_id')).strip():
+                linked_project_ids.append(str(row['linked_project_id']).strip())
+            if pd.notna(row.get('linked_issue_title')) and str(row.get('linked_issue_title')).strip():
+                linked_issue_titles.append(str(row['linked_issue_title']).strip())
+            if pd.notna(row.get('link_type')) and str(row.get('link_type')).strip():
+                link_types.append(str(row['link_type']).strip())
+        
+        # Remove duplicates while preserving order
+        linked_issue_ids = list(dict.fromkeys(linked_issue_ids))
+        linked_project_ids = list(dict.fromkeys(linked_project_ids))
+        linked_issue_titles = list(dict.fromkeys(linked_issue_titles))
+        link_types = list(dict.fromkeys(link_types))
+        
+        issue_info.update({
+            'linked_issue_id': ', '.join(linked_issue_ids),
+            'linked_project_id': ', '.join(linked_project_ids),
+            'linked_issue_title': ', '.join(linked_issue_titles),
+            'link_type': ', '.join(link_types),
+        })
+        
+        expanded_rows.append(issue_info)
+    
+    df_final = pd.DataFrame(expanded_rows)
     
     # Convert linked_issue_id and linked_project_id to integers (remove decimals)
     def convert_to_int_list(val):
@@ -567,12 +653,12 @@ def main():
     
     # Reorder columns
     col_order = [
-        'iteration', 'state', 'iteration_end_date', 'title', 'id', 'weight', 'labels', 'epic',
+        'iteration', 'state', 'iteration_end_date', 'title', 'id_x', 'weight', 'labels', 'epic',
         'swat', 'preprod_release_date', 'prod_release_date', 
         'ikg_merged', 'ikg_branch_name', 'nlg_merged', 'nlg_branch_name',
         'odm_merged', 'odm_branch_name', 'cid', 
         'linked_issue_id', 'linked_project_id', 'linked_issue_title', 'link_type',
-        'iteration_start_date'
+        'iteration_start_date', 'branch_name'
     ]
     df_final = df_final[col_order]
     
