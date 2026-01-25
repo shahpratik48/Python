@@ -119,7 +119,14 @@ class GitLabIssuesFetcher:
             assignee_str = ', '.join(assignees) if assignees else None
             
             labels = issue.get('labels', [])
-            label_str = ', '.join(labels) if labels else None
+            # Labels can be strings or dicts depending on with_labels_details parameter
+            if labels:
+                if isinstance(labels[0], dict):
+                    label_str = ', '.join([label.get('name', '') for label in labels])
+                else:
+                    label_str = ', '.join(labels)
+            else:
+                label_str = None
             
             iteration = issue.get('iteration', {}).get('title', '') if issue.get('iteration') else None
             
