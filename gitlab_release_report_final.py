@@ -17,6 +17,11 @@ from pathlib import Path
 from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill
 import logging
+import psycopg2
+from psycopg2 import sql
+from sqlalchemy import create_engine
+import psycopg2
+from psycopg2 import sql
 
 # Configure logging
 logging.basicConfig(
@@ -33,6 +38,15 @@ IKG_PROJECT_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/s
 NLG_PROJECT_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-genesis/genesis-platform/nlg-dags'
 ODM_PROJECT_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-genesis/genesis-platform/odm-dags'
 DEFAULT_BASE_BRANCH = 'odm-master'
+
+# Greenplum Configuration
+GREENPLUM_HOST = 'greenplum-rdsp.zur.swissbank.com'
+GREENPLUM_PORT = 5432
+GREENPLUM_DB = 'gprdsp'
+GREENPLUM_USER = 'ds_rdsp_dev'
+GREENPLUM_SCHEMA = 'sandbox_prj_smart_insights'
+OUTPUT_TABLE1 = 'staat_insight_release'
+OUTPUT_TABLE2 = 'odm_release_details'
 
 
 def get_linked_issues(project_id, issue_iid, headers):
@@ -75,6 +89,39 @@ def clean_labels(labels):
         if l:  # Only add non-empty labels
             cleaned.append(l)
     return ', '.join(cleaned)
+
+
+def save_to_greenplum(df, table_name, schema, password):
+    """Save DataFrame to Greenplum database"""
+    logger.info(f"Connecting to Greenplum database...")
+    
+    try:
+        # Create SQLAlchemy engine
+        connection_string = f"postgresql://{GREENPLUM_USER}:{password}@{GREENPLUM_HOST}:{GREENPLUM_PORT}/{GREENPLUM_DB}"
+        engine = create_engine(connection_string)
+        
+        # Clean column names for database (replace spaces and special characters)
+        df_clean = df.copy()
+        df_clean.columns = [col.lower().replace(' ', '_').replace('-', '_') for col in df_clean.columns]
+        
+        # Save to database
+        logger.info(f"Saving data to {schema}.{table_name}...")
+        df_clean.to_sql(
+            name=table_name,
+            con=engine,
+            schema=schema,
+            if_exists='append',  # Append data to existing table
+            index=False,
+            method='multi'
+        )
+        
+        logger.info(f"✅ Successfully saved {len(df_clean)} rows to {schema}.{table_name}")
+        engine.dispose()
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Error saving to Greenplum: {e}")
+        return False
 
 
 def infer_change_type(diff):
@@ -249,6 +296,7 @@ def collect_odm_release_details(odm_project, base_branch, df_final):
                             'linked_project_id': issue_row.get('linked_project_id', ''),
                             'linked_issue_title': issue_row.get('linked_issue_title', ''),
                             'link_type': issue_row.get('link_type', ''),
+                            'link_url': issue_row.get('link_url', ''),
                             'iteration_start_date': issue_row.get('iteration_start_date', ''),
                             'file_path': diff.get("new_path", ""),
                             'old_path': diff.get("old_path", ""),
@@ -343,6 +391,7 @@ def main():
                     'linked_project_id': link.get('project_id'),
                     'linked_issue_title': link.get('title'),
                     'link_type': link.get('link_type'),
+                    'link_url': link.get('web_url', ''),
                 })
         else:
             rows.append({
@@ -352,6 +401,7 @@ def main():
                 'linked_project_id': None,
                 'linked_issue_title': None,
                 'link_type': None,
+                'link_url': None,
             })
     
     df_linked_issues = pd.DataFrame(rows)
@@ -606,6 +656,7 @@ def main():
         linked_project_ids = []
         linked_issue_titles = []
         link_types = []
+        link_urls = []
         
         for _, row in group.iterrows():
             if pd.notna(row.get('linked_issue_id')) and str(row.get('linked_issue_id')).strip():
@@ -616,18 +667,22 @@ def main():
                 linked_issue_titles.append(str(row['linked_issue_title']).strip())
             if pd.notna(row.get('link_type')) and str(row.get('link_type')).strip():
                 link_types.append(str(row['link_type']).strip())
+            if pd.notna(row.get('link_url')) and str(row.get('link_url')).strip():
+                link_urls.append(str(row['link_url']).strip())
         
         # Remove duplicates while preserving order
         linked_issue_ids = list(dict.fromkeys(linked_issue_ids))
         linked_project_ids = list(dict.fromkeys(linked_project_ids))
         linked_issue_titles = list(dict.fromkeys(linked_issue_titles))
         link_types = list(dict.fromkeys(link_types))
+        link_urls = list(dict.fromkeys(link_urls))
         
         issue_info.update({
             'linked_issue_id': ', '.join(linked_issue_ids),
             'linked_project_id': ', '.join(linked_project_ids),
             'linked_issue_title': ', '.join(linked_issue_titles),
             'link_type': ', '.join(link_types),
+            'link_url': ', '.join(link_urls),
         })
         
         expanded_rows.append(issue_info)
@@ -667,7 +722,7 @@ def main():
         'swat', 'preprod_release_date', 'prod_release_date', 
         'ikg_merged', 'ikg_branch_name', 'nlg_merged', 'nlg_branch_name',
         'odm_merged', 'odm_branch_name', 'cid', 
-        'linked_issue_id', 'linked_project_id', 'linked_issue_title', 'link_type',
+        'linked_issue_id', 'linked_project_id', 'linked_issue_title', 'link_type', 'link_url',
         'iteration_start_date', 'branch_name'
     ]
     df_final = df_final[col_order]
@@ -729,6 +784,36 @@ def main():
     logger.info(f"📊 Sheet 2: odm_release_details with {len(df_odm_details)} file changes")
     logger.info(f"⏱️  Total duration: {duration}")
     logger.info("="*60)
+    
+    # Save to Greenplum database
+    save_to_db = input("\nSave data to Greenplum database? (yes/no): ").strip().lower()
+    if save_to_db in ['yes', 'y']:
+        logger.info("\n" + "="*60)
+        logger.info("Saving data to Greenplum database...")
+        logger.info("="*60)
+        
+        GREENPLUM_PASSWORD = getpass.getpass("Enter Greenplum database password: ")
+        
+        # Save Issues Report
+        logger.info(f"\n📊 Saving Issues_Report to {GREENPLUM_SCHEMA}.{OUTPUT_TABLE1}...")
+        success1 = save_to_greenplum(df_final, OUTPUT_TABLE1, GREENPLUM_SCHEMA, GREENPLUM_PASSWORD)
+        
+        # Save ODM Release Details
+        if not df_odm_details.empty:
+            logger.info(f"\n📊 Saving odm_release_details to {GREENPLUM_SCHEMA}.{OUTPUT_TABLE2}...")
+            success2 = save_to_greenplum(df_odm_details, OUTPUT_TABLE2, GREENPLUM_SCHEMA, GREENPLUM_PASSWORD)
+        else:
+            logger.info("\n⚠️  No ODM details to save")
+            success2 = True
+        
+        if success1 and success2:
+            logger.info("\n" + "="*60)
+            logger.info("✅ All data successfully saved to Greenplum!")
+            logger.info("="*60)
+        else:
+            logger.warning("\n⚠️  Some data failed to save to Greenplum")
+    else:
+        logger.info("\n⏭️  Skipping database save")
     
     return output_file
 

@@ -1,0 +1,7 @@
+python-gitlab
+pandas
+numpy
+openpyxl
+requests
+psycopg2-binary
+sqlalchemy
