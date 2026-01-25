@@ -5,7 +5,7 @@ WITH max_exclusion_dates AS (
     -- Get the maximum last_upd_dte for each insight_type
     SELECT 
         insight_type,
-        MAX(last_upd_dte) AS max_last_upd_dte
+        MAX(last_upd_dte::date) AS max_last_upd_dte
     FROM sandbox_prj_smart_insights.odm_exclusion_insight_type
     GROUP BY insight_type
 ),
@@ -16,15 +16,12 @@ latest_exclusion_records AS (
     FROM sandbox_prj_smart_insights.odm_exclusion_insight_type b
     INNER JOIN max_exclusion_dates m
         ON b.insight_type = m.insight_type
-        AND b.last_upd_dte = m.max_last_upd_dte
+        AND b.last_upd_dte::date = m.max_last_upd_dte
 )
 SELECT 
-    -- All columns from table a (odm_release_details)
-    a.*,
-    
     -- All columns from table b (odm_exclusion_insight_type) with alias to avoid conflicts
     b.insight_type AS exclusion_insight_type,
-    b.last_upd_dte AS exclusion_last_upd_dte,
+    b.last_upd_dte::date AS exclusion_last_upd_dte,
     b.is_curr AS exclusion_is_curr,
     
     -- Go_live column logic
@@ -43,11 +40,31 @@ SELECT
         -- If insight_type exists in exclusion table with max date and is_curr = 1
         WHEN b.insight_type IS NOT NULL AND b.is_curr = 1 THEN NULL
         -- If insight_type exists in exclusion table with max date and is_curr = 0
-        WHEN b.insight_type IS NOT NULL AND b.is_curr = 0 THEN b.last_upd_dte
+        WHEN b.insight_type IS NOT NULL AND b.is_curr = 0 THEN b.last_upd_dte::date::text
         -- If insight_type is not in exclusion table (null)
         WHEN b.insight_type IS NULL THEN a.prod_release_date
         ELSE a.prod_release_date
-    END AS go_live_date
+    END AS go_live_date,
+    
+    -- All columns from table a (odm_release_details)
+    a.prod_release_date,
+    a.rule_name,
+    a.target_type,
+    a.change_type,
+    a.iteration_end_date,
+    a.issue_id,
+    a.issue_title,
+    a.issue_state,
+    a.issue_weight,
+    a.issue_labels,
+    a.issue_epic,
+    a.swat,
+    a.branch_name,
+    a.linked_issue_id,
+    a.linked_issue_title,
+    a.link_url,
+    a.linked_project_id,
+    a.link_type
 
 FROM sandbox_prj_smart_insights.odm_release_details a
 
