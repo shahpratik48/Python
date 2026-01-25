@@ -195,6 +195,16 @@ class GitLabIssuesFetcher:
     def extract_issue_data(self, issues: List[Dict[str, Any]], project_identifier: str) -> pd.DataFrame:
         """Extract comprehensive issue data with proper column order"""
         logger.info(f"Extracting data from {len(issues)} issues for {project_identifier}")
+        
+        # Debug: Log structure of first issue if available
+        if issues and len(issues) > 0:
+            first_issue = issues[0]
+            logger.debug(f"Sample issue keys: {list(first_issue.keys())}")
+            if first_issue.get('iteration'):
+                logger.info(f"Sample iteration data: {first_issue.get('iteration')}")
+            else:
+                logger.debug("No iteration field in sample issue")
+        
         extracted_data = []
         current_datetime = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
@@ -213,7 +223,21 @@ class GitLabIssuesFetcher:
             else:
                 label_str = None
             
-            iteration = issue.get('iteration', {}).get('title', '') if issue.get('iteration') else None
+            # Extract iteration - try multiple possible field structures
+            iteration = None
+            if issue.get('iteration'):
+                iteration_data = issue.get('iteration')
+                # Try different possible fields for iteration name/title
+                if isinstance(iteration_data, dict):
+                    iteration = (iteration_data.get('title') or 
+                               iteration_data.get('name') or 
+                               iteration_data.get('web_url', '').split('/')[-1] if iteration_data.get('web_url') else None)
+                elif isinstance(iteration_data, str):
+                    iteration = iteration_data
+                
+                if iteration:
+                    logger.debug(f"Issue {issue.get('iid')} iteration: {iteration}")
+            
             epic = issue.get('epic', {}).get('title', '') if issue.get('epic') else None
             epic_iid = issue.get('epic', {}).get('iid', '') if issue.get('epic') else None
             
@@ -334,7 +358,18 @@ class GitLabIssuesFetcher:
             extracted_data.append(issue_data)
         
         df = pd.DataFrame(extracted_data)
+        
+        # Log iteration statistics
+        iterations_found = df['iteration'].notna().sum()
         logger.info(f"Extracted {len(df)} rows with {len(df.columns)} columns")
+        logger.info(f"Issues with iteration data: {iterations_found}/{len(df)}")
+        
+        if iterations_found > 0:
+            unique_iterations = df[df['iteration'].notna()]['iteration'].unique()
+            logger.info(f"Unique iterations found: {list(unique_iterations)[:10]}")  # Log first 10
+        else:
+            logger.warning("No iteration data found in any issues - this may be expected if issues don't have iterations assigned")
+        
         return df
 
 
