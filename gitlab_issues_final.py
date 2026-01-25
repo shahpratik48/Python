@@ -295,13 +295,15 @@ class GitLabIssuesFetcher:
                     proj_name = self.get_project_name_by_id(proj_id)
                     linked_project_names.append(proj_name)
             
-            # Column order: project, issue_id, issue_iid, title, labels, description, ...
+            # Column order: project, issue_id, issue_iid, title, labels, epic, weight, description, ...
             issue_data = {
                 'project': project_identifier,
                 'issue_id': issue.get('id'),
                 'issue_iid': issue.get('iid'),
                 'title': issue.get('title'),
                 'labels': label_str,  # Labels right after title
+                'epic': epic,  # Epic right after labels
+                'weight': issue.get('weight'),  # Weight right after epic
                 'description': issue.get('description'),
                 'state': issue.get('state'),
                 'web_url': issue.get('web_url', ''),
@@ -314,7 +316,7 @@ class GitLabIssuesFetcher:
                 'link_url': ', '.join(link_urls) if link_urls else None,
                 'link_issue_title': ', '.join(link_issue_titles) if link_issue_titles else None,
                 'linked_project_id': ', '.join(linked_project_ids) if linked_project_ids else None,
-                'linked_project_name': ', '.join(linked_project_names) if linked_project_names else None,  # NEW!
+                'linked_project_name': ', '.join(linked_project_names) if linked_project_names else None,
                 
                 # Assignment and ownership
                 'author': issue.get('author', {}).get('name'),
@@ -337,9 +339,7 @@ class GitLabIssuesFetcher:
                 'iteration': iteration,
                 'iteration_start_date': iteration_start_date,
                 'iteration_end_date': iteration_end_date,
-                'epic': epic,
                 'epic_iid': epic_iid,
-                'weight': issue.get('weight'),
                 
                 # Relationships
                 'parent_iid': None,
