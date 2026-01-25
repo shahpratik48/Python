@@ -223,8 +223,11 @@ class GitLabIssuesFetcher:
             else:
                 label_str = None
             
-            # Extract iteration - try multiple possible field structures
+            # Extract iteration - get full details including dates
             iteration = None
+            iteration_start_date = None
+            iteration_end_date = None
+            
             if issue.get('iteration'):
                 iteration_data = issue.get('iteration')
                 # Try different possible fields for iteration name/title
@@ -232,11 +235,16 @@ class GitLabIssuesFetcher:
                     iteration = (iteration_data.get('title') or 
                                iteration_data.get('name') or 
                                iteration_data.get('web_url', '').split('/')[-1] if iteration_data.get('web_url') else None)
+                    
+                    # Extract iteration dates
+                    iteration_start_date = iteration_data.get('start_date')
+                    iteration_end_date = iteration_data.get('due_date') or iteration_data.get('end_date')
+                    
                 elif isinstance(iteration_data, str):
                     iteration = iteration_data
                 
                 if iteration:
-                    logger.debug(f"Issue {issue.get('iid')} iteration: {iteration}")
+                    logger.debug(f"Issue {issue.get('iid')} iteration: {iteration} ({iteration_start_date} to {iteration_end_date})")
             
             epic = issue.get('epic', {}).get('title', '') if issue.get('epic') else None
             epic_iid = issue.get('epic', {}).get('iid', '') if issue.get('epic') else None
@@ -327,6 +335,8 @@ class GitLabIssuesFetcher:
                 # Organization
                 'milestone': milestone,
                 'iteration': iteration,
+                'iteration_start_date': iteration_start_date,
+                'iteration_end_date': iteration_end_date,
                 'epic': epic,
                 'epic_iid': epic_iid,
                 'weight': issue.get('weight'),
@@ -361,8 +371,11 @@ class GitLabIssuesFetcher:
         
         # Log iteration statistics
         iterations_found = df['iteration'].notna().sum()
+        iterations_with_dates = df[(df['iteration_start_date'].notna()) | (df['iteration_end_date'].notna())].shape[0]
+        
         logger.info(f"Extracted {len(df)} rows with {len(df.columns)} columns")
         logger.info(f"Issues with iteration data: {iterations_found}/{len(df)}")
+        logger.info(f"Issues with iteration dates: {iterations_with_dates}/{len(df)}")
         
         if iterations_found > 0:
             unique_iterations = df[df['iteration'].notna()]['iteration'].unique()
