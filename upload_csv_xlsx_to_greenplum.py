@@ -5,6 +5,46 @@ from psycopg2 import sql
 import getpass
 from datetime import datetime
 from io import StringIO
+import tkinter as tk
+from tkinter import filedialog
+
+
+def browse_file():
+    """
+    Open file dialog to browse and select CSV or XLSX file
+    Returns filepath and filename
+    """
+    root = tk.Tk()
+    root.withdraw()  # Hide the main window
+    root.attributes('-topmost', True)  # Bring dialog to front
+    
+    # Open file dialog with filter for CSV and XLSX files
+    file_path = filedialog.askopenfilename(
+        title="Select a CSV or XLSX file",
+        filetypes=[
+            ("CSV files", "*.csv"),
+            ("Excel files", "*.xlsx"),
+            ("Excel files (old)", "*.xls"),
+            ("All supported files", "*.csv *.xlsx *.xls"),
+            ("All files", "*.*")
+        ]
+    )
+    
+    root.destroy()
+    
+    if not file_path:
+        raise ValueError("No file selected")
+    
+    # Validate file extension
+    file_extension = file_path.lower().split('.')[-1]
+    if file_extension not in ['csv', 'xlsx', 'xls']:
+        raise ValueError(f"Invalid file type. Please select a CSV or XLSX file. Selected: {file_extension}")
+    
+    # Extract filepath and filename
+    filepath = os.path.dirname(file_path)
+    filename = os.path.basename(file_path)
+    
+    return filepath, filename
 
 
 def get_db_connection(config):
@@ -287,17 +327,39 @@ def upload_to_greenplum(filepath, filename, output_tablename, db_config):
 
 # Main execution
 if __name__ == "__main__":
-    # Get user inputs
     print("\n" + "="*60)
     print("GREENPLUM FILE UPLOADER")
     print("="*60 + "\n")
     
-    filepath = input("Enter file path: ").strip()
-    filename = input("Enter file name (CSV or XLSX): ").strip()
-    output_tablename = input("Enter output table name: ").strip()
+    # Ask user if they want to browse or enter manually
+    use_browser = input("Do you want to browse for file? (yes/no) [default: yes]: ").strip().lower()
+    
+    if use_browser in ['', 'yes', 'y']:
+        print("\nOpening file browser...")
+        try:
+            filepath, filename = browse_file()
+            print(f"\nSelected file: {filename}")
+            print(f"File path: {filepath}")
+        except Exception as e:
+            print(f"Error: {e}")
+            print("Exiting...")
+            exit(1)
+    else:
+        # Manual input
+        filepath = input("Enter file path: ").strip()
+        filename = input("Enter file name (CSV or XLSX): ").strip()
+        
+        # Validate file extension
+        file_extension = filename.lower().split('.')[-1]
+        if file_extension not in ['csv', 'xlsx', 'xls']:
+            print(f"Error: Invalid file type '{file_extension}'. Please use CSV or XLSX files.")
+            exit(1)
+    
+    # Get output table name
+    output_tablename = input("\nEnter output table name: ").strip()
     
     # Get password securely
-    password = getpass.getpass(f"Enter Password for DB User: ")
+    password = getpass.getpass(f"\nEnter Password for DB User: ")
     
     # Database configuration
     DB_CONFIG = {
