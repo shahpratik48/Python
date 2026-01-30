@@ -49,6 +49,18 @@ OUTPUT_TABLE1 = 'staat_insight_release'
 OUTPUT_TABLE2 = 'odm_release_details'
 
 
+def get_project_name(gl, project_id):
+    """Get project name from project ID"""
+    try:
+        if project_id:
+            project = gl.projects.get(project_id)
+            return project.path_with_namespace
+        return ''
+    except Exception as e:
+        logger.warning(f"Could not get project name for ID {project_id}: {e}")
+        return ''
+
+
 def get_linked_issues(project_id, issue_iid, headers):
     """Get linked issues for a specific issue"""
     url = f"{GITLAB_URL}/api/v4/projects/{requests.utils.quote(str(project_id), safe='')}/issues/{issue_iid}/links"
@@ -310,6 +322,7 @@ def collect_odm_release_details(odm_project, base_branch, df_final):
                             'prod_release_date': issue_row.get('prod_release_date', ''),
                             'linked_issue_id': issue_row.get('linked_issue_id', ''),
                             'linked_project_id': issue_row.get('linked_project_id', ''),
+                            'linked_project_name': issue_row.get('linked_project_name', ''),
                             'linked_issue_title': issue_row.get('linked_issue_title', ''),
                             'link_type': issue_row.get('link_type', ''),
                             'link_url': issue_row.get('link_url', ''),
@@ -401,11 +414,14 @@ def main():
         linked_issues = get_linked_issues(PROJECT_PATH, issue.iid, headers)
         if linked_issues:
             for link in linked_issues:
+                linked_project_id = link.get('project_id')
+                linked_project_name = get_project_name(gl, linked_project_id) if linked_project_id else ''
                 rows.append({
                     'id': issue.iid,
                     'title': issue.title,
                     'linked_issue_id': link.get('iid'),
-                    'linked_project_id': link.get('project_id'),
+                    'linked_project_id': linked_project_id,
+                    'linked_project_name': linked_project_name,
                     'linked_issue_title': link.get('title'),
                     'link_type': link.get('link_type'),
                     'link_url': link.get('web_url', ''),
@@ -416,6 +432,7 @@ def main():
                 'title': issue.title,
                 'linked_issue_id': None,
                 'linked_project_id': None,
+                'linked_project_name': None,
                 'linked_issue_title': None,
                 'link_type': None,
                 'link_url': None,
@@ -671,6 +688,7 @@ def main():
         # Aggregate linked issues
         linked_issue_ids = []
         linked_project_ids = []
+        linked_project_names = []
         linked_issue_titles = []
         link_types = []
         link_urls = []
@@ -680,6 +698,8 @@ def main():
                 linked_issue_ids.append(str(row['linked_issue_id']).strip())
             if pd.notna(row.get('linked_project_id')) and str(row.get('linked_project_id')).strip():
                 linked_project_ids.append(str(row['linked_project_id']).strip())
+            if pd.notna(row.get('linked_project_name')) and str(row.get('linked_project_name')).strip():
+                linked_project_names.append(str(row['linked_project_name']).strip())
             if pd.notna(row.get('linked_issue_title')) and str(row.get('linked_issue_title')).strip():
                 linked_issue_titles.append(str(row['linked_issue_title']).strip())
             if pd.notna(row.get('link_type')) and str(row.get('link_type')).strip():
@@ -690,6 +710,7 @@ def main():
         # Remove duplicates while preserving order
         linked_issue_ids = list(dict.fromkeys(linked_issue_ids))
         linked_project_ids = list(dict.fromkeys(linked_project_ids))
+        linked_project_names = list(dict.fromkeys(linked_project_names))
         linked_issue_titles = list(dict.fromkeys(linked_issue_titles))
         link_types = list(dict.fromkeys(link_types))
         link_urls = list(dict.fromkeys(link_urls))
@@ -697,6 +718,7 @@ def main():
         issue_info.update({
             'linked_issue_id': ', '.join(linked_issue_ids),
             'linked_project_id': ', '.join(linked_project_ids),
+            'linked_project_name': ', '.join(linked_project_names),
             'linked_issue_title': ', '.join(linked_issue_titles),
             'link_type': ', '.join(link_types),
             'link_url': ', '.join(link_urls),
@@ -739,7 +761,7 @@ def main():
         'swat', 'preprod_release_date', 'prod_release_date', 
         'ikg_merged', 'ikg_branch_name', 'nlg_merged', 'nlg_branch_name',
         'odm_merged', 'odm_branch_name', 'cid', 
-        'linked_issue_id', 'linked_project_id', 'linked_issue_title', 'link_type', 'link_url',
+        'linked_issue_id', 'linked_project_id', 'linked_project_name', 'linked_issue_title', 'link_type', 'link_url',
         'iteration_start_date', 'branch_name', 'comment'
     ]
     
