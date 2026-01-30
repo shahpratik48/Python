@@ -37,7 +37,7 @@ PROJECT_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat
 IKG_PROJECT_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-genesis/genesis-platform/ikg-dags'
 NLG_PROJECT_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-genesis/genesis-platform/nlg-dags'
 ODM_PROJECT_PATH = 'ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-genesis/genesis-platform/odm-dags'
-DEFAULT_BASE_BRANCH = 'odm-master'
+DEFAULT_BASE_BRANCH = 'develop'
 
 # Greenplum Configuration
 GREENPLUM_HOST = 'greenplum-rdsp.zur.swissbank.com'
@@ -92,7 +92,7 @@ def clean_labels(labels):
 
 
 def save_to_greenplum(df, table_name, schema, password):
-    """Save DataFrame to Greenplum database"""
+    """Save DataFrame to Greenplum database with incremental batch logic"""
     logger.info(f"Connecting to Greenplum database...")
     
     try:
@@ -100,8 +100,24 @@ def save_to_greenplum(df, table_name, schema, password):
         connection_string = f"postgresql://{GREENPLUM_USER}:{password}@{GREENPLUM_HOST}:{GREENPLUM_PORT}/{GREENPLUM_DB}"
         engine = create_engine(connection_string)
         
-        # Clean column names for database (replace spaces and special characters)
+        # Get current max batch number
+        try:
+            query = f"SELECT COALESCE(MAX(batch), 0) as max_batch FROM {schema}.{table_name}"
+            result = pd.read_sql(query, engine)
+            current_batch = result['max_batch'].iloc[0] + 1
+            logger.info(f"Current batch number: {current_batch}")
+        except Exception as e:
+            # Table doesn't exist yet, start with batch 1
+            logger.info(f"Table doesn't exist or error getting max batch: {e}")
+            current_batch = 1
+            logger.info(f"Starting with batch number: {current_batch}")
+        
+        # Add comment column (empty) and batch column
         df_clean = df.copy()
+        df_clean['comment'] = ''
+        df_clean['batch'] = current_batch
+        
+        # Clean column names for database (replace spaces and special characters)
         df_clean.columns = [col.lower().replace(' ', '_').replace('-', '_') for col in df_clean.columns]
         
         # Save to database
@@ -115,7 +131,7 @@ def save_to_greenplum(df, table_name, schema, password):
             method='multi'
         )
         
-        logger.info(f"✅ Successfully saved {len(df_clean)} rows to {schema}.{table_name}")
+        logger.info(f"✅ Successfully saved {len(df_clean)} rows to {schema}.{table_name} with batch={current_batch}")
         engine.dispose()
         return True
         
@@ -301,6 +317,7 @@ def collect_odm_release_details(odm_project, base_branch, df_final):
                             'file_path': diff.get("new_path", ""),
                             'old_path': diff.get("old_path", ""),
                             'new_path': diff.get("new_path", ""),
+                            'comment': '',
                             **branch_meta
                         })
                 else:
@@ -465,9 +482,9 @@ def main():
     
     # Get merge requests
     logger.info("Fetching merge requests...")
-    target_ikg_branch = ['ikg-master']
-    target_nlg_branch = ['nlg-master']
-    target_odm_branch = ['odm-master']
+    target_ikg_branch = ['develop']
+    target_nlg_branch = ['develop']
+    target_odm_branch = ['develop']
     
     filtered_ikg_mrs = []
     for branch in target_ikg_branch:
@@ -723,8 +740,12 @@ def main():
         'ikg_merged', 'ikg_branch_name', 'nlg_merged', 'nlg_branch_name',
         'odm_merged', 'odm_branch_name', 'cid', 
         'linked_issue_id', 'linked_project_id', 'linked_issue_title', 'link_type', 'link_url',
-        'iteration_start_date', 'branch_name'
+        'iteration_start_date', 'branch_name', 'comment'
     ]
+    
+    # Add comment column (empty)
+    df_final['comment'] = ''
+    
     df_final = df_final[col_order]
     
     # Collect ODM release details
