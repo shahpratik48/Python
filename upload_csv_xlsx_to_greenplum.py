@@ -6,63 +6,6 @@ import getpass
 from datetime import datetime
 from io import StringIO
 
-# Try to import tkinter, but don't fail if not available
-try:
-    import tkinter as tk
-    from tkinter import filedialog
-    TKINTER_AVAILABLE = True
-except (ImportError, ModuleNotFoundError):
-    TKINTER_AVAILABLE = False
-    print("Note: tkinter not available. File browser will not be available.")
-
-
-def browse_file():
-    """
-    Open file dialog to browse and select CSV or XLSX file
-    Returns filepath and filename
-    """
-    if not TKINTER_AVAILABLE:
-        raise RuntimeError("tkinter is not available. Please use manual file path input.")
-    
-    try:
-        root = tk.Tk()
-        root.withdraw()  # Hide the main window
-        root.attributes('-topmost', True)  # Bring dialog to front
-        
-        # Open file dialog with filter for CSV and XLSX files
-        file_path = filedialog.askopenfilename(
-            title="Select a CSV or XLSX file",
-            filetypes=[
-                ("CSV files", "*.csv"),
-                ("Excel files", "*.xlsx"),
-                ("Excel files (old)", "*.xls"),
-                ("All supported files", "*.csv *.xlsx *.xls"),
-                ("All files", "*.*")
-            ]
-        )
-        
-        root.destroy()
-        
-        if not file_path:
-            raise ValueError("No file selected")
-        
-        # Validate file extension
-        file_extension = file_path.lower().split('.')[-1]
-        if file_extension not in ['csv', 'xlsx', 'xls']:
-            raise ValueError(f"Invalid file type. Please select a CSV or XLSX file. Selected: {file_extension}")
-        
-        # Extract filepath and filename
-        filepath = os.path.dirname(file_path)
-        filename = os.path.basename(file_path)
-        
-        return filepath, filename
-    
-    except tk.TclError as e:
-        if "no display" in str(e).lower() or "couldn't connect" in str(e).lower():
-            raise RuntimeError("No display available. File browser requires a graphical environment. Please use manual file path input.")
-        else:
-            raise
-
 
 def get_db_connection(config):
     """
@@ -82,11 +25,13 @@ def get_db_connection(config):
         raise
 
 
-def read_file(filepath, filename):
+def read_file(filename):
     """
-    Read CSV or XLSX file into pandas DataFrame
+    Read CSV or XLSX file from current directory into pandas DataFrame
     """
-    full_path = os.path.join(filepath, filename)
+    # Get the current working directory
+    current_dir = os.getcwd()
+    full_path = os.path.join(current_dir, filename)
     
     if not os.path.exists(full_path):
         raise FileNotFoundError(f"File not found: {full_path}")
@@ -101,7 +46,8 @@ def read_file(filepath, filename):
         else:
             raise ValueError(f"Unsupported file format: {file_extension}. Use CSV or XLSX.")
         
-        print(f"File loaded successfully. Shape: {df.shape}")
+        print(f"File loaded successfully from: {full_path}")
+        print(f"Shape: {df.shape}")
         print(f"Columns: {list(df.columns)}")
         return df
     
@@ -282,16 +228,14 @@ def load_data(conn, schema, table_name, df):
         raise
 
 
-def upload_to_greenplum(filepath, filename, output_tablename, db_config):
+def upload_to_greenplum(filename, output_tablename, db_config):
     """
     Main function to upload file to Greenplum
     
     Parameters:
     -----------
-    filepath : str
-        Path to the directory containing the file
     filename : str
-        Name of the file (CSV or XLSX)
+        Name of the file (CSV or XLSX) in the current directory
     output_tablename : str
         Name of the output table in Greenplum
     db_config : dict
@@ -305,7 +249,7 @@ def upload_to_greenplum(filepath, filename, output_tablename, db_config):
         print(f"Starting upload process for: {filename}")
         print(f"{'='*60}\n")
         
-        df = read_file(filepath, filename)
+        df = read_file(filename)
         
         # Step 2: Connect to database
         print("\nConnecting to Greenplum database...")
@@ -348,59 +292,36 @@ if __name__ == "__main__":
     print("GREENPLUM FILE UPLOADER")
     print("="*60 + "\n")
     
-    # Check if file browser is available
-    if TKINTER_AVAILABLE:
-        use_browser = input("Do you want to browse for file? (yes/no) [default: no]: ").strip().lower()
+    print("Current directory:", os.getcwd())
+    print("\nFiles in current directory:")
+    files = [f for f in os.listdir('.') if f.endswith(('.csv', '.xlsx', '.xls'))]
+    if files:
+        for f in files:
+            print(f"  - {f}")
     else:
-        print("Note: File browser is not available in this environment.")
-        use_browser = 'no'
+        print("  No CSV or XLSX files found in current directory")
     
-    if use_browser in ['yes', 'y'] and TKINTER_AVAILABLE:
-        print("\nOpening file browser...")
-        try:
-            filepath, filename = browse_file()
-            print(f"\nSelected file: {filename}")
-            print(f"File path: {filepath}")
-        except RuntimeError as e:
-            print(f"\n{e}")
-            print("Falling back to manual input...\n")
-            use_browser = 'no'
-        except Exception as e:
-            print(f"Error: {e}")
-            print("Falling back to manual input...\n")
-            use_browser = 'no'
+    print("\n" + "-"*60 + "\n")
     
-    if use_browser not in ['yes', 'y'] or not TKINTER_AVAILABLE:
-        # Manual input
-        filepath = input("Enter file path (or full path with filename): ").strip()
-        
-        # Check if user provided full path or just directory
-        if os.path.isfile(filepath):
-            # Full path provided
-            full_path = filepath
-            filepath = os.path.dirname(full_path)
-            filename = os.path.basename(full_path)
-        else:
-            # Directory provided, ask for filename
-            filename = input("Enter file name (CSV or XLSX): ").strip()
-        
-        # Validate file extension
-        file_extension = filename.lower().split('.')[-1]
-        if file_extension not in ['csv', 'xlsx', 'xls']:
-            print(f"Error: Invalid file type '{file_extension}'. Please use CSV or XLSX files.")
-            exit(1)
-        
-        # Verify file exists
-        full_file_path = os.path.join(filepath, filename) if filepath else filename
-        if not os.path.exists(full_file_path):
-            print(f"Error: File not found: {full_file_path}")
-            exit(1)
+    # Get filename
+    filename = input("Enter file name (e.g., abc.xlsx): ").strip()
+    
+    # Validate file extension
+    file_extension = filename.lower().split('.')[-1]
+    if file_extension not in ['csv', 'xlsx', 'xls']:
+        print(f"Error: Invalid file type '{file_extension}'. Please use CSV or XLSX files.")
+        exit(1)
+    
+    # Verify file exists
+    if not os.path.exists(filename):
+        print(f"Error: File '{filename}' not found in current directory: {os.getcwd()}")
+        exit(1)
     
     # Get output table name
-    output_tablename = input("\nEnter output table name: ").strip()
+    output_tablename = input("Enter output table name: ").strip()
     
     # Get password securely
-    password = getpass.getpass(f"\nEnter Password for DB User: ")
+    password = getpass.getpass("Enter DB password: ")
     
     # Database configuration
     DB_CONFIG = {
@@ -413,4 +334,4 @@ if __name__ == "__main__":
     }
     
     # Execute upload
-    upload_to_greenplum(filepath, filename, output_tablename, DB_CONFIG)
+    upload_to_greenplum(filename, output_tablename, DB_CONFIG)
