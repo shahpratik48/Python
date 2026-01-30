@@ -54,23 +54,6 @@ DB_CONFIG = {
 RULE_FILE_EXTS = {".yaml", ".yml", ".json"}
 RULE_TAG_PATTERN = re.compile(r"\{([^{}]+)\}")
 
-# Rule tags to parse
-RULE_TAGS = {
-    "rule_narrative",
-    "rule_narrative_title",
-    "rule_narrative_single",
-    "rule_narrative_footer",
-    "rule_narrative_item",
-    "disclaimer",
-}
-
-
-def extract_rule_tags_from_value(value: Any) -> Set[str]:
-    """Extract rule tag values like {account_name1} from text."""
-    if isinstance(value, str):
-        return set(RULE_TAG_PATTERN.findall(value))
-    return set()
-
 
 def parse_yaml_json_content(content: str, file_ext: str) -> Dict[str, Any]:
     """Parse YAML or JSON content."""
@@ -95,77 +78,45 @@ def extract_rules_recursive(
     records: List[Dict],
     parent_key: str = ""
 ):
-    """Recursively extract rule tags and values from nested structures."""
+    """Recursively extract all rule tags and values from nested structures."""
     if isinstance(data, dict):
         for key, value in data.items():
             current_key = f"{parent_key}.{key}" if parent_key else key
             
-            # Check if this key is a rule tag we're interested in
-            if key in RULE_TAGS:
-                # Extract rule tag values from the value
-                rule_tag_values = extract_rule_tags_from_value(value)
-                
-                # Convert value to string for storage
-                if isinstance(value, (list, dict)):
-                    rule_value = json.dumps(value) if isinstance(value, dict) else "\n".join(str(v) for v in value)
-                else:
-                    rule_value = str(value) if value is not None else ""
-                
-                # Create record for each rule_tag_value found
-                if rule_tag_values:
-                    for tag_value in rule_tag_values:
-                        records.append({
-                            "target_type": target_type,
-                            "insight_type": insight_type,
-                            "rule_tag": key,
-                            "rule_tag_value": tag_value,
-                            "rule_value": rule_value,
-                            "filepath": filepath,
-                            "filename": filename,
-                            "current_timestamp": current_timestamp,
-                        })
-                else:
-                    # No tag values found, but still record the rule tag
-                    records.append({
-                        "target_type": target_type,
-                        "insight_type": insight_type,
-                        "rule_tag": key,
-                        "rule_tag_value": "",
-                        "rule_value": rule_value,
-                        "filepath": filepath,
-                        "filename": filename,
-                        "current_timestamp": current_timestamp,
-                    })
+            # Extract all key-value pairs as potential rule tags
+            # Convert value to string for storage
+            if isinstance(value, list):
+                rule_value = "\n".join(str(v) for v in value)
+            elif isinstance(value, dict):
+                rule_value = json.dumps(value)
+            else:
+                rule_value = str(value) if value is not None else ""
             
-            # Also check if value contains any of our rule tags
-            if isinstance(value, str):
-                tag_values = extract_rule_tags_from_value(value)
-                if tag_values and key not in RULE_TAGS:
-                    # This is a key-value pair where key is a tag and value contains {tag_value}
-                    for tag_value in tag_values:
-                        records.append({
-                            "target_type": target_type,
-                            "insight_type": insight_type,
-                            "rule_tag": key,
-                            "rule_tag_value": tag_value,
-                            "rule_value": value,
-                            "filepath": filepath,
-                            "filename": filename,
-                            "current_timestamp": current_timestamp,
-                        })
+            # Record this rule tag
+            records.append({
+                "target_type": target_type,
+                "insight_type": insight_type,
+                "rule_tag": key,
+                "rule_value": rule_value,
+                "filepath": filepath,
+                "filename": filename,
+                "current_timestamp": current_timestamp,
+            })
             
             # Recurse into nested structures
-            extract_rules_recursive(
-                value, target_type, insight_type, filepath, filename,
-                current_timestamp, records, current_key
-            )
+            if isinstance(value, (dict, list)):
+                extract_rules_recursive(
+                    value, target_type, insight_type, filepath, filename,
+                    current_timestamp, records, current_key
+                )
     
     elif isinstance(data, list):
-        for item in data:
-            extract_rules_recursive(
-                item, target_type, insight_type, filepath, filename,
-                current_timestamp, records, parent_key
-            )
+        for idx, item in enumerate(data):
+            if isinstance(item, (dict, list)):
+                extract_rules_recursive(
+                    item, target_type, insight_type, filepath, filename,
+                    current_timestamp, records, f"{parent_key}[{idx}]"
+                )
 
 
 def get_gitlab_files(gl_project, branch: str, base_path: str) -> List[Dict]:
@@ -181,8 +132,7 @@ def get_gitlab_files(gl_project, branch: str, base_path: str) -> List[Dict]:
                 item_name = item['name']
                 
                 if item['type'] == 'tree':
-                    # This is a directory
-                    # Determine target_type from folder structure
+                    # This is a directory - recurse into it
                     if path == base_path:
                         # Direct subfolder of rules = target_type
                         new_target_type = item_name
@@ -289,7 +239,6 @@ def main():
         "target_type",
         "insight_type",
         "rule_tag",
-        "rule_tag_value",
         "rule_value",
         "filepath",
         "filename",
@@ -350,18 +299,17 @@ def main():
         print(f"  Dropping table {schema}.{table} if exists...")
         cursor.execute(f"DROP TABLE IF EXISTS {schema}.{table}")
         
-        # Create new table
+        # Create new table - Changed TIMESTAMP to TEXT to avoid syntax error
         print(f"  Creating table {schema}.{table}...")
         create_table_sql = f"""
         CREATE TABLE {schema}.{table} (
             target_type TEXT,
             insight_type TEXT,
             rule_tag TEXT,
-            rule_tag_value TEXT,
             rule_value TEXT,
             filepath TEXT,
             filename TEXT,
-            current_timestamp TIMESTAMP
+            current_timestamp TEXT
         ) DISTRIBUTED RANDOMLY
         """
         cursor.execute(create_table_sql)
@@ -371,9 +319,9 @@ def main():
         for _, row in df.iterrows():
             insert_sql = f"""
             INSERT INTO {schema}.{table} 
-            (target_type, insight_type, rule_tag, rule_tag_value, rule_value, 
+            (target_type, insight_type, rule_tag, rule_value, 
              filepath, filename, current_timestamp)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             """
             cursor.execute(insert_sql, tuple(row))
         
