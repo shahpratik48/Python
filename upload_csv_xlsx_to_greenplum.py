@@ -5,8 +5,15 @@ from psycopg2 import sql
 import getpass
 from datetime import datetime
 from io import StringIO
-import tkinter as tk
-from tkinter import filedialog
+
+# Try to import tkinter, but don't fail if not available
+try:
+    import tkinter as tk
+    from tkinter import filedialog
+    TKINTER_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    TKINTER_AVAILABLE = False
+    print("Note: tkinter not available. File browser will not be available.")
 
 
 def browse_file():
@@ -14,37 +21,47 @@ def browse_file():
     Open file dialog to browse and select CSV or XLSX file
     Returns filepath and filename
     """
-    root = tk.Tk()
-    root.withdraw()  # Hide the main window
-    root.attributes('-topmost', True)  # Bring dialog to front
+    if not TKINTER_AVAILABLE:
+        raise RuntimeError("tkinter is not available. Please use manual file path input.")
     
-    # Open file dialog with filter for CSV and XLSX files
-    file_path = filedialog.askopenfilename(
-        title="Select a CSV or XLSX file",
-        filetypes=[
-            ("CSV files", "*.csv"),
-            ("Excel files", "*.xlsx"),
-            ("Excel files (old)", "*.xls"),
-            ("All supported files", "*.csv *.xlsx *.xls"),
-            ("All files", "*.*")
-        ]
-    )
+    try:
+        root = tk.Tk()
+        root.withdraw()  # Hide the main window
+        root.attributes('-topmost', True)  # Bring dialog to front
+        
+        # Open file dialog with filter for CSV and XLSX files
+        file_path = filedialog.askopenfilename(
+            title="Select a CSV or XLSX file",
+            filetypes=[
+                ("CSV files", "*.csv"),
+                ("Excel files", "*.xlsx"),
+                ("Excel files (old)", "*.xls"),
+                ("All supported files", "*.csv *.xlsx *.xls"),
+                ("All files", "*.*")
+            ]
+        )
+        
+        root.destroy()
+        
+        if not file_path:
+            raise ValueError("No file selected")
+        
+        # Validate file extension
+        file_extension = file_path.lower().split('.')[-1]
+        if file_extension not in ['csv', 'xlsx', 'xls']:
+            raise ValueError(f"Invalid file type. Please select a CSV or XLSX file. Selected: {file_extension}")
+        
+        # Extract filepath and filename
+        filepath = os.path.dirname(file_path)
+        filename = os.path.basename(file_path)
+        
+        return filepath, filename
     
-    root.destroy()
-    
-    if not file_path:
-        raise ValueError("No file selected")
-    
-    # Validate file extension
-    file_extension = file_path.lower().split('.')[-1]
-    if file_extension not in ['csv', 'xlsx', 'xls']:
-        raise ValueError(f"Invalid file type. Please select a CSV or XLSX file. Selected: {file_extension}")
-    
-    # Extract filepath and filename
-    filepath = os.path.dirname(file_path)
-    filename = os.path.basename(file_path)
-    
-    return filepath, filename
+    except tk.TclError as e:
+        if "no display" in str(e).lower() or "couldn't connect" in str(e).lower():
+            raise RuntimeError("No display available. File browser requires a graphical environment. Please use manual file path input.")
+        else:
+            raise
 
 
 def get_db_connection(config):
@@ -331,28 +348,52 @@ if __name__ == "__main__":
     print("GREENPLUM FILE UPLOADER")
     print("="*60 + "\n")
     
-    # Ask user if they want to browse or enter manually
-    use_browser = input("Do you want to browse for file? (yes/no) [default: yes]: ").strip().lower()
+    # Check if file browser is available
+    if TKINTER_AVAILABLE:
+        use_browser = input("Do you want to browse for file? (yes/no) [default: no]: ").strip().lower()
+    else:
+        print("Note: File browser is not available in this environment.")
+        use_browser = 'no'
     
-    if use_browser in ['', 'yes', 'y']:
+    if use_browser in ['yes', 'y'] and TKINTER_AVAILABLE:
         print("\nOpening file browser...")
         try:
             filepath, filename = browse_file()
             print(f"\nSelected file: {filename}")
             print(f"File path: {filepath}")
+        except RuntimeError as e:
+            print(f"\n{e}")
+            print("Falling back to manual input...\n")
+            use_browser = 'no'
         except Exception as e:
             print(f"Error: {e}")
-            print("Exiting...")
-            exit(1)
-    else:
+            print("Falling back to manual input...\n")
+            use_browser = 'no'
+    
+    if use_browser not in ['yes', 'y'] or not TKINTER_AVAILABLE:
         # Manual input
-        filepath = input("Enter file path: ").strip()
-        filename = input("Enter file name (CSV or XLSX): ").strip()
+        filepath = input("Enter file path (or full path with filename): ").strip()
+        
+        # Check if user provided full path or just directory
+        if os.path.isfile(filepath):
+            # Full path provided
+            full_path = filepath
+            filepath = os.path.dirname(full_path)
+            filename = os.path.basename(full_path)
+        else:
+            # Directory provided, ask for filename
+            filename = input("Enter file name (CSV or XLSX): ").strip()
         
         # Validate file extension
         file_extension = filename.lower().split('.')[-1]
         if file_extension not in ['csv', 'xlsx', 'xls']:
             print(f"Error: Invalid file type '{file_extension}'. Please use CSV or XLSX files.")
+            exit(1)
+        
+        # Verify file exists
+        full_file_path = os.path.join(filepath, filename) if filepath else filename
+        if not os.path.exists(full_file_path):
+            print(f"Error: File not found: {full_file_path}")
             exit(1)
     
     # Get output table name
