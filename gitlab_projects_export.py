@@ -1,7 +1,7 @@
 import argparse
 import getpass
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
 import gitlab
 import pandas as pd
@@ -52,20 +52,24 @@ def extract_team_name(web_url: str) -> str:
     return ""
 
 
-def get_package_json_info(project: Any) -> tuple[str, str]:
+def get_package_json_info(project: Any) -> Tuple[str, str]:
     """
     Check if package.json exists in the project's default branch.
     Returns (package_json: 'Yes'/'No', int_ext: 'internal'/'external'/'-')
     """
+    ref = project.default_branch or "main"
     try:
-        file_obj = project.files.get(file_path="package.json", ref=project.default_branch or "main")
+        file_obj = project.files.get(file_path="package.json", ref=ref)
         content = file_obj.decode().decode("utf-8")
         has_uwr = "%UWR%" in content or "@uwr/" in content
-        return "Yes", "internal" if has_uwr else "external"
+        result = "internal" if has_uwr else "external"
+        logger.info("  [package.json] FOUND | %s | %s", project.path_with_namespace, result)
+        return "Yes", result
     except gitlab.exceptions.GitlabGetError:
+        logger.info("  [package.json] NOT FOUND | %s", project.path_with_namespace)
         return "No", "-"
     except Exception as e:
-        logger.warning("Could not check package.json for project %s: %s", project.id, e)
+        logger.warning("  [package.json] ERROR | %s | %s", project.path_with_namespace, e)
         return "No", "-"
 
 
@@ -108,14 +112,19 @@ def export_group_projects(
     group = client.groups.get(group_path)
     projects = group.projects.list(include_subgroups=True, all=True, per_page=per_page)
 
-    logger.info("Found %s project references", len(projects))
+    total = len(projects)
+    logger.info("Found %s project references — starting detail fetch", total)
 
     rows: List[Dict[str, Any]] = []
-    for proj_ref in projects:
-        project = client.projects.get(proj_ref.id)
-        rows.append(project_to_row(project))
+    for idx, proj_ref in enumerate(projects, start=1):
+        logger.info("[%d/%d] Processing: %s", idx, total, proj_ref.path_with_namespace)
+        try:
+            project = client.projects.get(proj_ref.id)
+            rows.append(project_to_row(project))
+        except Exception as e:
+            logger.error("[%d/%d] FAILED to fetch project %s: %s", idx, total, proj_ref.id, e)
 
-    logger.info("Resolved %s projects", len(rows))
+    logger.info("Resolved %s/%s projects successfully", len(rows), total)
     return rows
 
 
