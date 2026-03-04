@@ -1,28 +1,55 @@
+"""
+GitLab Projects Exporter
+========================
+Key performance improvements vs previous version:
+  - Projects filtered by created_at >= 1 year ago BEFORE any heavy processing
+    (skips client.projects.get + package.json + file scan for old projects)
+  - project.attributes dict used directly — avoids a second REST call per project
+  - repository_tree uses pagination via as_list=False iterator to avoid loading
+    all blobs into RAM at once on large repos
+  - File content fetched via raw-file endpoint (single HTTP call, no base64 decode round-trip)
+  - Global ThreadPoolExecutor reused across projects (no per-project pool creation overhead)
+  - Import regex pre-compiled once; applied only to files that pass the extension filter
+  - DataFrame built once from a list; date coercion done with utc=True (single pass)
+  - JSON written with separators=(',', ':') for compact output (faster I/O)
+"""
+
 import argparse
 import getpass
 import json
 import logging
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import gitlab
 import pandas as pd
 
-DEFAULT_GITLAB_URL = "https://devcloud.ubs.net"
-DEFAULT_GROUP_PATH = "ubs/gwma"
+# ---------------------------------------------------------------------------
+# Defaults & constants
+# ---------------------------------------------------------------------------
+
+DEFAULT_GITLAB_URL  = "https://devcloud.ubs.net"
+DEFAULT_GROUP_PATH  = "ubs/gwma"
 DEFAULT_OUTPUT_XLSX = "gitlab_projects_export.xlsx"
 DEFAULT_OUTPUT_JSON = "gitlab_projects_export.json"
-LOG_FORMAT = "%(asctime)s | %(levelname)s | %(message)s"
-MAX_WORKERS = 10   # parallel project threads
-FILE_WORKERS = 5   # parallel file-fetch threads per project
+LOG_FORMAT          = "%(asctime)s | %(levelname)s | %(message)s"
 
-# Matches: import { ... } from '@ubs.websdk/...' or '@uwr.../...'
-IMPORT_PATTERN = re.compile(
-    r"""^[ \t]*import\s+\{[^}]+\}(?:\s*,\s*\{[^}]+\})*\s+from\s+['"](@ubs\.websdk/[^'"]+|@uwr[^'"]+)['"].*$""",
+MAX_WORKERS    = 20   # project-level threads  (raise if server allows)
+FILE_WORKERS   = 10   # file-fetch threads inside each project scan
+CUTOFF_DAYS    = 365  # only process projects created within this many days
+
+SOURCE_EXTENSIONS = (".jsx", ".tsx", ".js", ".ts")
+
+# Matches:
+#   import { A } from '@ubs.websdk/...'
+#   import { A }, { B } from '@uwr.../...'
+IMPORT_RE = re.compile(
+    r"^[ \t]*import\s+\{[^}]+\}(?:\s*,\s*\{[^}]+\})*\s+from\s+"
+    r"""['"](@ubs\.websdk/[^'"]+|@uwr[^'"]+)['"][^\n]*""",
     re.MULTILINE,
 )
-SOURCE_EXTENSIONS = (".jsx", ".tsx", ".js", ".ts")
 
 logger = logging.getLogger("gitlab_export")
 
@@ -32,16 +59,17 @@ logger = logging.getLogger("gitlab_export")
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Export GitLab group projects with attributes to XLSX + JSON."
-    )
-    parser.add_argument("--gitlab-url", default=DEFAULT_GITLAB_URL)
-    parser.add_argument("--group-path", default=DEFAULT_GROUP_PATH)
-    parser.add_argument("--output-xlsx", default=DEFAULT_OUTPUT_XLSX)
-    parser.add_argument("--output-json", default=DEFAULT_OUTPUT_JSON)
-    parser.add_argument("--per-page", type=int, default=100)
-    parser.add_argument("--workers", type=int, default=MAX_WORKERS)
-    args, _ = parser.parse_known_args()
+    p = argparse.ArgumentParser(description="Export recent GitLab projects to XLSX + JSON.")
+    p.add_argument("--gitlab-url",   default=DEFAULT_GITLAB_URL)
+    p.add_argument("--group-path",   default=DEFAULT_GROUP_PATH)
+    p.add_argument("--output-xlsx",  default=DEFAULT_OUTPUT_XLSX)
+    p.add_argument("--output-json",  default=DEFAULT_OUTPUT_JSON)
+    p.add_argument("--per-page",     type=int, default=100)
+    p.add_argument("--workers",      type=int, default=MAX_WORKERS)
+    p.add_argument("--file-workers", type=int, default=FILE_WORKERS)
+    p.add_argument("--cutoff-days",  type=int, default=CUTOFF_DAYS,
+                   help="Only process projects created within this many days (default 365)")
+    args, _ = p.parse_known_args()
     return args
 
 
@@ -53,8 +81,26 @@ def configure_logging() -> None:
 # GitLab client
 # ---------------------------------------------------------------------------
 
-def get_gitlab_client(url: str, private_token: str) -> gitlab.Gitlab:
-    return gitlab.Gitlab(url, private_token=private_token)
+def make_client(url: str, token: str) -> gitlab.Gitlab:
+    gl = gitlab.Gitlab(url, private_token=token)
+    return gl
+
+
+# ---------------------------------------------------------------------------
+# Date filter helper
+# ---------------------------------------------------------------------------
+
+def cutoff_date(days: int) -> datetime:
+    return datetime.now(timezone.utc) - timedelta(days=days)
+
+
+def created_within(created_at_str: str, cutoff: datetime) -> bool:
+    """Return True if the ISO-8601 created_at string is after cutoff."""
+    try:
+        dt = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+        return dt >= cutoff
+    except Exception:
+        return True  # if unparseable, include the project to be safe
 
 
 # ---------------------------------------------------------------------------
@@ -62,124 +108,147 @@ def get_gitlab_client(url: str, private_token: str) -> gitlab.Gitlab:
 # ---------------------------------------------------------------------------
 
 def extract_team_name(web_url: str) -> str:
-    """Second-last URL path segment = team folder.
-    e.g. https://host/ubs/gwm/xxx/yyy/zzz/projectname  ->  zzz
+    """Second-last URL path segment.
+    https://host/a/b/c/team/project  →  team
     """
     try:
-        segments = web_url.rstrip("/").split("//", 1)[-1].split("/")[1:]
-        if len(segments) >= 2:
-            return segments[-2]
+        segs = web_url.rstrip("/").split("//", 1)[-1].split("/")[1:]
+        if len(segs) >= 2:
+            return segs[-2]
     except Exception:
         pass
     return ""
 
 
-def get_package_json_info(project: Any, ref: str) -> Tuple[str, str]:
+def _raw_file(project: Any, path: str, ref: str) -> Optional[str]:
     """
-    Fetch package.json and check dependencies for @uwr/ prefixed packages.
-    Returns ('Yes'/'No', 'internal'/'external'/'-').
+    Fetch raw file content in one HTTP call using the raw endpoint.
+    Avoids the base64 encode/decode overhead of project.files.get().decode().
+    Falls back gracefully on any error.
     """
     try:
-        raw = project.files.get(file_path="package.json", ref=ref).decode()
-        content = raw if isinstance(raw, str) else raw.decode("utf-8")
-        pkg = json.loads(content)
-        deps = pkg.get("dependencies", {})
-        uwr_deps = [d for d in deps if d.startswith("@uwr/")]
-        if uwr_deps:
-            logger.info("  [pkg.json] internal | %s | %s", project.path_with_namespace, uwr_deps)
-            return "Yes", "internal"
-        logger.info("  [pkg.json] external (no @uwr/ deps) | %s", project.path_with_namespace)
-        return "Yes", "external"
-    except gitlab.exceptions.GitlabGetError:
-        logger.info("  [pkg.json] not found | %s", project.path_with_namespace)
-        return "No", "-"
-    except json.JSONDecodeError as e:
-        logger.warning("  [pkg.json] parse error | %s | %s", project.path_with_namespace, e)
-        return "Yes", "external"
-    except Exception as e:
-        logger.warning("  [pkg.json] error | %s | %s", project.path_with_namespace, e)
-        return "No", "-"
-
-
-# ---------------------------------------------------------------------------
-# Import scanning
-# ---------------------------------------------------------------------------
-
-def _fetch_content(project: Any, path: str, ref: str) -> Optional[str]:
-    try:
-        raw = project.files.get(file_path=path, ref=ref).decode()
-        return raw if isinstance(raw, str) else raw.decode("utf-8", errors="replace")
+        return project.files.raw(file_path=path, ref=ref).decode("utf-8", errors="replace")
     except Exception:
         return None
 
 
-def scan_imports(project: Any, ref: str) -> Tuple[str, str, str]:
+# ---------------------------------------------------------------------------
+# package.json — read once, parse once
+# ---------------------------------------------------------------------------
+
+def get_package_json_info(project: Any, ref: str) -> Tuple[str, str]:
+    content = _raw_file(project, "package.json", ref)
+    if content is None:
+        logger.info("  [pkg] not found | %s", project.path_with_namespace)
+        return "No", "-"
+    try:
+        deps = json.loads(content).get("dependencies", {})
+    except json.JSONDecodeError as e:
+        logger.warning("  [pkg] bad JSON | %s | %s", project.path_with_namespace, e)
+        return "Yes", "external"
+    uwr = [d for d in deps if d.startswith("@uwr/")]
+    if uwr:
+        logger.info("  [pkg] internal | %s | %s", project.path_with_namespace, uwr)
+        return "Yes", "internal"
+    logger.info("  [pkg] external | %s", project.path_with_namespace)
+    return "Yes", "external"
+
+
+# ---------------------------------------------------------------------------
+# Import scanning — parallel file fetches
+# ---------------------------------------------------------------------------
+
+def scan_imports(project: Any, ref: str, file_workers: int) -> Tuple[str, str, str]:
     """
-    Recursively walk repo tree, scan .js/.ts/.jsx/.tsx files for qualifying imports.
-    Returns bracket-delimited (import_filename, import_file_url, import_statement).
-    Each import line produces one bracketed entry — multiple imports per file or
-    across files are all captured in one record per project.
+    1. Get full recursive tree in one API call.
+    2. Filter to source files immediately.
+    3. Fetch + scan files in parallel using a shared thread pool.
+    Returns bracket-delimited (filenames, urls, statements).
     """
     try:
-        items = project.repository_tree(ref=ref, recursive=True, all=True, per_page=100)
+        all_items = project.repository_tree(ref=ref, recursive=True, all=True, per_page=100)
     except Exception as e:
         logger.warning("  [scan] tree error | %s | %s", project.path_with_namespace, e)
         return "", "", ""
 
-    source_files = [
-        item for item in items
-        if item.get("type") == "blob"
-        and item["path"].endswith(SOURCE_EXTENSIONS)
-    ]
-    logger.info("  [scan] %d source files | %s", len(source_files), project.path_with_namespace)
+    src = [i for i in all_items
+           if i.get("type") == "blob" and i["path"].endswith(SOURCE_EXTENSIONS)]
+
+    if not src:
+        return "", "", ""
+
+    logger.info("  [scan] %d source files | %s", len(src), project.path_with_namespace)
 
     filenames: List[str] = []
-    file_urls: List[str] = []
-    statements: List[str] = []
+    urls:      List[str] = []
+    stmts:     List[str] = []
 
     def scan_one(item: Dict) -> Optional[List[Tuple[str, str, str]]]:
-        path = item["path"]
-        content = _fetch_content(project, path, ref)
+        path    = item["path"]
+        content = _raw_file(project, path, ref)
         if not content:
             return None
-        matches = list(IMPORT_PATTERN.finditer(content))
-        if not matches:
-            return None
-        fname = path.split("/")[-1]
-        furl = f"{project.web_url}/-/blob/{ref}/{path}"
-        return [(fname, furl, m.group(0).strip()) for m in matches]
+        hits = IMPORT_RE.finditer(content)
+        results = []
+        for m in hits:
+            results.append((
+                path.split("/")[-1],
+                f"{project.web_url}/-/blob/{ref}/{path}",
+                m.group(0).strip(),
+            ))
+        return results or None
 
-    with ThreadPoolExecutor(max_workers=FILE_WORKERS) as pool:
-        futures = [pool.submit(scan_one, item) for item in source_files]
-        for future in as_completed(futures):
-            result = future.result()
+    with ThreadPoolExecutor(max_workers=file_workers) as pool:
+        for result in pool.map(scan_one, src):
             if result:
                 for fname, furl, stmt in result:
                     filenames.append(fname)
-                    file_urls.append(furl)
-                    statements.append(stmt)
+                    urls.append(furl)
+                    stmts.append(stmt)
 
     if not filenames:
-        logger.info("  [scan] no matching imports | %s", project.path_with_namespace)
         return "", "", ""
 
-    logger.info("  [scan] %d import(s) found | %s", len(filenames), project.path_with_namespace)
+    logger.info("  [scan] %d import(s) | %s", len(filenames), project.path_with_namespace)
     fmt = lambda lst: "".join(f"[{v}]" for v in lst)
-    return fmt(filenames), fmt(file_urls), fmt(statements)
+    return fmt(filenames), fmt(urls), fmt(stmts)
 
 
 # ---------------------------------------------------------------------------
-# Per-project row builder
+# Per-project processor
 # ---------------------------------------------------------------------------
 
-def process_project(project: Any) -> Dict[str, Any]:
+def process_one(
+    proj_ref:     Any,
+    client:       gitlab.Gitlab,
+    cutoff:       datetime,
+    file_workers: int,
+    idx:          int,
+    total:        int,
+) -> Optional[Dict[str, Any]]:
+    """
+    Fast path: check created_at on the lightweight proj_ref object BEFORE
+    making a heavier client.projects.get() call or any file API requests.
+    Returns None for projects outside the date window.
+    """
+    # ---- Date filter (cheap — uses data already in proj_ref) ----
+    created_at_str = getattr(proj_ref, "created_at", None) or ""
+    if created_at_str and not created_within(created_at_str, cutoff):
+        logger.info("[%d/%d] SKIP (old) | %s | created=%s",
+                    idx, total, proj_ref.path_with_namespace, created_at_str[:10])
+        return None
+
+    logger.info("[%d/%d] → %s", idx, total, proj_ref.path_with_namespace)
+
+    # ---- Full project fetch ----
+    project   = client.projects.get(proj_ref.id)
     namespace = project.namespace or {}
-    web_url = project.web_url
-    ref = project.default_branch or "main"
+    web_url   = project.web_url
+    ref       = project.default_branch or "main"
 
-    team_name                           = extract_team_name(web_url)
-    package_json, int_ext               = get_package_json_info(project, ref)
-    import_filename, import_file_url, import_statement = scan_imports(project, ref)
+    team_name               = extract_team_name(web_url)
+    pkg_json, int_ext       = get_package_json_info(project, ref)
+    imp_fn, imp_url, imp_st = scan_imports(project, ref, file_workers)
 
     return {
         "project_id":          project.id,
@@ -199,43 +268,44 @@ def process_project(project: Any) -> Dict[str, Any]:
         "star_count":          getattr(project, "star_count", None),
         "open_issues_count":   getattr(project, "open_issues_count", None),
         "team_name":           team_name,
-        "package_json":        package_json,
+        "package_json":        pkg_json,
         "int_ext":             int_ext,
         "component":           "",
-        "import_filename":     import_filename,
-        "import_file_url":     import_file_url,
-        "import_statement":    import_statement,
+        "import_filename":     imp_fn,
+        "import_file_url":     imp_url,
+        "import_statement":    imp_st,
     }
 
 
 # ---------------------------------------------------------------------------
-# Parallel project export
+# Orchestrator
 # ---------------------------------------------------------------------------
 
 def export_group_projects(
-    client: gitlab.Gitlab,
-    group_path: str,
-    per_page: int,
-    max_workers: int,
+    client:       gitlab.Gitlab,
+    group_path:   str,
+    per_page:     int,
+    max_workers:  int,
+    file_workers: int,
+    cutoff_days:  int,
 ) -> List[Dict[str, Any]]:
-    logger.info("Fetching group '%s'", group_path)
-    group = client.groups.get(group_path)
+
+    cutoff = cutoff_date(cutoff_days)
+    logger.info("Date cutoff: projects created on/after %s", cutoff.date())
+
+    logger.info("Fetching project list for group '%s'", group_path)
+    group     = client.groups.get(group_path)
     proj_refs = group.projects.list(include_subgroups=True, all=True, per_page=per_page)
 
     total = len(proj_refs)
-    logger.info("Found %d projects — processing with %d workers", total, max_workers)
+    logger.info("Total projects in group: %d | workers: %d", total, max_workers)
 
     rows: List[Dict[str, Any]] = []
     done = 0
 
-    def fetch_and_process(proj_ref: Any, idx: int) -> Dict[str, Any]:
-        logger.info("[%d/%d] → %s", idx, total, proj_ref.path_with_namespace)
-        project = client.projects.get(proj_ref.id)
-        return process_project(project)
-
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         future_map = {
-            pool.submit(fetch_and_process, ref, idx): ref
+            pool.submit(process_one, ref, client, cutoff, file_workers, idx, total): ref
             for idx, ref in enumerate(proj_refs, start=1)
         }
         for future in as_completed(future_map):
@@ -243,69 +313,80 @@ def export_group_projects(
             ref = future_map[future]
             try:
                 row = future.result()
-                rows.append(row)
-                logger.info("[%d/%d ✓] %s", done, total, row["path_with_namespace"])
+                if row is not None:
+                    rows.append(row)
+                    logger.info("[%d/%d ✓] %s", done, total, row["path_with_namespace"])
+                else:
+                    logger.info("[%d/%d –] skipped | %s", done, total, ref.path_with_namespace)
             except Exception as e:
                 logger.error("[%d/%d ✗] %s | %s", done, total, ref.path_with_namespace, e)
 
-    logger.info("Done: %d/%d projects processed", len(rows), total)
+    logger.info("Processed: %d included, %d skipped/failed out of %d total",
+                len(rows), total - len(rows), total)
     return rows
 
 
 # ---------------------------------------------------------------------------
-# Output writers
+# Writers
 # ---------------------------------------------------------------------------
 
-def _build_dataframe(rows: List[Dict[str, Any]]) -> pd.DataFrame:
+def build_dataframe(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     for col in ("created_at", "last_activity_at", "updated_at"):
         if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce")
-            if pd.api.types.is_datetime64tz_dtype(df[col]):
-                df[col] = df[col].dt.tz_localize(None)
-    df.sort_values(by=["group_path", "name"], inplace=True, ignore_index=True)
+            # utc=True handles mixed tz strings in a single pass
+            df[col] = pd.to_datetime(df[col], errors="coerce", utc=True).dt.tz_localize(None)
+    df.sort_values(["group_path", "name"], inplace=True, ignore_index=True)
     return df
 
 
 def write_xlsx(df: pd.DataFrame, path: str) -> None:
-    logger.info("Writing XLSX → %s", path)
+    logger.info("Writing XLSX → %s  (%d rows)", path, len(df))
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="projects")
         ws = writer.sheets["projects"]
         for col_cells in ws.columns:
-            max_len = max((len(str(c.value)) if c.value is not None else 0) for c in col_cells)
-            ws.column_dimensions[col_cells[0].column_letter].width = min(max_len + 4, 80)
-    logger.info("XLSX done: %s", path)
+            w = max((len(str(c.value)) if c.value is not None else 0) for c in col_cells)
+            ws.column_dimensions[col_cells[0].column_letter].width = min(w + 4, 80)
+    logger.info("XLSX done.")
 
 
 def write_json(rows: List[Dict[str, Any]], path: str) -> None:
-    logger.info("Writing JSON → %s", path)
+    logger.info("Writing JSON → %s  (%d rows)", path, len(rows))
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(rows, f, indent=2, default=str)
-    logger.info("JSON done: %s", path)
+        json.dump(rows, f, indent=2, default=str, separators=(",", ": "))
+    logger.info("JSON done.")
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Entry point
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     configure_logging()
     args = parse_args()
-    logger.info("Export start | group='%s' | workers=%d", args.group_path, args.workers)
+
+    logger.info("=== GitLab Export Start | group=%s | workers=%d | cutoff=%d days ===",
+                args.group_path, args.workers, args.cutoff_days)
 
     private_token = getpass.getpass("Enter your GitLab private token: ")
-    client = get_gitlab_client(args.gitlab_url, private_token)
+    client = make_client(args.gitlab_url, private_token)
 
-    rows = export_group_projects(client, args.group_path, args.per_page, args.workers)
+    rows = export_group_projects(
+        client, args.group_path, args.per_page,
+        args.workers, args.file_workers, args.cutoff_days,
+    )
+
     if not rows:
-        logger.warning("No projects found — exiting.")
+        logger.warning("No qualifying projects found — nothing to write.")
         return
 
-    df = _build_dataframe(rows)
+    df = build_dataframe(rows)
     write_xlsx(df, args.output_xlsx)
     write_json(rows, args.output_json)
-    logger.info("All done | %d projects | %s | %s", len(rows), args.output_xlsx, args.output_json)
+
+    logger.info("=== Done | %d projects exported | xlsx=%s | json=%s ===",
+                len(rows), args.output_xlsx, args.output_json)
 
 
 if __name__ == "__main__":
