@@ -55,16 +55,32 @@ def extract_team_name(web_url: str) -> str:
 def get_package_json_info(project: Any) -> Tuple[str, str]:
     """
     Check if package.json exists in the project's default branch.
+    Looks at the 'dependencies' object — if any key starts with '@uwr/', int_ext = internal, else external.
     Returns (package_json: 'Yes'/'No', int_ext: 'internal'/'external'/'-')
     """
+    import json
+
     ref = project.default_branch or "main"
     try:
         file_obj = project.files.get(file_path="package.json", ref=ref)
         content = file_obj.decode().decode("utf-8")
-        has_uwr = "%UWR%" in content or "@uwr/" in content
-        result = "internal" if has_uwr else "external"
-        logger.info("  [package.json] FOUND | %s | %s", project.path_with_namespace, result)
-        return "Yes", result
+
+        try:
+            pkg = json.loads(content)
+        except json.JSONDecodeError as je:
+            logger.warning("  [package.json] JSON PARSE ERROR | %s | %s", project.path_with_namespace, je)
+            return "Yes", "external"
+
+        dependencies = pkg.get("dependencies", {})
+        uwr_deps = [dep for dep in dependencies if dep.startswith("@uwr/")]
+
+        if uwr_deps:
+            logger.info("  [package.json] FOUND | %s | internal | @uwr/ deps: %s", project.path_with_namespace, uwr_deps)
+            return "Yes", "internal"
+        else:
+            logger.info("  [package.json] FOUND | %s | external | no @uwr/ deps found", project.path_with_namespace)
+            return "Yes", "external"
+
     except gitlab.exceptions.GitlabGetError:
         logger.info("  [package.json] NOT FOUND | %s", project.path_with_namespace)
         return "No", "-"
