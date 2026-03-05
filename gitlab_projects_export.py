@@ -215,6 +215,26 @@ def scan_imports(project: Any, ref: str, file_workers: int) -> Tuple[str, str, s
 
 
 # ---------------------------------------------------------------------------
+# Library label
+# ---------------------------------------------------------------------------
+
+def derive_library(import_statements: str) -> str:
+    """
+    Inspect collected import_statement string for known library prefixes.
+    Returns deduplicated ordered label: 'uwr', 'websdk', or 'uwr, websdk'.
+    Empty string when no imports were found.
+    """
+    if not import_statements:
+        return ""
+    found = []
+    if "@uwr/" in import_statements:
+        found.append("uwr")
+    if "@ubs.websdk/" in import_statements:
+        found.append("websdk")
+    return ", ".join(found)
+
+
+# ---------------------------------------------------------------------------
 # Per-project processor
 # ---------------------------------------------------------------------------
 
@@ -246,9 +266,16 @@ def process_one(
     web_url   = project.web_url
     ref       = project.default_branch or "main"
 
-    team_name               = extract_team_name(web_url)
-    pkg_json, int_ext       = get_package_json_info(project, ref)
+    team_name         = extract_team_name(web_url)
+    pkg_json, int_ext = get_package_json_info(project, ref)
+
+    # ---- Filter: skip projects with no package.json ----
+    if pkg_json == "No":
+        logger.info("[%d/%d] SKIP (no package.json) | %s", idx, total, project.path_with_namespace)
+        return None
+
     imp_fn, imp_url, imp_st = scan_imports(project, ref, file_workers)
+    library = derive_library(imp_st)
 
     return {
         "project_id":          project.id,
@@ -271,6 +298,7 @@ def process_one(
         "package_json":        pkg_json,
         "int_ext":             int_ext,
         "component":           "",
+        "library":             library,
         "import_filename":     imp_fn,
         "import_file_url":     imp_url,
         "import_statement":    imp_st,
