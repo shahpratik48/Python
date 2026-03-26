@@ -454,7 +454,7 @@ def db_setup_table(conn) -> None:
     )
     ddl_owner  = (
         f'ALTER TABLE {_FQTABLE} '
-        f'OWNER TO erd_gpdbprj_smart_insights;'
+        f'OWNER TO erd_gpdb_prj_smart_insights;'
     )
     ddl_grant  = (
         f'GRANT SELECT ON {_FQTABLE} '
@@ -474,54 +474,115 @@ def db_setup_table(conn) -> None:
     logger.info('DB | table ready: %s', _FQTABLE)
 
 
+def _coerce_val(val: Any) -> Any:
+    """Normalise a single value so psycopg2 can safely bind it."""
+    if val is None:
+        return None
+    if isinstance(val, float) and val != val:        # NaN -> NULL
+        return None
+    if isinstance(val, str) and val.strip() == '':
+        return None
+    # archived arrives as Python bool or the string 'false'/'true' from proj_ref
+    if isinstance(val, str) and val.lower() in ('true', 'false'):
+        return val.lower() == 'true'
+    return val
+
+
 def _coerce_row(row: Dict[str, Any]) -> tuple:
     """Convert a row dict to a tuple in _COL_NAMES order, safe for psycopg2."""
-    def _v(val):
-        if val is None or val == '':
-            return None
-        if isinstance(val, float) and (val != val):   # NaN check
-            return None
-        return val
-    return tuple(_v(row.get(col)) for col in _COL_NAMES)
+    return tuple(_coerce_val(row.get(col)) for col in _COL_NAMES)
 
 
 def db_insert_rows(conn, rows: List[Dict[str, Any]]) -> None:
-    """Batch-insert rows into the table using execute_values."""
+    """
+    Batch-insert rows using execute_values.
+    template= specifies the per-row shape; %s in the SQL is the VALUES placeholder.
+    """
     if not rows:
         logger.warning('DB | no rows to insert')
         return
 
-    placeholders = ','.join(['%s'] * len(_COL_NAMES))
-    sql = (
-        f'INSERT INTO {_FQTABLE} ({", ".join(_COL_NAMES)}) '
-        f'VALUES %s'
-    )
-    tuples = [_coerce_row(r) for r in rows]
-    total  = len(tuples)
+    col_list         = ', '.join(_COL_NAMES)
+    col_placeholders = '(' + ', '.join(['%s'] * len(_COL_NAMES)) + ')'
+    sql              = f'INSERT INTO {_FQTABLE} ({col_list}) VALUES %s'
+
+    tuples   = [_coerce_row(r) for r in rows]
+    total    = len(tuples)
     inserted = 0
 
     with conn.cursor() as cur:
         for start in range(0, total, DB_BATCH_SIZE):
-            batch = tuples[start:start + DB_BATCH_SIZE]
-            psycopg2.extras.execute_values(cur, sql, batch)
+            batch = tuples[start : start + DB_BATCH_SIZE]
+            psycopg2.extras.execute_values(cur, sql, batch, template=col_placeholders)
             inserted += len(batch)
             logger.info('DB | inserted %d / %d rows', inserted, total)
     conn.commit()
-    logger.info('DB | ✅ all %d rows committed to %s', total, _FQTABLE)
+    logger.info('DB | ✅ %d rows committed to %s', total, _FQTABLE)
 
 
-def db_write(rows: List[Dict[str, Any]]) -> None:
-    """Full DB write: connect → setup table → insert rows → close."""
+def db_update_imports(conn, rows: List[Dict[str, Any]]) -> None:
+    """
+    Replace the Phase-1 summary rows for each project with enriched Phase-2 rows.
+    Strategy: DELETE existing rows for these project_ids, then INSERT new rows.
+    This is simpler and more reliable than UPDATE on Greenplum.
+    """
+    if not rows:
+        logger.warning('DB | no import rows to update')
+        return
+
+    project_ids = list({_coerce_val(r.get('project_id')) for r in rows
+                        if r.get('project_id') is not None})
+    logger.info('DB | replacing rows for %d project(s) with import data …', len(project_ids))
+
+    col_list         = ', '.join(_COL_NAMES)
+    col_placeholders = '(' + ', '.join(['%s'] * len(_COL_NAMES)) + ')'
+    sql_delete       = f'DELETE FROM {_FQTABLE} WHERE project_id = ANY(%s)'
+    sql_insert       = f'INSERT INTO {_FQTABLE} ({col_list}) VALUES %s'
+
+    tuples   = [_coerce_row(r) for r in rows]
+    total    = len(tuples)
+    inserted = 0
+
+    with conn.cursor() as cur:
+        cur.execute(sql_delete, (project_ids,))
+        logger.info('DB | deleted %d Phase-1 summary row(s) for these projects', cur.rowcount)
+
+        for start in range(0, total, DB_BATCH_SIZE):
+            batch = tuples[start : start + DB_BATCH_SIZE]
+            psycopg2.extras.execute_values(cur, sql_insert, batch, template=col_placeholders)
+            inserted += len(batch)
+            logger.info('DB | inserted %d / %d enriched rows', inserted, total)
+
+    conn.commit()
+    logger.info('DB | ✅ %d import rows committed to %s', total, _FQTABLE)
+
+
+def db_write_phase1(rows: List[Dict[str, Any]]) -> None:
+    """Connect → DROP/CREATE table → insert Phase-1 rows → close."""
     logger.info('DB | connecting to %s …', DB_CONFIG['host'])
-    try:
-        conn = _get_conn()
-    except Exception as exc:
-        logger.error('DB | connection FAILED: %s', exc)
-        raise
-
+    conn = _get_conn()
     try:
         db_setup_table(conn)
         db_insert_rows(conn, rows)
+    except Exception as exc:
+        logger.error('DB | Phase-1 write FAILED: %s', exc)
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+        logger.info('DB | connection closed')
+
+
+def db_write_phase2(rows: List[Dict[str, Any]]) -> None:
+    """Connect → replace Phase-1 summary rows with enriched Phase-2 rows → close."""
+    logger.info('DB | connecting to %s …', DB_CONFIG['host'])
+    conn = _get_conn()
+    try:
+        db_update_imports(conn, rows)
+    except Exception as exc:
+        logger.error('DB | Phase-2 write FAILED: %s', exc)
+        conn.rollback()
+        raise
     finally:
         conn.close()
         logger.info('DB | connection closed')
@@ -652,16 +713,17 @@ _proceed = input(
     f'  Proceed to import-statement scan for {run_stats["has_package_json"]} projects? (yes/no): '
 ).strip().lower()
 
+# ── Always write Phase-1 rows to DB first ────────────────────────────────────
+logger.info('USER | writing Phase-1 project rows to Greenplum before asking about Phase 2 …')
+p1_rows = [phase1_to_row(p) for p in phase1_results]
+db_write_phase1(p1_rows)
+print(f'\n✅  {len(p1_rows)} project rows written to {_FQTABLE}')
+
 if _proceed not in ('yes', 'y'):
-    # Write Phase-1 summary rows to Greenplum and exit
-    logger.info('USER | chose to stop — writing Phase-1 summary to Greenplum …')
-    p1_rows = [phase1_to_row(p) for p in phase1_results]
-    db_write(p1_rows)
-    print(f'\n✅  Phase-1 data written to {_FQTABLE}  ({len(p1_rows)} rows)')
-    logger.info('USER | exiting after Phase 1')
+    logger.info('USER | chose to stop after Phase 1 — done.')
     sys.exit(0)
 
-logger.info('USER | proceeding to Phase 2')
+logger.info('USER | proceeding to Phase 2 (import scan) …')
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -758,11 +820,11 @@ for label, value in summary_lines:
 
 # ── Write to Greenplum ────────────────────────────────────────────────────────
 if not all_rows:
-    logger.warning('DB | no rows to write — skipping')
-    print('\n⚠️  No rows collected — Greenplum table not written.')
+    logger.warning('DB | no import rows collected')
+    print('\n⚠️  No import rows collected — Phase-1 data remains in table.')
 else:
-    db_write(all_rows)
-    print(f'\n✅  {len(all_rows)} rows written to {_FQTABLE}')
+    db_write_phase2(all_rows)
+    print(f'\n✅  {len(all_rows)} enriched rows written to {_FQTABLE}')
 
 logger.info('=' * 70)
 logger.info('GitLab Projects Export  v5  — complete (%.1fs total)', t_elapsed)
