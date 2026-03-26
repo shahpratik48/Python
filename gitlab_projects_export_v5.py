@@ -175,17 +175,18 @@ _gitlab_sem = threading.Semaphore(MAX_CONNECTIONS)
 logger.info('AUTH | requesting GitLab private token ...')
 private_token = getpass.getpass('Enter your GitLab private token: ')
 
-_session = requests.Session()
-_adapter = HTTPAdapter(max_retries=1,
-                       pool_connections=MAX_CONNECTIONS,
-                       pool_maxsize=MAX_CONNECTIONS)
+class _TimeoutSession(requests.Session):
+    """requests.Session that injects a default timeout on every request."""
+    def request(self, method, url, **kwargs):
+        kwargs.setdefault('timeout', GITLAB_TIMEOUT)
+        return super().request(method, url, **kwargs)
+
+_session = _TimeoutSession()
+_adapter  = HTTPAdapter(max_retries=1,
+                        pool_connections=MAX_CONNECTIONS,
+                        pool_maxsize=MAX_CONNECTIONS)
 _session.mount('https://', _adapter)
 _session.mount('http://',  _adapter)
-_orig_req = _session.request
-def _timed_request(method, url, **kwargs):
-    kwargs.setdefault('timeout', GITLAB_TIMEOUT)
-    return _orig_req(method, url, **kwargs)
-_session.request = _timed_request
 
 client = gitlab.Gitlab(GITLAB_URL, private_token=private_token, session=_session)
 logger.info('AUTH | GitLab client ready')
