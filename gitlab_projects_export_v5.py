@@ -152,15 +152,21 @@ DEPS_COL_NAMES     = [c[0] for c in DEPS_COLS]
 IMPORTS_COL_NAMES  = [c[0] for c in IMPORTS_COLS]
 
 # ── Import regex — every ES-module import form ────────────────────────────────
+# Uses [^\S\n] (horizontal whitespace only) so the pattern never crosses a
+# newline boundary — each import line is always its own match.
+# File content is also normalised to \n before matching (see _raw_file).
 ANY_IMPORT_RE = re.compile(
-    r"^[ \t]*import"
-    r"(?:\s+(?:"
-        r"[\w\$_][\w\$_]*(?:\s*,\s*(?:\*\s+as\s+[\w\$_]+|\{[^}]*\}))?"
-        r"|\*\s+as\s+[\w\$_][\w\$_]*"
-        r"|\{[^}]*\}"
-    r")\s+from)?"
-    r"\s*['\"]([^'\"]+)['\"]"
-    r"\s*;?[^\n]*",
+    r"^[^\S\n]*import"                                 # leading horiz. space only
+    r"(?:[^\S\n]+(?:"
+        r"[\w\$_][\w\$_]*"                           # default export name
+        r"(?:[^\S\n]*,[^\S\n]*"                      # optional comma
+          r"(?:\*[^\S\n]+as[^\S\n]+[\w\$_]+|\{[^\}\n]*\})"  # * as Ns OR {Named}
+        r")?"
+        r"|[^\S\n]*\*[^\S\n]+as[^\S\n]+[\w\$_]+"  # * as Namespace
+        r"|\{[^\}\n]*\}"                              # { Named } — no newline inside
+    r")[^\S\n]+from)?"
+    r"[^\S\n]*['\"]([^'\"]+)['\"]"                  # module specifier
+    r"[^\S\n]*;?[^\n]*",                               # optional semicolon + rest of line
     re.MULTILINE,
 )
 
@@ -254,9 +260,16 @@ def extract_team_name(web_url: str) -> str:
 
 
 def _raw_file(project: Any, path: str, ref: str) -> Optional[str]:
+    """Fetch file as UTF-8 text.
+    Normalises \\r\\n and bare \\r to \\n so the import regex never merges
+    two lines into one match (Windows files fetched via GitLab API often
+    contain \\r\\n line endings that survive the UTF-8 decode).
+    """
     with _gitlab_sem:
         try:
-            return project.files.raw(file_path=path, ref=ref).decode('utf-8', errors='replace')
+            raw = project.files.raw(file_path=path, ref=ref).decode('utf-8', errors='replace')
+            # Normalise all line-ending variants to plain \n
+            return raw.replace('\r\n', '\n').replace('\r', '\n')
         except Exception as exc:
             logger.debug('FILE | err | %s | %s', path, exc)
             return None
