@@ -6,7 +6,16 @@
 #   gwma_ui_dependencies   (Phase 2)  One row per dependency per project
 #   gwma_ui_imports        (Phase 2)  One row per import statement per file per project
 #
-# FLOW
+# SAMPLING FLAG
+# ─────────────
+#   SAMPLE_MODE = False  →  Full run against all three main tables (default)
+#   SAMPLE_MODE = True   →  Asks for a single project_id, runs all phases for that
+#                            project only, and writes to *_sample tables:
+#                              gwma_ui_projects_sample
+#                              gwma_ui_dependencies_sample
+#                              gwma_ui_imports_sample
+#
+# FLOW  (SAMPLE_MODE = False)
 # ────
 #   [A] Ask: run Phase 1? (yes = scan GitLab + recreate projects table)
 #            (no  = skip, assume table already populated, go straight to Phase 2 prompt)
@@ -17,7 +26,7 @@
 #            (no  = exit)
 #   [D] If yes → load project list from gwma_ui_projects, process each project:
 #         • parse package.json  → insert rows into gwma_ui_dependencies
-#         • scan .js/.ts/.jsx/.tsx files → insert rows into gwma_ui_imports
+#         • scan ALL files in repo → insert rows into gwma_ui_imports
 #
 # gwma_ui_projects columns
 #   project_id, name, path, path_with_namespace, group_path, web_url, description,
@@ -25,8 +34,8 @@
 #   forks_count, star_count, open_issues_count, team_name, package_json
 #
 # gwma_ui_dependencies columns
-#   project_id, name, path, dependency
-#   (dependency = one package name per row; join to projects on project_id)
+#   project_id, name, path, tag, dependency, version
+#   tag = 'dependencies' or 'devDependencies'; one row per package; join on project_id
 #
 # gwma_ui_imports columns
 #   project_id, name, path, import_filename, import_file_url, import_statement
@@ -75,8 +84,8 @@ GITLAB_TIMEOUT  = (10, 30)    # (connect_s, read_s) per request
 FUTURE_TIMEOUT  = 120         # seconds before abandoning a stuck future
 PROGRESS_EVERY  = 5
 
-UPDATED_SINCE     = datetime(2025, 1, 1, tzinfo=timezone.utc)
-SOURCE_EXTENSIONS = ('.jsx', '.tsx', '.js', '.ts')
+UPDATED_SINCE = datetime(2025, 1, 1, tzinfo=timezone.utc)
+# All blob files are scanned for import statements — no extension filter.
 
 # Greenplum
 DB_SCHEMA = 'sandbox_prj_smart_insights'
@@ -84,10 +93,18 @@ DB_OWNER  = 'erd_gpdb_prj_smart_insights'
 DB_GRANT  = 'erd_gpdb_prj_smart_insights_ro'
 DB_BATCH  = 200
 
-# Table names
-TBL_PROJECTS = f'{DB_SCHEMA}.gwma_ui_projects'
-TBL_DEPS     = f'{DB_SCHEMA}.gwma_ui_dependencies'
-TBL_IMPORTS  = f'{DB_SCHEMA}.gwma_ui_imports'
+# ── Sampling flag ────────────────────────────────────────────────────────────
+# Set SAMPLE_MODE = True to test a single project_id before running the full export.
+# When True the script skips the full GitLab scan, asks for one project_id, runs
+# all three phases for that project only, and writes to *_sample tables.
+# Set SAMPLE_MODE = False for a normal full run against all three main tables.
+SAMPLE_MODE = False
+
+# Base table names (suffix '_sample' is appended automatically when SAMPLE_MODE=True)
+_TBL_SUFFIX  = '_sample' if SAMPLE_MODE else ''
+TBL_PROJECTS = f'{DB_SCHEMA}.gwma_ui_projects{_TBL_SUFFIX}'
+TBL_DEPS     = f'{DB_SCHEMA}.gwma_ui_dependencies{_TBL_SUFFIX}'
+TBL_IMPORTS  = f'{DB_SCHEMA}.gwma_ui_imports{_TBL_SUFFIX}'
 
 # ── Column definitions ────────────────────────────────────────────────────────
 
@@ -116,7 +133,9 @@ DEPS_COLS: List[Tuple[str, str]] = [
     ('project_id',  'BIGINT'),
     ('name',        'TEXT'),
     ('path',        'TEXT'),
-    ('dependency',  'TEXT'),   # one row per package name
+    ('tag',         'TEXT'),   # 'dependencies' or 'devDependencies'
+    ('dependency',  'TEXT'),   # package name, e.g. "react"
+    ('version',     'TEXT'),   # version string, e.g. "^18.0.0"
 ]
 
 IMPORTS_COLS: List[Tuple[str, str]] = [
@@ -472,17 +491,25 @@ def scan_project(row: Dict[str, Any]) -> Tuple[List[Dict], List[Dict]]:
     import_base = {'project_id': project_id, 'name': name, 'path': path}
 
     # ── Parse package.json for dependencies ──────────────────────────────────
+    # Each tag section (dependencies, devDependencies) produces separate rows.
+    # Row format: {project_id, name, path, tag, dependency, version}
     dep_rows: List[Dict] = []
     pkg_content = _raw_file(project, 'package.json', ref)
     if pkg_content:
         try:
             pkg_json = json.loads(pkg_content)
-            # Collect both "dependencies" and "devDependencies" if present
-            all_deps: Dict[str, str] = {}
-            all_deps.update(pkg_json.get('dependencies', {}))
-            all_deps.update(pkg_json.get('devDependencies', {}))
-            for dep_name in sorted(all_deps.keys()):
-                dep_rows.append({**dep_base, 'dependency': dep_name})
+            # Process each tag section independently to preserve tag label
+            for tag in ('dependencies', 'devDependencies'):
+                section: Dict[str, str] = pkg_json.get(tag, {})
+                if not isinstance(section, dict):
+                    continue
+                for dep_name in sorted(section.keys()):
+                    dep_rows.append({
+                        **dep_base,
+                        'tag'       : tag,
+                        'dependency': dep_name,
+                        'version'   : section[dep_name],
+                    })
             logger.info('P2 | deps=%d | %s', len(dep_rows), ns)
         except json.JSONDecodeError as exc:
             logger.warning('P2 | bad package.json | %s | %s', ns, exc)
@@ -491,11 +518,10 @@ def scan_project(row: Dict[str, Any]) -> Tuple[List[Dict], List[Dict]]:
 
     _inc('dep_rows_total', len(dep_rows))
 
-    # ── Walk tree and scan source files ───────────────────────────────────────
+    # ── Walk tree and scan ALL blob files for import statements ─────────────
     all_items = _repo_tree_pages(project, ref)
-    src_items = [i for i in all_items
-                 if i.get('type') == 'blob' and i['path'].endswith(SOURCE_EXTENSIONS)]
-    logger.info('P2 | tree=%d  src=%d | %s', len(all_items), len(src_items), ns)
+    src_items = [i for i in all_items if i.get('type') == 'blob']
+    logger.info('P2 | tree=%d  blobs=%d | %s', len(all_items), len(src_items), ns)
 
     import_rows: List[Dict] = []
     local_fetched = local_empty = local_error = local_stmts = 0
@@ -553,7 +579,129 @@ if not db_test_connection():
 t_total = time.perf_counter()
 
 # =============================================================================
-#  PHASE 1 GATE
+#  SAMPLE MODE — single-project test run
+# =============================================================================
+if SAMPLE_MODE:
+    print()
+    print('=' * 70)
+    print('  SAMPLE MODE — single project test')
+    print(f'  Tables: {TBL_PROJECTS}')
+    print(f'          {TBL_DEPS}')
+    print(f'          {TBL_IMPORTS}')
+    print('=' * 70)
+
+    # Ask for the project_id to test
+    while True:
+        _pid_str = input('
+  Enter project_id to sample: ').strip()
+        try:
+            SAMPLE_PROJECT_ID = int(_pid_str)
+            break
+        except ValueError:
+            print('  Please enter a numeric project_id.')
+
+    logger.info('SAMPLE | fetching project %d ...', SAMPLE_PROJECT_ID)
+    with _gitlab_sem:
+        try:
+            _sample_project = client.projects.get(SAMPLE_PROJECT_ID)
+        except Exception as _exc:
+            print(f'
+  ERROR: Could not fetch project {SAMPLE_PROJECT_ID}: {_exc}')
+            sys.exit(1)
+
+    logger.info('SAMPLE | found: %s', _sample_project.path_with_namespace)
+
+    # Build the single Phase-1 row (same shape as fetch_project_with_pkg returns)
+    _ref     = _sample_project.default_branch or 'main'
+    _ns_d    = _sample_project.namespace or {}
+    _s_p1row = {
+        '_project': _sample_project,
+        '_ref'    : _ref,
+        'project_id'         : int(_sample_project.id),
+        'name'               : _sample_project.name,
+        'path'               : _sample_project.path,
+        'path_with_namespace': _sample_project.path_with_namespace,
+        'group_path'         : _ns_d.get('full_path'),
+        'web_url'            : _sample_project.web_url,
+        'description'        : _sample_project.description,
+        'visibility'         : _sample_project.visibility,
+        'archived'           : bool(_sample_project.archived),
+        'created_at'         : _sample_project.created_at,
+        'last_activity_at'   : _sample_project.last_activity_at,
+        'updated_at'         : _sample_project.updated_at,
+        'default_branch'     : _ref,
+        'forks_count'        : int(_sample_project.forks_count)       if _sample_project.forks_count       is not None else None,
+        'star_count'         : int(_sample_project.star_count)        if _sample_project.star_count        is not None else None,
+        'open_issues_count'  : int(_sample_project.open_issues_count) if _sample_project.open_issues_count is not None else None,
+        'team_name'          : extract_team_name(_sample_project.web_url),
+        'package_json'       : 'Yes',
+    }
+
+    # Confirm package.json exists
+    with _gitlab_sem:
+        try:
+            _sample_project.files.raw(file_path='package.json', ref=_ref)
+            logger.info('SAMPLE | package.json found')
+        except Exception:
+            logger.warning('SAMPLE | package.json NOT found on branch %s', _ref)
+            print(f'  WARNING: No package.json found on branch {_ref}. '
+                  f'Dependency table will be empty.')
+
+    print(f'
+  Project  : {_sample_project.path_with_namespace}')
+    print(f'  Branch   : {_ref}')
+    print(f'  web_url  : {_sample_project.web_url}')
+
+    # ── Write sample project row ──────────────────────────────────────────────
+    print(f'
+  Writing project row to {TBL_PROJECTS} ...')
+    conn = _get_conn()
+    _create_table(conn, TBL_PROJECTS, PROJECTS_COLS, 'project_id')
+    _bulk_insert(conn, TBL_PROJECTS, PROJECTS_COL_NAMES, [_s_p1row])
+    conn.close()
+    print(f'  OK  1 row in {TBL_PROJECTS}')
+
+    # ── Scan deps + imports for the single project ────────────────────────────
+    print(f'
+  Scanning project for dependencies and imports ...')
+    _s_dep_rows, _s_import_rows = scan_project(_s_p1row)
+
+    # ── Write deps ────────────────────────────────────────────────────────────
+    print(f'
+  Writing {len(_s_dep_rows)} dependency rows to {TBL_DEPS} ...')
+    conn = _get_conn()
+    _create_table(conn, TBL_DEPS, DEPS_COLS, 'project_id')
+    _bulk_insert(conn, TBL_DEPS, DEPS_COL_NAMES, _s_dep_rows)
+    conn.close()
+    print(f'  OK  {len(_s_dep_rows)} rows in {TBL_DEPS}')
+
+    # ── Write imports ─────────────────────────────────────────────────────────
+    print(f'
+  Writing {len(_s_import_rows)} import rows to {TBL_IMPORTS} ...')
+    conn = _get_conn()
+    _create_table(conn, TBL_IMPORTS, IMPORTS_COLS, 'project_id')
+    _bulk_insert(conn, TBL_IMPORTS, IMPORTS_COL_NAMES, _s_import_rows)
+    conn.close()
+    print(f'  OK  {len(_s_import_rows)} rows in {TBL_IMPORTS}')
+
+    # ── Sample summary ────────────────────────────────────────────────────────
+    t_elapsed = time.perf_counter() - t_total
+    print()
+    print('=' * 70)
+    print('  SAMPLE RUN COMPLETE')
+    print('=' * 70)
+    print(f'  Project ID           : {SAMPLE_PROJECT_ID}')
+    print(f'  Project path         : {_sample_project.path_with_namespace}')
+    print(f'  {TBL_PROJECTS:<50}: 1 row')
+    print(f'  {TBL_DEPS:<50}: {len(_s_dep_rows)} rows')
+    print(f'  {TBL_IMPORTS:<50}: {len(_s_import_rows)} rows')
+    print(f'  Total elapsed (s)    : {t_elapsed:.1f}')
+    print('=' * 70)
+    logger.info('SAMPLE | complete (%.1fs)', t_elapsed)
+    sys.exit(0)
+
+# =============================================================================
+#  PHASE 1 GATE  (normal / full-run mode only — not reached in SAMPLE_MODE)
 # =============================================================================
 print()
 print('=' * 70)
