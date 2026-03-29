@@ -1,10 +1,17 @@
 # GitLab Projects Export  ── v5
 #
-# TABLES  (never dropped — INSERT only, with batch + inserted_at columns)
+# TABLES  (never dropped — INSERT only)
 # ───────
 #   gwma_ui_projects       Phase 1  one row per project with package.json
 #   gwma_ui_dependencies   Phase 2  one row per dependency per project
 #   gwma_ui_imports        Phase 2  one row per import statement per file
+#
+# COLUMN MIGRATION
+# ────────────────
+#   batch (INTEGER) and inserted_at (TIMESTAMP WITH TIME ZONE) are added to
+#   all three tables at startup if they do not already exist.
+#   Uses information_schema — safe for Greenplum / older PostgreSQL that
+#   does not support ALTER TABLE ADD COLUMN IF NOT EXISTS.
 #
 # BATCH BEHAVIOUR
 # ───────────────
@@ -334,12 +341,55 @@ def db_test_connection() -> bool:
         logger.error('DB   | connection FAILED: %s', exc)
         return False
 
+def _column_exists(conn, fqtable: str, column: str) -> bool:
+    """Return True if column already exists in the table (Greenplum-safe check)."""
+    schema, table = fqtable.split('.', 1) if '.' in fqtable else (None, fqtable)
+    with conn.cursor() as cur:
+        if schema:
+            cur.execute(
+                "SELECT COUNT(*) FROM information_schema.columns "
+                "WHERE table_schema = %s AND table_name = %s AND column_name = %s;",
+                (schema, table, column)
+            )
+        else:
+            cur.execute(
+                "SELECT COUNT(*) FROM information_schema.columns "
+                "WHERE table_name = %s AND column_name = %s;",
+                (table, column)
+            )
+        return cur.fetchone()[0] > 0
+
+
+def db_add_columns_if_missing(conn, fqtable: str) -> None:
+    """
+    One-time migration: add 'batch' (INTEGER) and 'inserted_at'
+    (TIMESTAMP WITH TIME ZONE) to an existing table if they are absent.
+
+    Uses information_schema to check first — compatible with Greenplum
+    and older PostgreSQL that do not support ALTER TABLE ADD COLUMN IF NOT EXISTS.
+    Safe to call on every run; no-ops when columns already exist.
+    """
+    for col, dtype in [
+        ('batch',       'INTEGER'),
+        ('inserted_at', 'TIMESTAMP WITH TIME ZONE'),
+    ]:
+        if _column_exists(conn, fqtable, col):
+            logger.info('MIGRATE | column "%s" already exists in %s — skipped', col, fqtable)
+        else:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(f'ALTER TABLE {fqtable} ADD COLUMN "{col}" {dtype};')
+                conn.commit()
+                logger.info('MIGRATE | added column "%s" %s to %s', col, dtype, fqtable)
+            except Exception as exc:
+                conn.rollback()
+                logger.error('MIGRATE | could not add "%s" to %s: %s', col, fqtable, exc)
+
+
 def _ensure_table(conn, fqtable: str, cols: List[Tuple[str, str]],
                   distributed_by: str = 'project_id') -> None:
     """
-    CREATE TABLE IF NOT EXISTS.
-    If the table already exists, verify that batch and inserted_at columns are
-    present and add them if they were created by an older version of this script.
+    CREATE TABLE IF NOT EXISTS, then run the batch/inserted_at migration.
     Never drops or truncates the table.
     """
     col_defs = ',\n    '.join(f'"{col}" {dtype}' for col, dtype in cols)
@@ -349,19 +399,15 @@ def _ensure_table(conn, fqtable: str, cols: List[Tuple[str, str]],
     )
     with conn.cursor() as cur:
         cur.execute(sql_create)
-        # Ensure batch + inserted_at exist (idempotent ALTER)
-        for col, dtype in [('batch', 'INTEGER'), ('inserted_at', 'TIMESTAMP WITH TIME ZONE')]:
-            try:
-                cur.execute(f'ALTER TABLE {fqtable} ADD COLUMN IF NOT EXISTS "{col}" {dtype};')
-            except Exception:
-                conn.rollback()
         try:
             cur.execute(f'ALTER TABLE {fqtable} OWNER TO {DB_OWNER};')
             cur.execute(f'GRANT SELECT ON {fqtable} TO {DB_GRANT};')
         except Exception:
-            pass  # permissions may already be set; don't abort
+            pass
     conn.commit()
-    logger.info('DB   | table ready (no drop): %s', fqtable)
+    # Add batch + inserted_at if missing (safe for pre-existing tables)
+    db_add_columns_if_missing(conn, fqtable)
+    logger.info('DB   | table ready: %s', fqtable)
 
 def _get_next_batch(conn, fqtable: str) -> int:
     """Return max(batch)+1 from the table, or 1 if the table is empty."""
@@ -737,6 +783,25 @@ logger.info('DB   | testing connection ...')
 if not db_test_connection():
     print('\n  ERROR: Cannot connect to Greenplum.')
     sys.exit(1)
+
+# ── One-time migration: add batch + inserted_at to all 3 tables if missing ────
+# This runs every startup but is a no-op when columns already exist.
+# Safe for Greenplum (no ADD COLUMN IF NOT EXISTS — uses information_schema check).
+print()
+print('  Checking / migrating table columns ...')
+try:
+    _mig_conn = _get_conn()
+    for _tbl in [TBL_PROJECTS, TBL_DEPS, TBL_IMPORTS]:
+        try:
+            db_add_columns_if_missing(_mig_conn, _tbl)
+        except Exception as _e:
+            # Table may not exist yet — that is fine, _ensure_table will create it
+            logger.debug('MIGRATE | %s not yet created: %s', _tbl, _e)
+    _mig_conn.close()
+    print('  Column check complete.')
+except Exception as _mig_exc:
+    logger.error('MIGRATE | migration check failed: %s', _mig_exc)
+    print(f'  WARNING: migration check failed: {_mig_exc}')
 
 t_total      = time.perf_counter()
 run_ts       = datetime.now(timezone.utc)   # single timestamp for this whole run
