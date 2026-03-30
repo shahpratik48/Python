@@ -223,6 +223,26 @@ class SQLParser:
             for nm in _RE_CTE_NAME.finditer(block):
                 local_ctes.add(nm.group(1).lower())
 
+        # Build per-statement alias map first (table -> alias)
+        stmt_table_to_alias = {}
+        _skip = {
+            'where','on','set','select','inner','left','right','full',
+            'outer','cross','join','from','as','not','null','and','or',
+            'in','by','group','order','having','limit','union','all',
+            'distinct','with','values','distributed','using','for',
+            'case','when','then','else','end','exists','between',
+            'like','ilike','is','true','false','into','insert','update',
+            'delete','create','drop','alter','table','temp','temporary',
+            'partition','over','partition','window','rows','range',
+            'unbounded','preceding','following','current','row',
+            'natural','lateral','recursive','only','returning',
+        }
+        for m in _RE_FROM_JOIN.finditer(stmt):
+            traw = normalize_table_name(m.group(1))
+            al   = (m.group(2) or '').lower()
+            if al and al not in _skip and al != traw:
+                stmt_table_to_alias[traw] = al
+
         for m in _RE_FROM_JOIN.finditer(stmt):
             raw_full = m.group(0)
             table_name_raw = m.group(1)
@@ -251,13 +271,33 @@ class SQLParser:
             self.table_sources[target].add(table_name)
 
             # Extract join conditions for this source→target link
-            join_cols = extract_join_conditions(stmt, table_name, self.alias_map)
+            raw_join_cols = extract_join_conditions(stmt, table_name, self.alias_map)
 
-            # Record relationship
+            # Deduplicate raw tuples (keep full alias.col = alias.col form)
+            seen_jk = set()
+            dedup_jk = []
+            for jc in raw_join_cols:
+                if isinstance(jc, (list, tuple)) and len(jc) == 2:
+                    key = (str(jc[0]).lower(), str(jc[1]).lower())
+                else:
+                    key = str(jc).lower()
+                if key not in seen_jk:
+                    seen_jk.add(key)
+                    if isinstance(jc, tuple):
+                        dedup_jk.append([jc[0], jc[1]])
+                    else:
+                        dedup_jk.append(str(jc))
+
+            src_alias = stmt_table_to_alias.get(table_name, alias.lower() if alias else "")
+            tgt_alias = stmt_table_to_alias.get(target, "")
+
+            # Record relationship with raw join pairs
             self.relationships.append({
                 "from": table_name,
                 "to": target,
-                "join_cols": join_cols,
+                "join_cols": dedup_jk,
+                "alias": src_alias,
+                "target_alias": tgt_alias,
                 "rel_type": "JOIN/SOURCE",
                 "is_external": is_ext,
             })
@@ -275,14 +315,35 @@ class SQLParser:
 
     def summary(self) -> dict:
         """Return a structured summary."""
-        # Deduplicate relationships by (from, to)
-        seen = set()
-        deduped = []
+        # Deduplicate relationships by (from, to), merging join_cols
+        merged = {}
         for r in self.relationships:
             key = (r["from"], r["to"])
-            if key not in seen:
-                seen.add(key)
-                deduped.append(r)
+            if key not in merged:
+                merged[key] = {
+                    "from": r["from"],
+                    "to": r["to"],
+                    "join_cols": list(r.get("join_cols", [])),
+                    "alias": r.get("alias", ""),
+                    "target_alias": r.get("target_alias", ""),
+                    "rel_type": r.get("rel_type", ""),
+                    "is_external": r.get("is_external", False),
+                }
+            else:
+                # Merge join keys (handle list/tuple items)
+                existing_keys = set(
+                    tuple(jk) if isinstance(jk, list) else jk
+                    for jk in merged[key]["join_cols"]
+                )
+                for jk in r.get("join_cols", []):
+                    jk_key = tuple(jk) if isinstance(jk, list) else jk
+                    if jk_key not in existing_keys:
+                        merged[key]["join_cols"].append(jk)
+                        existing_keys.add(jk_key)
+                # Keep alias if not yet set
+                if not merged[key]["alias"] and r.get("alias"):
+                    merged[key]["alias"] = r["alias"]
+        deduped = list(merged.values())
 
         return {
             "created_tables": sorted(self.created_tables),
@@ -293,926 +354,606 @@ class SQLParser:
         }
 
 
-# ---------------------------------------------------------------------------
-# ER Diagram HTML Generator
-# ---------------------------------------------------------------------------
-
-ER_DIAGRAM_TEMPLATE = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SQL Table Lineage ER Diagram</title>
-<style>
-  :root {{
-    --bg: #0d1117;
-    --panel: #161b22;
-    --border: #30363d;
-    --text: #e6edf3;
-    --muted: #8b949e;
-    --accent1: #58a6ff;
-    --accent2: #3fb950;
-    --accent3: #d2a8ff;
-    --accent4: #ffa657;
-    --accent5: #ff7b72;
-    --accent6: #79c0ff;
-  }}
-
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-
-  body {{
-    background: var(--bg);
-    color: var(--text);
-    font-family: 'Segoe UI', system-ui, sans-serif;
-    overflow: hidden;
-  }}
-
-  #app {{
-    display: flex;
-    flex-direction: column;
-    height: 100vh;
-  }}
-
-  /* ---- HEADER ---- */
-  #header {{
-    background: linear-gradient(135deg, #1a237e 0%, #0d47a1 40%, #006064 100%);
-    padding: 14px 24px;
-    display: flex;
-    align-items: center;
-    gap: 16px;
-    box-shadow: 0 2px 12px rgba(0,0,0,.6);
-    z-index: 10;
-    flex-shrink: 0;
-  }}
-  #header h1 {{
-    font-size: 1.25rem;
-    font-weight: 700;
-    letter-spacing: .5px;
-  }}
-  #header .subtitle {{
-    font-size: .8rem;
-    color: rgba(255,255,255,.6);
-  }}
-  .badge {{
-    padding: 3px 10px;
-    border-radius: 12px;
-    font-size: .72rem;
-    font-weight: 600;
-    letter-spacing: .3px;
-  }}
-  .badge-blue  {{ background: rgba(88,166,255,.2); color: #58a6ff; border: 1px solid #58a6ff44; }}
-  .badge-green {{ background: rgba(63,185,80,.2);  color: #3fb950; border: 1px solid #3fb95044; }}
-  .badge-purple{{ background: rgba(210,168,255,.2);color: #d2a8ff; border: 1px solid #d2a8ff44; }}
-  .badge-orange{{ background: rgba(255,166,87,.2); color: #ffa657; border: 1px solid #ffa65744; }}
-
-  /* ---- TOOLBAR ---- */
-  #toolbar {{
-    background: var(--panel);
-    border-bottom: 1px solid var(--border);
-    padding: 8px 16px;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    flex-shrink: 0;
-    flex-wrap: wrap;
-  }}
-  #toolbar button {{
-    background: #21262d;
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 5px 14px;
-    font-size: .8rem;
-    cursor: pointer;
-    transition: all .15s;
-  }}
-  #toolbar button:hover {{ background: #30363d; border-color: var(--accent1); }}
-  #toolbar input[type=text] {{
-    background: #21262d;
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 5px 12px;
-    font-size: .8rem;
-    width: 200px;
-    outline: none;
-  }}
-  #toolbar input[type=text]:focus {{ border-color: var(--accent1); }}
-  #toolbar label {{ font-size: .78rem; color: var(--muted); }}
-  .sep {{ width: 1px; height: 24px; background: var(--border); margin: 0 4px; }}
-
-  /* ---- LEGEND ---- */
-  #legend {{
-    display: flex; gap: 14px; margin-left: auto; flex-wrap: wrap;
-  }}
-  .legend-item {{ display: flex; align-items: center; gap: 6px; font-size: .72rem; }}
-  .legend-dot {{ width: 10px; height: 10px; border-radius: 50%; }}
-
-  /* ---- MAIN AREA ---- */
-  #main {{
-    display: flex;
-    flex: 1;
-    overflow: hidden;
-  }}
-
-  /* ---- SIDEBAR ---- */
-  #sidebar {{
-    width: 280px;
-    background: var(--panel);
-    border-right: 1px solid var(--border);
-    overflow-y: auto;
-    flex-shrink: 0;
-    padding: 12px;
-  }}
-  #sidebar h3 {{
-    font-size: .78rem;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-    color: var(--muted);
-    margin-bottom: 8px;
-    margin-top: 12px;
-  }}
-  #sidebar h3:first-child {{ margin-top: 0; }}
-  .table-list-item {{
-    padding: 6px 10px;
-    border-radius: 6px;
-    cursor: pointer;
-    font-size: .8rem;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    transition: background .1s;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }}
-  .table-list-item:hover {{ background: #21262d; }}
-  .table-list-item.active {{ background: #1f3958; border-left: 3px solid var(--accent1); }}
-  .tbl-icon {{ width: 8px; height: 8px; border-radius: 2px; flex-shrink: 0; }}
-
-  /* ---- CANVAS ---- */
-  #canvas-wrapper {{
-    flex: 1;
-    position: relative;
-    overflow: hidden;
-  }}
-  #canvas {{
-    position: absolute;
-    top: 0; left: 0;
-    cursor: grab;
-  }}
-  #canvas:active {{ cursor: grabbing; }}
-
-  /* ---- INFO PANEL ---- */
-  #info-panel {{
-    width: 300px;
-    background: var(--panel);
-    border-left: 1px solid var(--border);
-    padding: 16px;
-    overflow-y: auto;
-    flex-shrink: 0;
-    display: none;
-  }}
-  #info-panel.visible {{ display: block; }}
-  #info-panel h2 {{ font-size: 1rem; margin-bottom: 8px; }}
-  #info-panel .info-section {{ margin-top: 12px; }}
-  #info-panel .info-section h4 {{
-    font-size: .72rem;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-    color: var(--muted);
-    margin-bottom: 6px;
-  }}
-  .rel-chip {{
-    display: inline-flex; align-items: center; gap: 4px;
-    background: #21262d;
-    border: 1px solid var(--border);
-    border-radius: 5px;
-    padding: 3px 8px;
-    font-size: .72rem;
-    margin: 2px;
-    color: var(--accent1);
-    cursor: pointer;
-  }}
-  .rel-chip:hover {{ border-color: var(--accent1); }}
-
-  #close-info {{
-    float: right;
-    background: none;
-    border: none;
-    color: var(--muted);
-    cursor: pointer;
-    font-size: 1.1rem;
-  }}
-  #close-info:hover {{ color: var(--text); }}
-
-  /* ---- STATS BAR ---- */
-  #stats-bar {{
-    background: var(--panel);
-    border-top: 1px solid var(--border);
-    padding: 4px 16px;
-    font-size: .72rem;
-    color: var(--muted);
-    display: flex;
-    gap: 20px;
-    flex-shrink: 0;
-  }}
-  #stats-bar span b {{ color: var(--text); }}
-</style>
-</head>
-<body>
-<div id="app">
-
-<!-- HEADER -->
-<div id="header">
-  <div>
-    <h1>📊 SQL Table Lineage &amp; ER Diagram</h1>
-    <div class="subtitle">account_profile_curr_ikg pipeline · IKG Schema</div>
-  </div>
-  <span class="badge badge-blue" id="badge-created">-- IKG tables</span>
-  <span class="badge badge-purple" id="badge-temp">-- Temp tables</span>
-  <span class="badge badge-orange" id="badge-external">-- External tables</span>
-  <span class="badge badge-green" id="badge-rels">-- Relationships</span>
-</div>
-
-<!-- TOOLBAR -->
-<div id="toolbar">
-  <button onclick="resetView()">⟳ Reset View</button>
-  <button onclick="zoomIn()">＋ Zoom In</button>
-  <button onclick="zoomOut()">－ Zoom Out</button>
-  <div class="sep"></div>
-  <label>Search:</label>
-  <input type="text" id="search-box" placeholder="Filter tables…" oninput="filterTables()">
-  <button onclick="clearSearch()">✕</button>
-  <div class="sep"></div>
-  <button onclick="toggleExternal()">Toggle External</button>
-  <button onclick="toggleTemp()">Toggle Temp</button>
-  <div class="sep"></div>
-  <div id="legend">
-    <div class="legend-item"><div class="legend-dot" style="background:#58a6ff"></div>IKG Table</div>
-    <div class="legend-item"><div class="legend-dot" style="background:#d2a8ff"></div>Temp Table</div>
-    <div class="legend-item"><div class="legend-dot" style="background:#ffa657"></div>External</div>
-    <div class="legend-item"><div class="legend-dot" style="background:#3fb950"></div>Final Table</div>
-  </div>
-</div>
-
-<!-- MAIN -->
-<div id="main">
-  <!-- SIDEBAR -->
-  <div id="sidebar">
-    <h3>IKG Tables</h3>
-    <div id="list-created"></div>
-    <h3>Temp Tables</h3>
-    <div id="list-temp"></div>
-    <h3>External Tables</h3>
-    <div id="list-external"></div>
-  </div>
-
-  <!-- CANVAS -->
-  <div id="canvas-wrapper">
-    <canvas id="canvas"></canvas>
-  </div>
-
-  <!-- INFO PANEL -->
-  <div id="info-panel">
-    <button id="close-info" onclick="closeInfo()">✕</button>
-    <h2 id="info-title"></h2>
-    <div class="info-section">
-      <h4>Type</h4>
-      <div id="info-type"></div>
-    </div>
-    <div class="info-section">
-      <h4>Upstream Sources (inputs)</h4>
-      <div id="info-upstream"></div>
-    </div>
-    <div class="info-section">
-      <h4>Downstream Targets (outputs)</h4>
-      <div id="info-downstream"></div>
-    </div>
-    <div class="info-section">
-      <h4>Join Columns</h4>
-      <div id="info-joinkeys"></div>
-    </div>
-  </div>
-</div>
-
-<!-- STATS BAR -->
-<div id="stats-bar">
-  <span>Tables: <b id="stat-tables">0</b></span>
-  <span>Relationships: <b id="stat-rels">0</b></span>
-  <span>Zoom: <b id="stat-zoom">100%</b></span>
-  <span>Drag to pan · Scroll to zoom · Click node for details</span>
-</div>
-
-</div><!-- #app -->
-
-<script>
-// =========================================================================
-// DATA (injected by Python)
-// =========================================================================
-const DATA = {DATA_PLACEHOLDER};
-
-// =========================================================================
-// GRAPH STATE
-// =========================================================================
-const canvas  = document.getElementById('canvas');
-const ctx     = canvas.getContext('2d');
-const wrapper = document.getElementById('canvas-wrapper');
-
-let transform = {{ x: 0, y: 0, scale: 1 }};
-let nodes  = [];   // {{ id, label, x, y, w, h, type, color, textColor }}
-let edges  = [];   // {{ from, to, joinCols, color }}
-let dragging = null;
-let panStart = null;
-let selectedNode = null;
-let showExternal = true;
-let showTemp     = true;
-let highlightedNodes = new Set();
-
-// ---- Color palette ----
-const COLORS = {{
-  created:  {{ fill: '#0d2137', stroke: '#58a6ff', text: '#c9d1d9', hdr: '#58a6ff' }},
-  temp:     {{ fill: '#1a0d2b', stroke: '#d2a8ff', text: '#c9d1d9', hdr: '#d2a8ff' }},
-  external: {{ fill: '#1a1200', stroke: '#ffa657', text: '#c9d1d9', hdr: '#ffa657' }},
-  final:    {{ fill: '#0a2119', stroke: '#3fb950', text: '#e6edf3', hdr: '#3fb950' }},
-}};
-
-// =========================================================================
-// INIT
-// =========================================================================
-function init() {{
-  buildGraph();
-  populateSidebar();
-  updateBadges();
-  resizeCanvas();
-  resetView();
-  render();
-  requestAnimationFrame(animLoop);
-}}
-
-function buildGraph() {{
-  const allTables = new Set([
-    ...DATA.created_tables,
-    ...DATA.temp_tables,
-    ...DATA.external_tables,
-  ]);
-
-  const finalTable = 'account_profile_curr_ikg_temp_auto';
-
-  // Create nodes
-  allTables.forEach(tbl => {{
-    const type = DATA.created_tables.includes(tbl) ? (tbl === finalTable ? 'final' : 'created')
-               : DATA.temp_tables.includes(tbl)    ? 'temp'
-               : 'external';
-    nodes.push({{
-      id: tbl,
-      label: tbl,
-      x: Math.random() * 2400,
-      y: Math.random() * 1800,
-      w: Math.max(180, tbl.length * 7.2 + 24),
-      h: 48,
-      type,
-      color: COLORS[type],
-    }});
-  }});
-
-  // Create edges (deduplicate)
-  const seen = new Set();
-  DATA.relationships.forEach(rel => {{
-    const key = rel.from + '→' + rel.to;
-    if (seen.has(key) || !allTables.has(rel.from) || !allTables.has(rel.to)) return;
-    seen.add(key);
-    const isExt = DATA.external_tables.includes(rel.from);
-    edges.push({{
-      from: rel.from,
-      to: rel.to,
-      joinCols: rel.join_cols || [],
-      color: isExt ? '#ffa65755' : '#58a6ff55',
-    }});
-  }});
-
-  layoutGraph();
-}}
-
-// =========================================================================
-// LAYOUT — Layered / force-directed hybrid
-// =========================================================================
-function layoutGraph() {{
-  // Compute topological levels
-  const inDegree = {{}};
-  const outEdges = {{}};
-  nodes.forEach(n => {{ inDegree[n.id] = 0; outEdges[n.id] = []; }});
-  edges.forEach(e => {{
-    if (inDegree[e.to] !== undefined) inDegree[e.to]++;
-    if (outEdges[e.from]) outEdges[e.from].push(e.to);
-  }});
-
-  const levels = {{}};
-  const queue = nodes.filter(n => inDegree[n.id] === 0).map(n => n.id);
-  const processed = new Set();
-  queue.forEach(id => {{ levels[id] = 0; }});
-
-  while (queue.length) {{
-    const cur = queue.shift();
-    if (processed.has(cur)) continue;
-    processed.add(cur);
-    (outEdges[cur] || []).forEach(nxt => {{
-      levels[nxt] = Math.max(levels[nxt] || 0, (levels[cur] || 0) + 1);
-      queue.push(nxt);
-    }});
-  }}
-
-  // Group by level
-  const byLevel = {{}};
-  nodes.forEach(n => {{
-    const lv = levels[n.id] ?? 99;
-    if (!byLevel[lv]) byLevel[lv] = [];
-    byLevel[lv].push(n);
-  }});
-
-  const COL_W = 240, ROW_H = 80, MARGIN_X = 60, MARGIN_Y = 60;
-  Object.keys(byLevel).sort((a,b) => +a - +b).forEach((lv, li) => {{
-    const col = byLevel[lv];
-    col.forEach((n, ri) => {{
-      n.x = MARGIN_X + li * COL_W;
-      n.y = MARGIN_Y + ri * ROW_H;
-    }});
-  }});
-
-  // Run a few force iterations to spread nodes
-  for (let iter = 0; iter < 60; iter++) {{
-    forceStep();
-  }}
-}}
-
-function forceStep() {{
-  const repulsion = 800, attraction = 0.05, damping = 0.8;
-  const forces = {{}};
-  nodes.forEach(n => {{ forces[n.id] = {{ x: 0, y: 0 }}; }});
-
-  // Repulsion between all pairs
-  for (let i = 0; i < nodes.length; i++) {{
-    for (let j = i+1; j < nodes.length; j++) {{
-      const a = nodes[i], b = nodes[j];
-      const dx = b.x - a.x || 0.1, dy = b.y - a.y || 0.1;
-      const dist = Math.sqrt(dx*dx + dy*dy) || 1;
-      const force = repulsion / (dist * dist);
-      forces[a.id].x -= force * dx / dist;
-      forces[a.id].y -= force * dy / dist;
-      forces[b.id].x += force * dx / dist;
-      forces[b.id].y += force * dy / dist;
-    }}
-  }}
-
-  // Attraction along edges
-  edges.forEach(e => {{
-    const a = nodes.find(n => n.id === e.from);
-    const b = nodes.find(n => n.id === e.to);
-    if (!a || !b) return;
-    const dx = b.x - a.x, dy = b.y - a.y;
-    forces[a.id].x += attraction * dx;
-    forces[a.id].y += attraction * dy;
-    forces[b.id].x -= attraction * dx;
-    forces[b.id].y -= attraction * dy;
-  }});
-
-  nodes.forEach(n => {{
-    n.x += forces[n.id].x * damping;
-    n.y += forces[n.id].y * damping;
-  }});
-}}
-
-// =========================================================================
-// RENDER
-// =========================================================================
-let _raf = 0;
-function animLoop() {{
-  render();
-  _raf = requestAnimationFrame(animLoop);
-}}
-
-function render() {{
-  const W = canvas.width, H = canvas.height;
-  ctx.clearRect(0, 0, W, H);
-
-  ctx.save();
-  ctx.translate(transform.x, transform.y);
-  ctx.scale(transform.scale, transform.scale);
-
-  // Draw grid
-  drawGrid();
-
-  // Draw edges first
-  const visibleIds = getVisibleIds();
-  edges.forEach(e => {{
-    if (!visibleIds.has(e.from) || !visibleIds.has(e.to)) return;
-    drawEdge(e, visibleIds);
-  }});
-
-  // Draw nodes
-  nodes.forEach(n => {{
-    if (!visibleIds.has(n.id)) return;
-    drawNode(n);
-  }});
-
-  ctx.restore();
-}}
-
-function drawGrid() {{
-  const gridSize = 40;
-  const w = canvas.width / transform.scale;
-  const h = canvas.height / transform.scale;
-  const ox = -transform.x / transform.scale;
-  const oy = -transform.y / transform.scale;
-
-  ctx.strokeStyle = '#1a2030';
-  ctx.lineWidth = 0.5;
-  const startX = Math.floor(ox / gridSize) * gridSize;
-  const startY = Math.floor(oy / gridSize) * gridSize;
-  for (let x = startX; x < ox + w; x += gridSize) {{
-    ctx.beginPath(); ctx.moveTo(x, oy); ctx.lineTo(x, oy + h); ctx.stroke();
-  }}
-  for (let y = startY; y < oy + h; y += gridSize) {{
-    ctx.beginPath(); ctx.moveTo(ox, y); ctx.lineTo(ox + w, y); ctx.stroke();
-  }}
-}}
-
-function drawEdge(e, visibleIds) {{
-  const from = nodes.find(n => n.id === e.from);
-  const to   = nodes.find(n => n.id === e.to);
-  if (!from || !to) return;
-
-  const isHighlighted = selectedNode &&
-    (selectedNode === e.from || selectedNode === e.to);
-
-  const x1 = from.x + from.w, y1 = from.y + from.h / 2;
-  const x2 = to.x,            y2 = to.y   + to.h   / 2;
-  const cp1x = x1 + (x2 - x1) * 0.4;
-  const cp2x = x1 + (x2 - x1) * 0.6;
-
-  ctx.beginPath();
-  ctx.moveTo(x1, y1);
-  ctx.bezierCurveTo(cp1x, y1, cp2x, y2, x2, y2);
-  ctx.strokeStyle = isHighlighted ? '#58a6ff' : e.color;
-  ctx.lineWidth   = isHighlighted ? 2 : 1;
-  ctx.stroke();
-
-  // Arrow head
-  const ang = Math.atan2(y2 - (y1 + (y2-y1)*0.8), x2 - (x1 + (x2-x1)*0.8));
-  const aSize = isHighlighted ? 8 : 6;
-  ctx.beginPath();
-  ctx.moveTo(x2, y2);
-  ctx.lineTo(x2 - aSize * Math.cos(ang - 0.4), y2 - aSize * Math.sin(ang - 0.4));
-  ctx.lineTo(x2 - aSize * Math.cos(ang + 0.4), y2 - aSize * Math.sin(ang + 0.4));
-  ctx.closePath();
-  ctx.fillStyle = isHighlighted ? '#58a6ff' : e.color;
-  ctx.fill();
-}}
-
-function drawNode(n) {{
-  const isSelected = selectedNode === n.id;
-  const isHighlighted = highlightedNodes.has(n.id);
-  const c = n.color;
-
-  // Shadow / glow
-  if (isSelected || isHighlighted) {{
-    ctx.shadowColor = c.stroke;
-    ctx.shadowBlur  = 15;
-  }}
-
-  // Node background
-  ctx.fillStyle = c.fill;
-  roundRect(ctx, n.x, n.y, n.w, n.h, 8);
-  ctx.fill();
-
-  // Border
-  ctx.strokeStyle = isSelected ? '#ffffff' : c.stroke;
-  ctx.lineWidth   = isSelected ? 2.5 : 1.5;
-  roundRect(ctx, n.x, n.y, n.w, n.h, 8);
-  ctx.stroke();
-
-  // Header accent line
-  ctx.fillStyle = c.hdr;
-  roundRect(ctx, n.x, n.y, n.w, 3, {{ tl: 8, tr: 8, bl: 0, br: 0 }});
-  ctx.fill();
-
-  ctx.shadowBlur = 0;
-
-  // Label
-  ctx.fillStyle = c.text;
-  ctx.font = 'bold 11px "Segoe UI", system-ui, sans-serif';
-  ctx.textAlign = 'left';
-  ctx.textBaseline = 'middle';
-
-  // Truncate label if too long
-  let label = n.label;
-  const maxW = n.w - 16;
-  while (ctx.measureText(label).width > maxW && label.length > 6) {{
-    label = label.slice(0, -4) + '…';
-  }}
-  ctx.fillText(label, n.x + 10, n.y + n.h / 2 + 2);
-
-  // Type badge (small, right-aligned)
-  const badge = n.type === 'final' ? 'FINAL' : n.type === 'temp' ? 'TMP' : n.type === 'external' ? 'EXT' : 'IKG';
-  ctx.font = '8px "Segoe UI", system-ui, sans-serif';
-  ctx.fillStyle = c.hdr + 'aa';
-  ctx.textAlign = 'right';
-  ctx.fillText(badge, n.x + n.w - 6, n.y + n.h / 2 + 2);
-}}
-
-function roundRect(ctx, x, y, w, h, r) {{
-  if (typeof r === 'number') r = {{ tl: r, tr: r, bl: r, br: r }};
-  ctx.beginPath();
-  ctx.moveTo(x + r.tl, y);
-  ctx.lineTo(x + w - r.tr, y);
-  ctx.quadraticCurveTo(x + w, y, x + w, y + r.tr);
-  ctx.lineTo(x + w, y + h - r.br);
-  ctx.quadraticCurveTo(x + w, y + h, x + w - r.br, y + h);
-  ctx.lineTo(x + r.bl, y + h);
-  ctx.quadraticCurveTo(x, y + h, x, y + h - r.bl);
-  ctx.lineTo(x, y + r.tl);
-  ctx.quadraticCurveTo(x, y, x + r.tl, y);
-  ctx.closePath();
-}}
-
-// =========================================================================
-// VISIBILITY FILTER
-// =========================================================================
-function getVisibleIds() {{
-  const ids = new Set();
-  nodes.forEach(n => {{
-    if (n.type === 'external' && !showExternal) return;
-    if (n.type === 'temp'     && !showTemp)     return;
-    ids.add(n.id);
-  }});
-  return ids;
-}}
-
-// =========================================================================
-// INTERACTION
-// =========================================================================
-function resizeCanvas() {{
-  const rect = wrapper.getBoundingClientRect();
-  canvas.width  = rect.width;
-  canvas.height = rect.height;
-}}
-
-window.addEventListener('resize', () => {{ resizeCanvas(); }});
-
-canvas.addEventListener('mousedown', e => {{
-  const pos = screenToWorld(e.offsetX, e.offsetY);
-  const hit = nodes.find(n => pos.x >= n.x && pos.x <= n.x + n.w &&
-                               pos.y >= n.y && pos.y <= n.y + n.h);
-  if (hit) {{
-    dragging = {{ node: hit, ox: pos.x - hit.x, oy: pos.y - hit.y }};
-    selectNode(hit.id);
-  }} else {{
-    panStart = {{ mx: e.clientX, my: e.clientY, tx: transform.x, ty: transform.y }};
-  }}
-}});
-
-canvas.addEventListener('mousemove', e => {{
-  if (dragging) {{
-    const pos = screenToWorld(e.offsetX, e.offsetY);
-    dragging.node.x = pos.x - dragging.ox;
-    dragging.node.y = pos.y - dragging.oy;
-  }} else if (panStart) {{
-    transform.x = panStart.tx + (e.clientX - panStart.mx);
-    transform.y = panStart.ty + (e.clientY - panStart.my);
-  }}
-}});
-
-canvas.addEventListener('mouseup', () => {{ dragging = null; panStart = null; }});
-canvas.addEventListener('mouseleave', () => {{ dragging = null; panStart = null; }});
-
-canvas.addEventListener('wheel', e => {{
-  e.preventDefault();
-  const delta = e.deltaY > 0 ? 0.9 : 1.1;
-  const mx = e.offsetX, my = e.offsetY;
-  transform.x = mx - delta * (mx - transform.x);
-  transform.y = my - delta * (my - transform.y);
-  transform.scale *= delta;
-  transform.scale = Math.max(0.08, Math.min(4, transform.scale));
-  document.getElementById('stat-zoom').textContent =
-    Math.round(transform.scale * 100) + '%';
-}}, {{ passive: false }});
-
-function screenToWorld(sx, sy) {{
-  return {{
-    x: (sx - transform.x) / transform.scale,
-    y: (sy - transform.y) / transform.scale,
-  }};
-}}
-
-// =========================================================================
-// NODE SELECTION / INFO PANEL
-// =========================================================================
-function selectNode(id) {{
-  selectedNode = id;
-  const n = nodes.find(n => n.id === id);
-  if (!n) return;
-
-  // Highlight connected nodes
-  highlightedNodes = new Set([id]);
-  edges.forEach(e => {{
-    if (e.from === id) highlightedNodes.add(e.to);
-    if (e.to   === id) highlightedNodes.add(e.from);
-  }});
-
-  // Info panel
-  document.getElementById('info-title').textContent = id;
-  document.getElementById('info-type').textContent =
-    n.type === 'final' ? '🏁 Final Output Table' :
-    n.type === 'temp'  ? '⏳ Temporary Table' :
-    n.type === 'external' ? '🌐 External / EDW Table' : '📦 IKG Table';
-
-  const upstream = edges.filter(e => e.to === id).map(e => e.from);
-  const downstream = edges.filter(e => e.from === id).map(e => e.to);
-  const joinCols = edges
-    .filter(e => e.from === id || e.to === id)
-    .flatMap(e => e.joinCols.map(j => (Array.isArray(j) ? j.join(' = ') : j)));
-
-  renderChips('info-upstream', upstream, 'from');
-  renderChips('info-downstream', downstream, 'to');
-
-  const jkDiv = document.getElementById('info-joinkeys');
-  jkDiv.innerHTML = joinCols.length
-    ? joinCols.slice(0,20).map(c =>
-        `<code style="display:block;font-size:.7rem;padding:2px 0;color:#8b949e">${{c}}</code>`
-      ).join('')
-    : '<span style="color:var(--muted);font-size:.78rem">—</span>';
-
-  document.getElementById('info-panel').classList.add('visible');
-
-  // Highlight in sidebar
-  document.querySelectorAll('.table-list-item').forEach(el => {{
-    el.classList.toggle('active', el.dataset.id === id);
-  }});
-}}
-
-function renderChips(containerId, ids, dir) {{
-  const el = document.getElementById(containerId);
-  if (!ids.length) {{
-    el.innerHTML = '<span style="color:var(--muted);font-size:.78rem">—</span>';
-    return;
-  }}
-  el.innerHTML = ids.map(id =>
-    `<span class="rel-chip" onclick="selectNode('${{id}}')">${{id}}</span>`
-  ).join('');
-}}
-
-function closeInfo() {{
-  selectedNode = null;
-  highlightedNodes.clear();
-  document.getElementById('info-panel').classList.remove('visible');
-  document.querySelectorAll('.table-list-item').forEach(el => el.classList.remove('active'));
-}}
-
-// =========================================================================
-// SIDEBAR
-// =========================================================================
-function populateSidebar() {{
-  fillList('list-created',  DATA.created_tables,  'created');
-  fillList('list-temp',     DATA.temp_tables,      'temp');
-  fillList('list-external', DATA.external_tables,  'external');
-  document.getElementById('stat-tables').textContent =
-    DATA.created_tables.length + DATA.temp_tables.length + DATA.external_tables.length;
-  document.getElementById('stat-rels').textContent = DATA.relationships.length;
-}}
-
-function fillList(containerId, tables, type) {{
-  const el = document.getElementById(containerId);
-  const colorMap = {{ created: '#58a6ff', temp: '#d2a8ff', external: '#ffa657', final: '#3fb950' }};
-  el.innerHTML = tables.map(t => {{
-    const col = t === 'account_profile_curr_ikg_temp_auto' ? colorMap.final : colorMap[type];
-    return `<div class="table-list-item" data-id="${{t}}" onclick="selectNode('${{t}}'); focusNode('${{t}}')">\
-<div class="tbl-icon" style="background:${{col}}"></div>\
-<span title="${{t}}">${{t}}</span></div>`;
-  }}).join('');
-}}
-
-function focusNode(id) {{
-  const n = nodes.find(n => n.id === id);
-  if (!n) return;
-  const cx = canvas.width / 2, cy = canvas.height / 2;
-  transform.x = cx - n.x * transform.scale - (n.w / 2) * transform.scale;
-  transform.y = cy - n.y * transform.scale - (n.h / 2) * transform.scale;
-}}
-
-// =========================================================================
-// BADGES
-// =========================================================================
-function updateBadges() {{
-  document.getElementById('badge-created').textContent  = DATA.created_tables.length  + ' IKG tables';
-  document.getElementById('badge-temp').textContent     = DATA.temp_tables.length     + ' Temp tables';
-  document.getElementById('badge-external').textContent = DATA.external_tables.length + ' External tables';
-  document.getElementById('badge-rels').textContent     = DATA.relationships.length   + ' Relationships';
-}}
-
-// =========================================================================
-// TOOLBAR ACTIONS
-// =========================================================================
-function resetView() {{
-  // Center all nodes
-  if (!nodes.length) return;
-  const xs = nodes.map(n => n.x), ys = nodes.map(n => n.y);
-  const minX = Math.min(...xs), maxX = Math.max(...xs.map((x,i) => x + nodes[i].w));
-  const minY = Math.min(...ys), maxY = Math.max(...ys.map((y,i) => y + nodes[i].h));
-  const W = canvas.width, H = canvas.height;
-  const scaleX = W / (maxX - minX + 80);
-  const scaleY = H / (maxY - minY + 80);
-  transform.scale = Math.min(scaleX, scaleY, 1);
-  transform.x = (W - (maxX + minX) * transform.scale) / 2;
-  transform.y = (H - (maxY + minY) * transform.scale) / 2;
-  document.getElementById('stat-zoom').textContent = Math.round(transform.scale * 100) + '%';
-}}
-
-function zoomIn()  {{ applyZoom(1.2); }}
-function zoomOut() {{ applyZoom(0.8); }}
-function applyZoom(delta) {{
-  const cx = canvas.width / 2, cy = canvas.height / 2;
-  transform.x = cx - delta * (cx - transform.x);
-  transform.y = cy - delta * (cy - transform.y);
-  transform.scale = Math.max(0.08, Math.min(4, transform.scale * delta));
-  document.getElementById('stat-zoom').textContent = Math.round(transform.scale * 100) + '%';
-}}
-
-function toggleExternal() {{
-  showExternal = !showExternal;
-  render();
-}}
-function toggleTemp() {{
-  showTemp = !showTemp;
-  render();
-}}
-
-function filterTables() {{
-  const q = document.getElementById('search-box').value.toLowerCase();
-  document.querySelectorAll('.table-list-item').forEach(el => {{
-    el.style.display = el.dataset.id.includes(q) ? '' : 'none';
-  }});
-}}
-function clearSearch() {{
-  document.getElementById('search-box').value = '';
-  filterTables();
-}}
-
-// =========================================================================
-// START
-// =========================================================================
-window.addEventListener('load', init);
-</script>
-</body>
-</html>
-"""
-
+import json
 
 def build_er_html(summary: dict) -> str:
-    """Inject parsed data into the ER diagram HTML template."""
-    js_data = {
-        "created_tables": summary["created_tables"],
-        "temp_tables": summary["temp_tables"],
-        "external_tables": summary["external_tables"],
-        "relationships": [
-            {
-                "from": r["from"],
-                "to": r["to"],
-                "join_cols": [
-                    list(jc) if isinstance(jc, tuple) else jc
-                    for jc in r.get("join_cols", [])
-                ],
-                "is_external": r.get("is_external", False),
-            }
-            for r in summary["relationships"]
-        ],
+    import json as _json
+    from collections import deque as _deque
+
+    FINAL = 'account_profile_curr_ikg_temp_auto'
+
+    rel_up = {}
+    for r in summary['relationships']:
+        rel_up.setdefault(r['to'], []).append(r)
+
+    level_of = {}
+    queue = _deque([(FINAL, 0)])
+    dep_edges_raw = []
+    edge_set = set()
+
+    while queue:
+        tbl, depth = queue.popleft()
+        if tbl in level_of:
+            continue
+        level_of[tbl] = depth
+        for r in rel_up.get(tbl, []):
+            src = r['from']
+            key = (src, tbl)
+            if key not in edge_set:
+                edge_set.add(key)
+                dep_edges_raw.append(r)
+            if src not in level_of:
+                queue.append((src, depth + 1))
+
+    created  = set(summary['created_tables'])
+    temp_set = set(summary['temp_tables'])
+
+    def node_type(n):
+        if n == FINAL:    return 'final'
+        if n in created:  return 'ikg'
+        if n in temp_set: return 'tmp'
+        return 'ext'
+
+    nodes_js = [{'id': n, 'level': lv, 'type': node_type(n)} for n, lv in level_of.items()]
+
+    # Build edges with cleaned alias and structured join keys
+    ALIAS_BLACKLIST = {
+        'where','on','set','select','inner','left','right','full','outer','cross',
+        'join','from','as','not','null','and','or','in','by','group','order',
+        'having','limit','union','all','distinct','with','values','distributed',
+        'using','for','case','when','then','else','end','exists','between',
+        'like','ilike','is','true','false','into','insert','update','delete',
+        'create','drop','alter','table','temp','temporary','partition','over',
+        'window','rows','range','unbounded','preceding','following','current',
+        'row','natural','lateral','recursive','only','returning','returning',
+        'inner','model_data_temp_auto',
     }
-    data_str = json.dumps(js_data, indent=2)
 
-    # Step 1: inject the JSON data block
-    html = ER_DIAGRAM_TEMPLATE.replace("{DATA_PLACEHOLDER}", data_str)
+    def clean_alias(a):
+        if not a:
+            return ''
+        a = a.strip().lower()
+        if a in ALIAS_BLACKLIST:
+            return ''
+        # Must look like a real alias: letters/digits/underscore, not too long
+        import re
+        if not re.match(r'^[a-z_][a-z0-9_]{0,29}$', a):
+            return ''
+        return a
 
-    # Step 2: unescape {{ }} that Python uses to escape braces inside the
-    # template string.  Those appear throughout the JS code and must become
-    # real { } for the browser.  We protect the already-injected JSON data
-    # block (which contains real braces) with sentinels so it is not touched.
-    SENT_S = "<<<DATA_START>>>"
-    SENT_E = "<<<DATA_END>>>"
+    edges_js = []
+    for e in dep_edges_raw:
+        src_alias = clean_alias(e.get('alias', ''))
+        tgt_alias = clean_alias(e.get('target_alias', ''))
 
-    marker_start = "const DATA = "
-    marker_end   = "\n};\n"
+        # Build join key list: each item is {"left": "a.col", "right": "b.col"}
+        # or {"col": "colname"} if both sides are the same column
+        jk_list = []
+        seen_jk = set()
+        for jc in e.get('join_cols', []):
+            if isinstance(jc, (list, tuple)) and len(jc) == 2:
+                l, r2 = str(jc[0]), str(jc[1])
+                key = (l.lower(), r2.lower())
+                if key not in seen_jk:
+                    seen_jk.add(key)
+                    jk_list.append({'left': l, 'right': r2})
+            elif isinstance(jc, str) and jc:
+                key = jc.lower()
+                if key not in seen_jk:
+                    seen_jk.add(key)
+                    jk_list.append({'col': jc})
 
-    ds = html.find(marker_start)
-    de = html.find(marker_end, ds) + len(marker_end)
+        edges_js.append({
+            'from':         e['from'],
+            'to':           e['to'],
+            'jk':           jk_list,
+            'src_alias':    src_alias,
+            'tgt_alias':    tgt_alias,
+            'is_external':  e.get('is_external', False),
+        })
 
-    protected = html[:ds] + SENT_S + html[ds:de] + SENT_E + html[de:]
+    data_json = _json.dumps(
+        {'nodes': nodes_js, 'edges': edges_js, 'final': FINAL},
+        separators=(',', ':')
+    )
 
-    before, rest    = protected.split(SENT_S, 1)
-    data_block, after = rest.split(SENT_E, 1)
+    css = """
+*, *::before, *::after { box-sizing:border-box; margin:0; padding:0; }
+body { background:#0f1117; color:#e2e8f0;
+  font-family:'Segoe UI',system-ui,sans-serif;
+  overflow:hidden; height:100vh; display:flex; flex-direction:column; }
 
-    before = before.replace("{{", "{").replace("}}", "}")
-    after  = after.replace("{{", "{").replace("}}", "}")
+#header { background:linear-gradient(90deg,#1e3a5f,#0f2744);
+  padding:11px 20px; display:flex; align-items:center; gap:14px;
+  border-bottom:1px solid #1e2d40; flex-shrink:0; }
+#header h1 { font-size:.95rem; font-weight:700; color:#63b3ed; }
+.sub { font-size:.68rem; color:#3d5070; margin-top:1px; }
+.sp { padding:3px 10px; border-radius:20px; font-size:.67rem; font-weight:600; }
+.sp-g { background:#1a4731; color:#68d391; border:1px solid #2f855a44; }
+.sp-b { background:#1a365d; color:#63b3ed; border:1px solid #2b6cb044; }
+.sp-p { background:#322659; color:#b794f4; border:1px solid #6b46c144; }
 
-    return before + data_block + after
+#toolbar { background:#161b27; border-bottom:1px solid #1e2d40;
+  padding:6px 14px; display:flex; align-items:center; gap:7px;
+  flex-shrink:0; flex-wrap:wrap; }
+.tbtn { background:#1e2535; color:#8a9ab0; border:1px solid #252f40;
+  border-radius:5px; padding:4px 12px; font-size:.73rem; cursor:pointer; transition:all .12s; }
+.tbtn:hover { background:#2a3548; color:#e2e8f0; }
+.tbtn.on { background:#17304d; color:#63b3ed; border-color:#2b4a70; }
+.tsep { width:1px; height:20px; background:#1e2d40; margin:0 3px; }
+#srch { background:#1a2230; color:#e2e8f0; border:1px solid #252f40;
+  border-radius:5px; padding:4px 11px; font-size:.73rem; width:190px; outline:none; }
+#srch:focus { border-color:#3a6090; }
+#srch::placeholder { color:#2d3a4a; }
+#legend { display:flex; gap:12px; margin-left:auto; align-items:center; }
+.leg { display:flex; align-items:center; gap:5px; font-size:.67rem; color:#4a5a6a; }
+.leg-b { width:13px; height:9px; border-radius:2px; }
+
+#wrap { flex:1; position:relative; overflow:hidden; display:flex; }
+#cv-area { flex:1; position:relative; overflow:hidden; background:#0b0f18; }
+#cv { position:absolute; top:0; left:0; display:block; cursor:grab; }
+
+/* ── DETAIL PANEL ─────────────────────────────────────────────── */
+#panel {
+  width:430px; min-width:430px; background:#0d1525;
+  border-left:1px solid #1a2535;
+  display:none; flex-direction:column; overflow:hidden; flex-shrink:0;
+}
+#panel.open { display:flex; }
+
+#ph {
+  background:#0a1220; padding:12px 14px 10px;
+  border-bottom:1px solid #1a2535; flex-shrink:0;
+}
+#ph-title { font-size:.9rem; font-weight:700; color:#7ec8f8;
+  word-break:break-all; margin-bottom:4px; padding-right:22px; }
+#ph-meta { font-size:.69rem; }
+#ph-close { position:absolute; right:14px; top:14px;
+  background:none; border:none; color:#3a4a5a; cursor:pointer;
+  font-size:1.1rem; transition:color .1s; }
+#ph-close:hover { color:#e2e8f0; }
+
+#pb { flex:1; overflow-y:auto; }
+#pb::-webkit-scrollbar { width:4px; }
+#pb::-webkit-scrollbar-track { background:#0a1018; }
+#pb::-webkit-scrollbar-thumb { background:#1e2d40; border-radius:3px; }
+
+.sec { border-bottom:1px solid #111d2b; }
+.sec-hdr {
+  padding:9px 14px; font-size:.68rem; font-weight:700;
+  text-transform:uppercase; letter-spacing:.8px;
+  display:flex; align-items:center; gap:8px;
+  cursor:pointer; user-select:none; transition:background .1s;
+  color:#3a5a7a;
+}
+.sec-hdr:hover { background:#0f1c2d; }
+.sec-hdr.src-hdr { color:#5a9060; }
+.sec-hdr.dst-hdr { color:#8a6020; }
+.sec-cnt { margin-left:auto; background:#111d2b; color:#4a7090;
+  font-size:.63rem; padding:1px 8px; border-radius:10px; font-weight:700; }
+.arr { font-size:.65rem; color:#2a3a4a; transition:transform .15s; }
+.sec-hdr.collapsed .arr { transform:rotate(-90deg); }
+.sec-body { display:block; }
+.sec-hdr.collapsed + .sec-body { display:none; }
+
+/* table row */
+.trow { padding:8px 12px 8px 16px; border-bottom:1px solid #0d1828;
+  cursor:pointer; transition:background .1s; }
+.trow:hover { background:#0f1c2e; }
+.trow:last-child { border-bottom:none; }
+.trow-top { display:flex; align-items:flex-start; gap:8px; margin-bottom:5px; }
+.tdot { width:8px; height:8px; border-radius:2px; flex-shrink:0; margin-top:3px; }
+.tname { font-size:.77rem; font-weight:600; color:#c0d0e0; flex:1;
+  word-break:break-all; line-height:1.4; }
+.talias { font-size:.64rem; color:#2d5070; background:#091525;
+  border:1px solid #152535; border-radius:4px;
+  padding:1px 7px; font-family:'Consolas','Courier New',monospace;
+  white-space:nowrap; flex-shrink:0; align-self:flex-start; }
+
+/* join keys table */
+.jk-table { width:100%; border-collapse:collapse;
+  margin:0 0 4px 16px; width:calc(100% - 16px); }
+.jk-table th { font-size:.61rem; color:#2a4a5a; font-weight:600;
+  text-transform:uppercase; letter-spacing:.5px;
+  padding:3px 8px 3px 0; border-bottom:1px solid #0f1e2e; }
+.jk-table td { font-size:.68rem; font-family:'Consolas','Courier New',monospace;
+  padding:3px 8px 3px 0; color:#8ab0c0; vertical-align:top;
+  border-bottom:1px solid #0a1520; }
+.jk-table tr:last-child td { border-bottom:none; }
+.jk-src { color:#68d391; }
+.jk-dst { color:#f6ad55; }
+.jk-eq  { color:#2a3a4a; padding:0 4px; }
+.no-jk  { font-size:.65rem; color:#1e2d3a; padding:3px 0 3px 16px;
+  font-style:italic; }
+
+#sb { background:#161b27; border-top:1px solid #1a2535;
+  padding:3px 14px; font-size:.67rem; color:#2d3a4a;
+  display:flex; gap:18px; flex-shrink:0; }
+#sb b { color:#3d4a5a; }
+"""
+
+    body = """
+<div id="header">
+  <div>
+    <div id="h-title">&#128202; account_profile_curr_ikg &mdash; Table Dependency ER Diagram</div>
+    <div class="sub">Click any node to see source/destination tables with aliases and join keys</div>
+  </div>
+  <span class="sp sp-g" id="sp-n">-- nodes</span>
+  <span class="sp sp-b" id="sp-e">-- edges</span>
+  <span class="sp sp-p" id="sp-l">-- levels</span>
+</div>
+<div id="toolbar">
+  <button class="tbtn" onclick="resetView()">&#8635; Reset</button>
+  <button class="tbtn" onclick="zoomIn()">+ Zoom</button>
+  <button class="tbtn" onclick="zoomOut()">&#8722; Zoom</button>
+  <div class="tsep"></div>
+  <input id="srch" placeholder="&#128269; Search table..." oninput="onSearch()">
+  <button class="tbtn" onclick="clearSearch()">&#10005;</button>
+  <div class="tsep"></div>
+  <button class="tbtn on" id="btn-ikg" onclick="toggle('ikg')">IKG</button>
+  <button class="tbtn on" id="btn-tmp" onclick="toggle('tmp')">Temp</button>
+  <button class="tbtn on" id="btn-ext" onclick="toggle('ext')">External</button>
+  <div class="tsep"></div>
+  <button class="tbtn" onclick="fitLv(1)">Lv 1</button>
+  <button class="tbtn" onclick="fitLv(2)">Lv 1-2</button>
+  <button class="tbtn" onclick="fitLv(3)">Lv 1-3</button>
+  <button class="tbtn" onclick="fitAll()">All</button>
+  <div id="legend">
+    <div class="leg"><div class="leg-b" style="background:#2ecc71;border:1px solid #27ae60"></div>Final</div>
+    <div class="leg"><div class="leg-b" style="background:#1a5080;border:1px solid #2980b9"></div>IKG</div>
+    <div class="leg"><div class="leg-b" style="background:#3d1a6e;border:1px solid #8e44ad"></div>Temp</div>
+    <div class="leg"><div class="leg-b" style="background:#4a2800;border:1px solid #e67e22"></div>External</div>
+  </div>
+</div>
+<div id="wrap">
+  <div id="cv-area"><canvas id="cv"></canvas></div>
+  <div id="panel">
+    <div id="ph" style="position:relative;">
+      <button id="ph-close" onclick="closePanel()">&#10005;</button>
+      <div id="ph-title"></div>
+      <div id="ph-meta"></div>
+    </div>
+    <div id="pb">
+      <div class="sec">
+        <div class="sec-hdr src-hdr" id="hdr-src" onclick="toggleSec('src')">
+          &#8593;&nbsp;Source Tables&nbsp;<span style="color:#2a5a30;font-weight:400;font-size:.62rem;text-transform:none">(inputs to this table)</span>
+          <span class="sec-cnt" id="cnt-src">0</span>
+          <span class="arr">&#9660;</span>
+        </div>
+        <div class="sec-body" id="body-src"></div>
+      </div>
+      <div class="sec">
+        <div class="sec-hdr dst-hdr collapsed" id="hdr-dst" onclick="toggleSec('dst')">
+          &#8595;&nbsp;Destination Tables&nbsp;<span style="color:#5a3a10;font-weight:400;font-size:.62rem;text-transform:none">(tables that use this table)</span>
+          <span class="sec-cnt" id="cnt-dst">0</span>
+          <span class="arr">&#9660;</span>
+        </div>
+        <div class="sec-body" id="body-dst"></div>
+      </div>
+    </div>
+  </div>
+</div>
+<div id="sb">
+  <span>Zoom: <b id="sb-z">100%</b></span>
+  <span>Visible: <b id="sb-v">0</b></span>
+  <span>Scroll=zoom &bull; Drag=pan &bull; Click node for details</span>
+</div>
+"""
+
+    js = "const RAW=" + data_json + ";\n" + r"""
+const STYLE={
+  final:{fill:'#0a2a18',stroke:'#2ecc71',text:'#90f0b0'},
+  ikg:  {fill:'#0a1c30',stroke:'#2980b9',text:'#80b8e8'},
+  tmp:  {fill:'#180a2e',stroke:'#8e44ad',text:'#c080e8'},
+  ext:  {fill:'#261200',stroke:'#e67e22',text:'#f0a860'},
+};
+const TC={final:'#2ecc71',ikg:'#2980b9',tmp:'#8e44ad',ext:'#e67e22'};
+const TL={final:'Final Output',ikg:'IKG Table',tmp:'Temp Table',ext:'External/EDW'};
+
+const NM={},EO={},EI={};
+RAW.nodes.forEach(function(n){
+  n.w=Math.max(180,n.id.length*7.2+32); n.h=36; n.x=0; n.y=0;
+  NM[n.id]=n; EO[n.id]=[]; EI[n.id]=[];
+});
+RAW.edges.forEach(function(e){
+  if(NM[e.from]&&NM[e.to]){EO[e.from].push(e);EI[e.to].push(e);}
+});
+
+function layout(){
+  var byLv={};
+  RAW.nodes.forEach(function(n){if(!byLv[n.level])byLv[n.level]=[];byLv[n.level].push(n);});
+  var maxLv=Math.max.apply(null,RAW.nodes.map(function(n){return n.level;}));
+  var CW=260,RH=52,PX=60,PY=50;
+  Object.keys(byLv).forEach(function(lv){
+    var col=byLv[lv];
+    col.sort(function(a,b){return(EO[b.id].length+EI[b.id].length)-(EO[a.id].length+EI[a.id].length);});
+    col.forEach(function(n,i){n.x=PX+(maxLv-lv)*CW;n.y=PY+i*RH;});
+  });
+  for(var i=0;i<80;i++)forceStep();
+}
+function forceStep(){
+  var f={};
+  RAW.nodes.forEach(function(n){f[n.id]={x:0,y:0};});
+  for(var i=0;i<RAW.nodes.length;i++){
+    for(var j=i+1;j<RAW.nodes.length;j++){
+      var a=RAW.nodes[i],b=RAW.nodes[j];
+      var dx=b.x-a.x||.1,dy=b.y-a.y||.1,d=Math.sqrt(dx*dx+dy*dy)||1,rep=500/(d*d);
+      f[a.id].x-=rep*dx/d;f[a.id].y-=rep*dy/d;f[b.id].x+=rep*dx/d;f[b.id].y+=rep*dy/d;
+    }
+  }
+  RAW.edges.forEach(function(e){
+    var a=NM[e.from],b=NM[e.to];if(!a||!b)return;
+    var dx=b.x-a.x,dy=b.y-a.y,att=0.04;
+    f[a.id].x+=att*dx;f[a.id].y+=att*dy;f[b.id].x-=att*dx;f[b.id].y-=att*dy;
+  });
+  RAW.nodes.forEach(function(n){n.x+=f[n.id].x*.8;n.y+=f[n.id].y*.8;});
+}
+layout();
+
+var cvA=document.getElementById('cv-area'),cv=document.getElementById('cv'),ctx=cv.getContext('2d');
+var tx=0,ty=0,sc=1,maxLv=99,showT={ikg:true,tmp:true,ext:true},srchQ='',hlId=null;
+
+function isVis(n){
+  if(n.level>maxLv)return false;
+  if(n.type!=='final'&&!showT[n.type])return false;
+  if(srchQ&&n.id.indexOf(srchQ)<0)return false;
+  return true;
+}
+
+function render(){
+  ctx.clearRect(0,0,cv.width,cv.height);
+  ctx.save();ctx.translate(tx,ty);ctx.scale(sc,sc);
+  drawGrid();
+  RAW.edges.forEach(function(e){
+    var a=NM[e.from],b=NM[e.to];
+    if(!a||!b||!isVis(a)||!isVis(b))return;
+    drawEdge(e,a,b);
+  });
+  RAW.nodes.forEach(function(n){if(isVis(n))drawNode(n);});
+  ctx.restore();
+  document.getElementById('sb-v').textContent=RAW.nodes.filter(isVis).length;
+}
+
+function drawGrid(){
+  var gs=40,ox=-tx/sc,oy=-ty/sc,W=cv.width/sc,H=cv.height/sc;
+  ctx.strokeStyle='#10192a';ctx.lineWidth=1;
+  for(var x=Math.floor(ox/gs)*gs;x<ox+W;x+=gs){ctx.beginPath();ctx.moveTo(x,oy);ctx.lineTo(x,oy+H);ctx.stroke();}
+  for(var y=Math.floor(oy/gs)*gs;y<oy+H;y+=gs){ctx.beginPath();ctx.moveTo(ox,y);ctx.lineTo(ox+W,y);ctx.stroke();}
+}
+
+function drawEdge(e,a,b){
+  var hl=hlId&&(e.from===hlId||e.to===hlId);
+  var x1=a.x+a.w,y1=a.y+a.h/2,x2=b.x,y2=b.y+b.h/2,cp=Math.abs(x2-x1)*.42;
+  ctx.beginPath();ctx.moveTo(x1,y1);ctx.bezierCurveTo(x1+cp,y1,x2-cp,y2,x2,y2);
+  ctx.strokeStyle=hl?(e.to===hlId?'#4adb80':'#f0a840'):(srchQ?'#151f2e':'#1e2d42');
+  ctx.lineWidth=hl?2:1;ctx.globalAlpha=hl?1:.5;ctx.stroke();ctx.globalAlpha=1;
+  if(hl){
+    var col=e.to===hlId?'#4adb80':'#f0a840';
+    var ang=Math.atan2(y2-(y1+(y2-y1)*.8),x2-(x1+(x2-x1)*.8)),as=7;
+    ctx.beginPath();ctx.moveTo(x2,y2);
+    ctx.lineTo(x2-as*Math.cos(ang-.4),y2-as*Math.sin(ang-.4));
+    ctx.lineTo(x2-as*Math.cos(ang+.4),y2-as*Math.sin(ang+.4));
+    ctx.closePath();ctx.fillStyle=col;ctx.fill();
+  }
+}
+
+function drawNode(n){
+  var s=STYLE[n.type],isFinal=n.id===RAW.final,isHl=hlId===n.id;
+  var conn=hlId&&(EO[n.id].some(function(e){return e.to===hlId;})||EI[n.id].some(function(e){return e.from===hlId;}));
+  var dim=hlId&&!isHl&&!conn;
+  if(isHl||isFinal){ctx.shadowColor=s.stroke;ctx.shadowBlur=isHl?18:10;}
+  ctx.globalAlpha=dim?.18:1;
+  ctx.fillStyle=s.fill;rrect(n.x,n.y,n.w,n.h,6);ctx.fill();
+  ctx.strokeStyle=isHl?'#ffffff':(srchQ&&n.id.indexOf(srchQ)>=0?'#f0d060':s.stroke);
+  ctx.lineWidth=isHl||isFinal?2:1;rrect(n.x,n.y,n.w,n.h,6);ctx.stroke();
+  ctx.shadowBlur=0;
+  ctx.fillStyle=s.stroke;rrect(n.x,n.y,n.w,3,{tl:6,tr:6,bl:0,br:0});ctx.fill();
+  ctx.fillStyle=dim?'#1e2a38':s.text;
+  ctx.font=(isFinal?'bold ':'')+' 10.5px Segoe UI,system-ui,sans-serif';
+  ctx.textAlign='left';ctx.textBaseline='middle';
+  var lbl=n.id,mw=n.w-36;
+  while(ctx.measureText(lbl).width>mw&&lbl.length>4)lbl=lbl.slice(0,-4)+'...';
+  ctx.fillText(lbl,n.x+10,n.y+n.h/2+2);
+  ctx.font='8px Segoe UI,system-ui,sans-serif';
+  ctx.fillStyle=dim?'#1e2a38':s.stroke+'99';ctx.textAlign='right';
+  ctx.fillText(isFinal?'OUTPUT':'L'+n.level,n.x+n.w-5,n.y+n.h/2+2);
+  ctx.globalAlpha=1;
+}
+
+function rrect(x,y,w,h,r){
+  var tl,tr,bl,br;
+  if(typeof r==='number'){tl=tr=bl=br=r;}else{tl=r.tl||0;tr=r.tr||0;bl=r.bl||0;br=r.br||0;}
+  ctx.beginPath();
+  ctx.moveTo(x+tl,y);ctx.lineTo(x+w-tr,y);ctx.arcTo(x+w,y,x+w,y+tr,tr);
+  ctx.lineTo(x+w,y+h-br);ctx.arcTo(x+w,y+h,x+w-br,y+h,br);
+  ctx.lineTo(x+bl,y+h);ctx.arcTo(x,y+h,x,y+h-bl,bl);
+  ctx.lineTo(x,y+tl);ctx.arcTo(x,y,x+tl,y,tl);
+  ctx.closePath();
+}
+
+var panning=null;
+cv.addEventListener('mousedown',function(e){panning={mx:e.clientX,my:e.clientY,tx:tx,ty:ty};});
+cv.addEventListener('mousemove',function(e){
+  if(!panning)return;
+  tx=panning.tx+(e.clientX-panning.mx);ty=panning.ty+(e.clientY-panning.my);render();
+});
+cv.addEventListener('mouseup',function(e){
+  var moved=panning&&(Math.abs(e.clientX-panning.mx)>4||Math.abs(e.clientY-panning.my)>4);
+  panning=null;
+  if(!moved){
+    var p=s2w(e.offsetX,e.offsetY),hit=hitNode(p.x,p.y);
+    if(hit){hlId=hit.id;openPanel(hit);}else{hlId=null;closePanel();}
+    render();
+  }
+});
+cv.addEventListener('mouseleave',function(){panning=null;});
+cv.addEventListener('wheel',function(e){
+  e.preventDefault();
+  var d=e.deltaY>0?.88:1.14;
+  tx=e.offsetX-d*(e.offsetX-tx);ty=e.offsetY-d*(e.offsetY-ty);
+  sc=Math.max(.04,Math.min(6,sc*d));
+  document.getElementById('sb-z').textContent=Math.round(sc*100)+'%';render();
+},{passive:false});
+
+function s2w(sx,sy){return{x:(sx-tx)/sc,y:(sy-ty)/sc};}
+function hitNode(wx,wy){
+  for(var i=RAW.nodes.length-1;i>=0;i--){
+    var n=RAW.nodes[i];if(!isVis(n))continue;
+    if(wx>=n.x&&wx<=n.x+n.w&&wy>=n.y&&wy<=n.y+n.h)return n;
+  }
+  return null;
+}
+
+// ── Panel ────────────────────────────────────────────────────────────────────
+function openPanel(n){
+  var p=document.getElementById('panel');p.classList.add('open');
+  document.getElementById('ph-title').textContent=n.id;
+  document.getElementById('ph-meta').textContent=
+    TL[n.type]+' \u2022 Level '+n.level+
+    ' \u2022 '+EI[n.id].length+' inputs \u2022 '+EO[n.id].length+' outputs';
+  document.getElementById('ph-meta').style.color=TC[n.type]+'88';
+  buildSec('src',EI[n.id],n.id,true);
+  buildSec('dst',EO[n.id],n.id,false);
+}
+
+function buildSec(sec,edges,nodeId,isSource){
+  document.getElementById('cnt-'+sec).textContent=edges.length;
+  var body=document.getElementById('body-'+sec);
+  body.innerHTML='';
+  if(!edges.length){
+    var em=document.createElement('div');
+    em.style.cssText='padding:8px 14px;color:#1e2d3a;font-size:.72rem;font-style:italic;';
+    em.textContent=isSource?'No source tables (base/external input)':'No downstream tables (leaf output)';
+    body.appendChild(em);return;
+  }
+
+  edges.forEach(function(e){
+    var otherId=isSource?e.from:e.to;
+    var other=NM[otherId];
+    var type=other?other.type:'ext';
+    var col=TC[type]||'#718096';
+
+    // Determine which alias belongs to which side
+    var thisAlias=isSource?e.src_alias:e.tgt_alias;
+    var otherAlias=isSource?e.src_alias:e.tgt_alias;
+    // src_alias = alias of "from" table, tgt_alias = alias of "to" table
+    var fromAlias=e.src_alias||'';
+    var toAlias=e.tgt_alias||'';
+    var displayAlias=isSource?fromAlias:toAlias;
+
+    var row=document.createElement('div');row.className='trow';
+    row.addEventListener('click',function(){
+      var target=NM[otherId];
+      if(target){hlId=otherId;openPanel(target);focusNode(otherId);render();}
+    });
+
+    // Top line
+    var top=document.createElement('div');top.className='trow-top';
+    var dot=document.createElement('div');dot.className='tdot';
+    dot.style.background=col;dot.style.border='1px solid '+col+'66';
+    var nm=document.createElement('div');nm.className='tname';nm.textContent=otherId;
+    top.appendChild(dot);top.appendChild(nm);
+    if(displayAlias){
+      var ab=document.createElement('span');ab.className='talias';
+      ab.textContent='alias: '+displayAlias;top.appendChild(ab);
+    }
+    row.appendChild(top);
+
+    // Join keys table
+    var jks=e.jk||[];
+    if(jks.length){
+      var tbl=document.createElement('table');tbl.className='jk-table';
+      var thead=tbl.createTHead();var hr=thead.insertRow();
+      var th1=document.createElement('th');th1.textContent='Source ('+( fromAlias||e.from.slice(0,12))+')';
+      var th2=document.createElement('th');th2.style.cssText='width:18px;text-align:center;';th2.textContent='';
+      var th3=document.createElement('th');th3.textContent='Destination ('+( toAlias||e.to.slice(0,12))+')';
+      hr.appendChild(th1);hr.appendChild(th2);hr.appendChild(th3);
+      var tbody=tbl.createTBody();
+      jks.forEach(function(jk){
+        var tr=tbody.insertRow();
+        if(jk.left&&jk.right){
+          var td1=tr.insertCell();td1.className='jk-src';td1.textContent=jk.left;
+          var td2=tr.insertCell();td2.className='jk-eq';td2.textContent='=';
+          var td3=tr.insertCell();td3.className='jk-dst';td3.textContent=jk.right;
+        } else if(jk.col){
+          var td1=tr.insertCell();td1.className='jk-src';td1.textContent=jk.col;td1.colSpan=3;
+        }
+      });
+      row.appendChild(tbl);
+    } else {
+      var nj=document.createElement('div');nj.className='no-jk';
+      nj.textContent='(no explicit join key \u2014 derived or subquery source)';
+      row.appendChild(nj);
+    }
+    body.appendChild(row);
+  });
+}
+
+function closePanel(){
+  document.getElementById('panel').classList.remove('open');
+  hlId=null;render();
+}
+function toggleSec(s){document.getElementById('hdr-'+s).classList.toggle('collapsed');}
+
+function focusNode(id){
+  var n=NM[id];if(!n)return;
+  var r=cvA.getBoundingClientRect();
+  tx=r.width/2-n.x*sc-(n.w/2)*sc;ty=r.height/2-n.y*sc-(n.h/2)*sc;
+}
+
+function resize(){var r=cvA.getBoundingClientRect();cv.width=r.width;cv.height=r.height;render();}
+window.addEventListener('resize',resize);
+
+function resetView(){hlId=null;closePanel();fitAll();}
+function fitAll(){
+  maxLv=99;
+  ['ikg','tmp','ext'].forEach(function(t){showT[t]=true;document.getElementById('btn-'+t).classList.add('on');});
+  fitVisible();
+}
+function fitLv(lv){maxLv=lv;fitVisible();}
+function fitVisible(){
+  var vis=RAW.nodes.filter(isVis);if(!vis.length)return;
+  var x1=Math.min.apply(null,vis.map(function(n){return n.x;}));
+  var x2=Math.max.apply(null,vis.map(function(n){return n.x+n.w;}));
+  var y1=Math.min.apply(null,vis.map(function(n){return n.y;}));
+  var y2=Math.max.apply(null,vis.map(function(n){return n.y+n.h;}));
+  var pad=60;
+  sc=Math.min((cv.width-pad*2)/(x2-x1||1),(cv.height-pad*2)/(y2-y1||1),1.4);
+  tx=pad-x1*sc;ty=(cv.height-(y2-y1)*sc)/2-y1*sc;
+  document.getElementById('sb-z').textContent=Math.round(sc*100)+'%';render();
+}
+function zoomIn(){applyZoom(1.2);}function zoomOut(){applyZoom(.83);}
+function applyZoom(d){
+  var cx=cv.width/2,cy=cv.height/2;tx=cx-d*(cx-tx);ty=cy-d*(cy-ty);
+  sc=Math.max(.04,Math.min(6,sc*d));
+  document.getElementById('sb-z').textContent=Math.round(sc*100)+'%';render();
+}
+function toggle(t){showT[t]=!showT[t];document.getElementById('btn-'+t).classList.toggle('on',showT[t]);render();}
+function onSearch(){srchQ=document.getElementById('srch').value.toLowerCase().trim();render();}
+function clearSearch(){srchQ='';document.getElementById('srch').value='';render();}
+
+window.addEventListener('load',function(){
+  resize();
+  var mx=Math.max.apply(null,RAW.nodes.map(function(n){return n.level;}));
+  document.getElementById('sp-n').textContent=RAW.nodes.length+' nodes';
+  document.getElementById('sp-e').textContent=RAW.edges.length+' edges';
+  document.getElementById('sp-l').textContent=(mx+1)+' levels';
+  fitVisible();
+});
+"""
+
+    return (
+        "<!DOCTYPE html>\n<html lang='en'>\n<head>\n"
+        "<meta charset='UTF-8'>\n"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>\n"
+        "<title>account_profile_curr_ikg \u2014 ER Diagram</title>\n"
+        "<style>\n" + css + "</style>\n</head>\n<body>\n"
+        + body +
+        "<script>\n" + js + "\n</script>\n</body>\n</html>\n"
+    )
+
+
+
 
 
 # ---------------------------------------------------------------------------
