@@ -23,34 +23,27 @@ from pathlib import Path
 from collections import defaultdict
 
 
-import re
-
-
-import re as _re
-
-
-import re as _re
 
 def extract_table_columns(sql_text: str) -> dict:
     """
     Parse SQL and extract output columns for every CREATE TABLE / INSERT INTO.
     Returns dict: table_name -> [col1, col2, ...]
     """
-    clean = _re.sub(r'/\*.*?\*/', ' ', sql_text, flags=_re.DOTALL)
-    clean = _re.sub(r'--[^\n]*', ' ', clean)
+    clean = re.sub(r'/\*.*?\*/', ' ', sql_text, flags=re.DOTALL)
+    clean = re.sub(r'--[^\n]*', ' ', clean)
     result = {}
 
     # ── CREATE TABLE ... AS ────────────────────────────────────────────────
-    create_pat = _re.compile(
+    create_pat = re.compile(
         r'CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?'
         r'(?:\{\{[^}]+\}\}\.)?(\w+)\s+AS\s*',
-        _re.IGNORECASE
+        re.IGNORECASE
     )
     for m in create_pat.finditer(clean):
         tbl = m.group(1).lower()
         body = clean[m.end():]
         # Skip WITH CTE preamble to reach the main SELECT
-        with_m = _re.match(r'\s*WITH\b', body, _re.IGNORECASE)
+        with_m = re.match(r'\s*WITH\b', body, re.IGNORECASE)
         if with_m:
             # Advance past all CTE definitions to the outermost SELECT
             depth, pos = 0, 0
@@ -64,7 +57,7 @@ def extract_table_columns(sql_text: str) -> dict:
                     break
                 pos += 1
             body = body[pos:]
-        sel_m = _re.search(r'\bSELECT\b', body, _re.IGNORECASE)
+        sel_m = re.search(r'\bSELECT\b', body, re.IGNORECASE)
         if not sel_m:
             continue
         cols = _select_cols(body[sel_m.start():])
@@ -73,9 +66,9 @@ def extract_table_columns(sql_text: str) -> dict:
 
     # ── INSERT INTO tbl SELECT ... ─────────────────────────────────────────
     # Use a more robust pattern that handles whitespace/newlines between table name and SELECT
-    insert_pat = _re.compile(
+    insert_pat = re.compile(
         r'INSERT\s+INTO\s+(?:\{\{[^}]+\}\}\.)?(\w+)\s*\n?\s*(SELECT\b)',
-        _re.IGNORECASE | _re.DOTALL
+        re.IGNORECASE | re.DOTALL
     )
     for m in insert_pat.finditer(clean):
         tbl = m.group(1).lower()
@@ -90,7 +83,7 @@ def extract_table_columns(sql_text: str) -> dict:
 def _select_cols(body: str) -> list:
     """Extract output column names from text starting with SELECT."""
     # Strip SELECT [DISTINCT|ALL]
-    body = _re.sub(r'^\s*SELECT\s+(?:ALL\s+|DISTINCT\s+)?', '', body, flags=_re.IGNORECASE)
+    body = re.sub(r'^\s*SELECT\s+(?:ALL\s+|DISTINCT\s+)?', '', body, flags=re.IGNORECASE)
 
     # Find the FROM at depth 0 that ends the column list
     depth, from_pos = 0, len(body)
@@ -105,7 +98,7 @@ def _select_cols(body: str) -> list:
             if depth < 0:
                 from_pos = i
                 break
-        elif depth == 0 and _re.match(r'\bFROM\b', upper[i:]):
+        elif depth == 0 and re.match(r'\bFROM\b', upper[i:]):
             from_pos = i
             break
         i += 1
@@ -143,12 +136,12 @@ def _select_cols(body: str) -> list:
         if not col:
             continue
         # Explicit AS alias — highest priority
-        as_m = _re.search(r'\bAS\s+(\w+)\s*$', col, _re.IGNORECASE)
+        as_m = re.search(r'\bAS\s+(\w+)\s*$', col, re.IGNORECASE)
         if as_m:
             name = as_m.group(1).lower()
         else:
             # Last identifier after dot or whitespace: handles "alias.col_name"
-            last = _re.search(r'(?:[.\s,(]|^)(\w+)\s*$', col)
+            last = re.search(r'(?:[.\s,(]|^)(\w+)\s*$', col)
             name = last.group(1).lower() if last else None
 
         if name and len(name) > 1 and name not in SKIP and name not in seen:
@@ -236,8 +229,6 @@ def extract_join_conditions(sql_block: str, source_table: str, aliases: dict) ->
     Returns only pairs where at least one alias resolves to source_table,
     preventing conditions from other JOINs bleeding into this edge.
     """
-    import re as _r
-
     # Build reverse: table_name -> set of aliases
     tbl_to_aliases = {}
     for alias, tbl in aliases.items():
@@ -246,13 +237,13 @@ def extract_join_conditions(sql_block: str, source_table: str, aliases: dict) ->
 
     results = []
     # Pattern: JOIN <table> [alias] ON <condition> until next clause/join
-    join_on_pat = _r.compile(
+    join_on_pat = re.compile(
         r'\bJOIN\s+(?:\{\{[^}]+\}\}\.)?(\w+)(?:\s+(?:AS\s+)?(\w+))?\s+ON\b(.+?)'
         r'(?=\b(?:LEFT|RIGHT|INNER|FULL|CROSS|OUTER|JOIN|WHERE|GROUP\s+BY|'
         r'ORDER\s+BY|HAVING|LIMIT|DISTRIBUTED|;)\b|$)',
-        _r.IGNORECASE | _r.DOTALL
+        re.IGNORECASE | re.DOTALL
     )
-    eq_pat = _r.compile(r'(\w+)\.(\w+)\s*=\s*(\w+)\.(\w+)')
+    eq_pat = re.compile(r'(\w+)\.(\w+)\s*=\s*(\w+)\.(\w+)')
 
     for m in join_on_pat.finditer(sql_block):
         on_clause = m.group(3)
@@ -591,7 +582,6 @@ def auto_detect_final_table(summary: dict, sql_text: str = "") -> str:
 
 def build_er_html(summary: dict) -> str:
     import json as _json
-    import re as _re
     from collections import deque as _deque, defaultdict as _dd
 
     FINAL = summary.get('final_table') or auto_detect_final_table(
@@ -605,19 +595,19 @@ def build_er_html(summary: dict) -> str:
     # Collect CTE names to exclude (they are inline aliases, not real tables)
     cte_names = set()
     sql_text = summary.get('_sql_text', '')
-    clean_sql = _re.sub(r'/\*.*?\*/', ' ', sql_text, flags=_re.DOTALL)
-    clean_sql = _re.sub(r'--[^\n]*', ' ', clean_sql)
-    for m in _re.finditer(r'\bWITH\b(.*?)(?=\bSELECT\b)', clean_sql,
-                          _re.IGNORECASE | _re.DOTALL):
-        for nm in _re.finditer(r'\b(\w+)\s+AS\s*\(', m.group(1), _re.IGNORECASE):
+    clean_sql = re.sub(r'/\*.*?\*/', ' ', sql_text, flags=re.DOTALL)
+    clean_sql = re.sub(r'--[^\n]*', ' ', clean_sql)
+    for m in re.finditer(r'\bWITH\b(.*?)(?=\bSELECT\b)', clean_sql,
+                          re.IGNORECASE | re.DOTALL):
+        for nm in re.finditer(r'\b(\w+)\s+AS\s*\(', m.group(1), re.IGNORECASE):
             cte_names.add(nm.group(1).lower())
 
     # All tables referenced anywhere (FROM/JOIN)
     skip_kw = {'select','where','on','set','lateral','only','rows','unnest',
                 'values','null','true','false','current','row','all','distinct'}
     all_referenced = set()
-    for m in _re.finditer(
-            r'\b(?:FROM|JOIN)\s+(?:\{\{[^}]+\}\}\.)?(\w+)', clean_sql, _re.IGNORECASE):
+    for m in re.finditer(
+            r'\b(?:FROM|JOIN)\s+(?:\{\{[^}]+\}\}\.)?(\w+)', clean_sql, re.IGNORECASE):
         nm = m.group(1).lower()
         if nm not in skip_kw and nm not in cte_names:
             all_referenced.add(nm)
@@ -646,7 +636,7 @@ def build_er_html(summary: dict) -> str:
         if not a: return ''
         a = a.strip().lower()
         if a in ALIAS_BL: return ''
-        if not _re.match(r'^[a-z_][a-z0-9_]{0,29}$', a): return ''
+        if not re.match(r'^[a-z_][a-z0-9_]{0,29}$', a): return ''
         return a
 
     merged_edges = {}
