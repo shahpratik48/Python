@@ -843,13 +843,13 @@ body { background:#090e18; color:#e2e8f0;
     body = """
 <div id="hdr">
   <div>
-    <div id="h1">&#128202; """ + FINAL + """ &mdash; Full SQL Pipeline ER Diagram</div>
+    <div id="h1">&#128202; """ + FINAL + """ &mdash; ER Diagram</div>
     <div class="sub">All tables, dependencies and relationships &bull; Drag boxes to reposition &bull; Click any table for details</div>
   </div>
-  <span class="sp sp-g"  id="sp-n">-- nodes</span>
-  <span class="sp sp-b"  id="sp-e">-- edges</span>
-  <span class="sp sp-p"  id="sp-l">-- levels</span>
-  <span class="sp sp-o"  id="sp-i">-- isolated</span>
+  <span class="sp sp-b"  id="sp-ikg">-- IKG tables</span>
+  <span class="sp sp-p"  id="sp-tmp">-- Temp tables</span>
+  <span class="sp sp-o"  id="sp-ext">-- External tables</span>
+  <span class="sp sp-g"  id="sp-rel">-- Relationships</span>
 </div>
 <div id="tb">
   <button class="btn" onclick="resetView()">&#8635; Reset</button>
@@ -966,21 +966,21 @@ function layout(){
     var mw=0; byLv[lv].forEach(function(n){if(n.w>mw)mw=n.w;}); maxW[lv]=mw;
   });
 
-  // Build column x positions: level 0 = rightmost (final table)
-  var sortedLvs=Object.keys(byLv).map(Number).sort(function(a,b){return a-b;});
+  // Build column x positions:
+  // Final table has highest level → place it on the LEFT (x = small)
+  // Source tables have level 0   → place them on the RIGHT (x = large)
+  // So we sort levels DESCENDING: maxLevel first → x increases right
+  var sortedLvs=Object.keys(byLv).map(Number).sort(function(a,b){return b-a;});
   var xCursor=PAD_X, colX={};
-  for(var li=sortedLvs.length-1;li>=0;li--){
-    var lv=sortedLvs[li]; colX[lv]=xCursor; xCursor+=maxW[lv]+COL_GAP;
-  }
-  var totalW=xCursor;
-  var flipped={};
-  sortedLvs.forEach(function(lv){ flipped[lv]=totalW-colX[lv]-maxW[lv]; });
+  sortedLvs.forEach(function(lv){
+    colX[lv]=xCursor; xCursor+=maxW[lv]+COL_GAP;
+  });
 
   // Assign y: pack nodes with no overlap
   Object.keys(byLv).forEach(function(lv){
     var yCursor=PAD_Y;
     byLv[lv].forEach(function(n){
-      n.x=flipped[lv]; n.y=yCursor; yCursor+=n.h+ROW_GAP;
+      n.x=colX[lv]; n.y=yCursor; yCursor+=n.h+ROW_GAP;
     });
   });
 }
@@ -1256,12 +1256,13 @@ function clearSearch(){srchQ='';document.getElementById('srch').value='';render(
 
 window.addEventListener('load',function(){
   resize();
-  var maxL=0; RAW.nodes.forEach(function(n){if(n.level>maxL)maxL=n.level;});
-  var isolated=RAW.nodes.filter(function(n){return EI[n.id].length===0&&EO[n.id].length===0;}).length;
-  document.getElementById('sp-n').textContent=RAW.nodes.length+' nodes';
-  document.getElementById('sp-e').textContent=RAW.edges.length+' edges';
-  document.getElementById('sp-l').textContent=(maxL+1)+' levels';
-  document.getElementById('sp-i').textContent=isolated+' isolated';
+  var ikg=RAW.nodes.filter(function(n){return n.type==='ikg'||n.type==='final';}).length;
+  var tmp=RAW.nodes.filter(function(n){return n.type==='tmp';}).length;
+  var ext=RAW.nodes.filter(function(n){return n.type==='ext';}).length;
+  document.getElementById('sp-ikg').textContent=ikg+' IKG tables';
+  document.getElementById('sp-tmp').textContent=tmp+' Temp tables';
+  document.getElementById('sp-ext').textContent=ext+' External tables';
+  document.getElementById('sp-rel').textContent=RAW.edges.length+' Relationships';
   fitVisible();
 });
 """
