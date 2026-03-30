@@ -23,9 +23,139 @@ from pathlib import Path
 from collections import defaultdict
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+import re
+
+
+import re as _re
+
+
+import re as _re
+
+def extract_table_columns(sql_text: str) -> dict:
+    """
+    Parse SQL and extract output columns for every CREATE TABLE / INSERT INTO.
+    Returns dict: table_name -> [col1, col2, ...]
+    """
+    clean = _re.sub(r'/\*.*?\*/', ' ', sql_text, flags=_re.DOTALL)
+    clean = _re.sub(r'--[^\n]*', ' ', clean)
+    result = {}
+
+    # ── CREATE TABLE ... AS ────────────────────────────────────────────────
+    create_pat = _re.compile(
+        r'CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?'
+        r'(?:\{\{[^}]+\}\}\.)?(\w+)\s+AS\s*',
+        _re.IGNORECASE
+    )
+    for m in create_pat.finditer(clean):
+        tbl = m.group(1).lower()
+        body = clean[m.end():]
+        # Skip WITH CTE preamble to reach the main SELECT
+        with_m = _re.match(r'\s*WITH\b', body, _re.IGNORECASE)
+        if with_m:
+            # Advance past all CTE definitions to the outermost SELECT
+            depth, pos = 0, 0
+            while pos < len(body):
+                ch = body[pos]
+                if ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+                elif depth == 0 and body[pos:pos+6].upper() == 'SELECT':
+                    break
+                pos += 1
+            body = body[pos:]
+        sel_m = _re.search(r'\bSELECT\b', body, _re.IGNORECASE)
+        if not sel_m:
+            continue
+        cols = _select_cols(body[sel_m.start():])
+        if cols:
+            result[tbl] = cols
+
+    # ── INSERT INTO tbl SELECT ... ─────────────────────────────────────────
+    # Use a more robust pattern that handles whitespace/newlines between table name and SELECT
+    insert_pat = _re.compile(
+        r'INSERT\s+INTO\s+(?:\{\{[^}]+\}\}\.)?(\w+)\s*\n?\s*(SELECT\b)',
+        _re.IGNORECASE | _re.DOTALL
+    )
+    for m in insert_pat.finditer(clean):
+        tbl = m.group(1).lower()
+        if tbl not in result:
+            cols = _select_cols(clean[m.start(2):])
+            if cols:
+                result[tbl] = cols
+
+    return result
+
+
+def _select_cols(body: str) -> list:
+    """Extract output column names from text starting with SELECT."""
+    # Strip SELECT [DISTINCT|ALL]
+    body = _re.sub(r'^\s*SELECT\s+(?:ALL\s+|DISTINCT\s+)?', '', body, flags=_re.IGNORECASE)
+
+    # Find the FROM at depth 0 that ends the column list
+    depth, from_pos = 0, len(body)
+    upper = body.upper()
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+            if depth < 0:
+                from_pos = i
+                break
+        elif depth == 0 and _re.match(r'\bFROM\b', upper[i:]):
+            from_pos = i
+            break
+        i += 1
+
+    col_section = body[:from_pos]
+
+    # Split by top-level commas
+    cols_raw = []
+    depth, buf = 0, []
+    for ch in col_section:
+        if ch == '(':
+            depth += 1; buf.append(ch)
+        elif ch == ')':
+            depth -= 1; buf.append(ch)
+        elif ch == ',' and depth == 0:
+            cols_raw.append(''.join(buf).strip()); buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        cols_raw.append(''.join(buf).strip())
+
+    SKIP = {
+        'null','true','false','desc','asc','int','text','date','varchar',
+        'numeric','bigint','boolean','timestamp','char','n','y',
+        'profile_date',  # keep this – actually useful, remove from skip
+    }
+    SKIP = {
+        'null','true','false','desc','asc','int','text','date','varchar',
+        'numeric','bigint','boolean','timestamp','char',
+    }
+
+    result, seen = [], set()
+    for col in cols_raw:
+        col = col.strip()
+        if not col:
+            continue
+        # Explicit AS alias — highest priority
+        as_m = _re.search(r'\bAS\s+(\w+)\s*$', col, _re.IGNORECASE)
+        if as_m:
+            name = as_m.group(1).lower()
+        else:
+            # Last identifier after dot or whitespace: handles "alias.col_name"
+            last = _re.search(r'(?:[.\s,(]|^)(\w+)\s*$', col)
+            name = last.group(1).lower() if last else None
+
+        if name and len(name) > 1 and name not in SKIP and name not in seen:
+            seen.add(name)
+            result.append(name)
+
+    return result
 
 def normalize_table_name(raw: str) -> str:
     """Strip {{params.*}} schema prefixes and lowercase the table name."""
@@ -102,17 +232,48 @@ _RE_CTE_NAME = re.compile(r'\b(\w+)\s+AS\s*\(', re.IGNORECASE)
 
 def extract_join_conditions(sql_block: str, source_table: str, aliases: dict) -> list:
     """
-    Try to capture ON conditions from JOINs to derive join columns.
-    Returns a list of (left_col, right_col) strings.
+    Extract JOIN ON conditions that specifically involve source_table.
+    Returns only pairs where at least one alias resolves to source_table,
+    preventing conditions from other JOINs bleeding into this edge.
     """
-    conds = []
-    for m in re.finditer(r'\bON\b\s+(.+?)(?=\b(?:LEFT|RIGHT|INNER|FULL|CROSS|JOIN|WHERE|GROUP|ORDER|HAVING|LIMIT|DISTRIBUTED|;)\b)',
-                         sql_block, re.IGNORECASE | re.DOTALL):
-        cond = m.group(1).strip()
-        # Find alias.col = alias.col patterns
-        for eq in re.finditer(r'(\w+)\.(\w+)\s*=\s*(\w+)\.(\w+)', cond):
-            conds.append((f"{eq.group(1)}.{eq.group(2)}", f"{eq.group(3)}.{eq.group(4)}"))
-    return conds
+    import re as _r
+
+    # Build reverse: table_name -> set of aliases
+    tbl_to_aliases = {}
+    for alias, tbl in aliases.items():
+        tbl_to_aliases.setdefault(tbl, set()).add(alias)
+    src_aliases = tbl_to_aliases.get(source_table, set()) | {source_table}
+
+    results = []
+    # Pattern: JOIN <table> [alias] ON <condition> until next clause/join
+    join_on_pat = _r.compile(
+        r'\bJOIN\s+(?:\{\{[^}]+\}\}\.)?(\w+)(?:\s+(?:AS\s+)?(\w+))?\s+ON\b(.+?)'
+        r'(?=\b(?:LEFT|RIGHT|INNER|FULL|CROSS|OUTER|JOIN|WHERE|GROUP\s+BY|'
+        r'ORDER\s+BY|HAVING|LIMIT|DISTRIBUTED|;)\b|$)',
+        _r.IGNORECASE | _r.DOTALL
+    )
+    eq_pat = _r.compile(r'(\w+)\.(\w+)\s*=\s*(\w+)\.(\w+)')
+
+    for m in join_on_pat.finditer(sql_block):
+        on_clause = m.group(3)
+        for eq in eq_pat.finditer(on_clause):
+            la = eq.group(1).lower()
+            lc = eq.group(2)
+            ra = eq.group(3).lower()
+            rc = eq.group(4)
+            ltbl = aliases.get(la, la)
+            rtbl = aliases.get(ra, ra)
+            if ltbl == source_table or rtbl == source_table or la in src_aliases or ra in src_aliases:
+                results.append((la + '.' + lc, ra + '.' + rc))
+
+    seen, deduped = set(), []
+    for pair in results:
+        key = (pair[0].lower(), pair[1].lower())
+        if key not in seen:
+            seen.add(key)
+            deduped.append(pair)
+    return deduped
+
 
 
 class SQLParser:
@@ -430,46 +591,48 @@ def auto_detect_final_table(summary: dict, sql_text: str = "") -> str:
 
 def build_er_html(summary: dict) -> str:
     import json as _json
-    from collections import deque as _deque
+    import re as _re
+    from collections import deque as _deque, defaultdict as _dd
 
-    FINAL = summary.get('final_table') or auto_detect_final_table(summary, summary.get('_sql_text',''))
+    FINAL = summary.get('final_table') or auto_detect_final_table(
+        summary, summary.get('_sql_text', ''))
 
-    rel_up = {}
-    for r in summary['relationships']:
-        rel_up.setdefault(r['to'], []).append(r)
+    # ── Collect ALL tables from the script ────────────────────────────────────
+    created_set  = set(summary['created_tables'])
+    temp_set     = set(summary['temp_tables'])
+    ext_set      = set(summary['external_tables'])
 
-    level_of = {}
-    queue = _deque([(FINAL, 0)])
-    dep_edges_raw = []
-    edge_set = set()
+    # Collect CTE names to exclude (they are inline aliases, not real tables)
+    cte_names = set()
+    sql_text = summary.get('_sql_text', '')
+    clean_sql = _re.sub(r'/\*.*?\*/', ' ', sql_text, flags=_re.DOTALL)
+    clean_sql = _re.sub(r'--[^\n]*', ' ', clean_sql)
+    for m in _re.finditer(r'\bWITH\b(.*?)(?=\bSELECT\b)', clean_sql,
+                          _re.IGNORECASE | _re.DOTALL):
+        for nm in _re.finditer(r'\b(\w+)\s+AS\s*\(', m.group(1), _re.IGNORECASE):
+            cte_names.add(nm.group(1).lower())
 
-    while queue:
-        tbl, depth = queue.popleft()
-        if tbl in level_of:
-            continue
-        level_of[tbl] = depth
-        for r in rel_up.get(tbl, []):
-            src = r['from']
-            key = (src, tbl)
-            if key not in edge_set:
-                edge_set.add(key)
-                dep_edges_raw.append(r)
-            if src not in level_of:
-                queue.append((src, depth + 1))
+    # All tables referenced anywhere (FROM/JOIN)
+    skip_kw = {'select','where','on','set','lateral','only','rows','unnest',
+                'values','null','true','false','current','row','all','distinct'}
+    all_referenced = set()
+    for m in _re.finditer(
+            r'\b(?:FROM|JOIN)\s+(?:\{\{[^}]+\}\}\.)?(\w+)', clean_sql, _re.IGNORECASE):
+        nm = m.group(1).lower()
+        if nm not in skip_kw and nm not in cte_names:
+            all_referenced.add(nm)
 
-    created  = set(summary['created_tables'])
-    temp_set = set(summary['temp_tables'])
+    all_tables = (created_set | temp_set | ext_set | all_referenced) - cte_names
 
-    def node_type(n):
-        if n == FINAL:    return 'final'
-        if n in created:  return 'ikg'
-        if n in temp_set: return 'tmp'
-        return 'ext'
+    # ── Column enrichment ─────────────────────────────────────────────────────
+    col_map = {}
+    for extra_sql in summary.get('_extra_sql_texts', []):
+        col_map.update(extract_table_columns(extra_sql))
+    if sql_text:
+        col_map.update(extract_table_columns(sql_text))
 
-    nodes_js = [{'id': n, 'level': lv, 'type': node_type(n)} for n, lv in level_of.items()]
-
-    # Build edges with cleaned alias and structured join keys
-    ALIAS_BLACKLIST = {
+    # ── Deduplicated edge list ─────────────────────────────────────────────────
+    ALIAS_BL = {
         'where','on','set','select','inner','left','right','full','outer','cross',
         'join','from','as','not','null','and','or','in','by','group','order',
         'having','limit','union','all','distinct','with','values','distributed',
@@ -477,51 +640,99 @@ def build_er_html(summary: dict) -> str:
         'like','ilike','is','true','false','into','insert','update','delete',
         'create','drop','alter','table','temp','temporary','partition','over',
         'window','rows','range','unbounded','preceding','following','current',
-        'row','natural','lateral','recursive','only','returning','returning',
-        'inner','model_data_temp_auto',
+        'row','natural','lateral','recursive','only','returning',
     }
-
     def clean_alias(a):
-        if not a:
-            return ''
+        if not a: return ''
         a = a.strip().lower()
-        if a in ALIAS_BLACKLIST:
-            return ''
-        # Must look like a real alias: letters/digits/underscore, not too long
-        import re
-        if not re.match(r'^[a-z_][a-z0-9_]{0,29}$', a):
-            return ''
+        if a in ALIAS_BL: return ''
+        if not _re.match(r'^[a-z_][a-z0-9_]{0,29}$', a): return ''
         return a
 
-    edges_js = []
-    for e in dep_edges_raw:
-        src_alias = clean_alias(e.get('alias', ''))
-        tgt_alias = clean_alias(e.get('target_alias', ''))
-
-        # Build join key list: each item is {"left": "a.col", "right": "b.col"}
-        # or {"col": "colname"} if both sides are the same column
-        jk_list = []
-        seen_jk = set()
-        for jc in e.get('join_cols', []):
+    merged_edges = {}
+    for r in summary['relationships']:
+        src_t = r['from']
+        tgt_t = r['to']
+        if src_t not in all_tables or tgt_t not in all_tables:
+            continue
+        key = (src_t, tgt_t)
+        if key not in merged_edges:
+            merged_edges[key] = {
+                'from':       src_t,
+                'to':         tgt_t,
+                'src_alias':  clean_alias(r.get('alias', '')),
+                'tgt_alias':  clean_alias(r.get('target_alias', '')),
+                'jk':         [],
+                'is_external': r.get('is_external', False),
+            }
+        # Merge join keys
+        existing = set(
+            tuple(j) if isinstance(j, list) else j
+            for j in merged_edges[key]['jk']
+        )
+        for jc in r.get('join_cols', []):
             if isinstance(jc, (list, tuple)) and len(jc) == 2:
-                l, r2 = str(jc[0]), str(jc[1])
-                key = (l.lower(), r2.lower())
-                if key not in seen_jk:
-                    seen_jk.add(key)
-                    jk_list.append({'left': l, 'right': r2})
-            elif isinstance(jc, str) and jc:
-                key = jc.lower()
-                if key not in seen_jk:
-                    seen_jk.add(key)
-                    jk_list.append({'col': jc})
+                item = [str(jc[0]), str(jc[1])]
+                k2 = tuple(item)
+            else:
+                item = str(jc)
+                k2 = item
+            if k2 not in existing:
+                existing.add(k2)
+                merged_edges[key]['jk'].append(
+                    {'left': item[0], 'right': item[1]}
+                    if isinstance(item, list) else {'col': item}
+                )
 
+    edges_list = list(merged_edges.values())
+
+    # ── Topological levels for ALL tables ─────────────────────────────────────
+    in_edges  = _dd(set)
+    out_edges = _dd(set)
+    for e in edges_list:
+        in_edges[e['to']].add(e['from'])
+        out_edges[e['from']].add(e['to'])
+
+    in_deg = {t: len(in_edges[t]) for t in all_tables}
+    queue  = _deque([t for t in all_tables if in_deg[t] == 0])
+    level  = {t: 0 for t in queue}
+    while queue:
+        t = queue.popleft()
+        for nxt in out_edges[t]:
+            if nxt in all_tables:
+                in_deg[nxt] = max(0, in_deg.get(nxt, 0) - 1)
+                level[nxt]  = max(level.get(nxt, 0), level[t] + 1)
+                if in_deg[nxt] == 0:
+                    queue.append(nxt)
+    for t in all_tables:
+        if t not in level:
+            level[t] = 0
+
+    # ── Build node type ────────────────────────────────────────────────────────
+    def node_type(n):
+        if n == FINAL:        return 'final'
+        if n in created_set:  return 'ikg'
+        if n in temp_set:     return 'tmp'
+        return 'ext'
+
+    nodes_js = []
+    for t in all_tables:
+        nodes_js.append({
+            'id':    t,
+            'level': level.get(t, 0),
+            'type':  node_type(t),
+            'cols':  col_map.get(t, []),
+        })
+
+    edges_js = []
+    for e in edges_list:
         edges_js.append({
-            'from':         e['from'],
-            'to':           e['to'],
-            'jk':           jk_list,
-            'src_alias':    src_alias,
-            'tgt_alias':    tgt_alias,
-            'is_external':  e.get('is_external', False),
+            'from':        e['from'],
+            'to':          e['to'],
+            'jk':          e['jk'],
+            'src_alias':   e['src_alias'],
+            'tgt_alias':   e['tgt_alias'],
+            'is_external': e['is_external'],
         })
 
     data_json = _json.dumps(
@@ -529,178 +740,172 @@ def build_er_html(summary: dict) -> str:
         separators=(',', ':')
     )
 
+    # ── CSS ───────────────────────────────────────────────────────────────────
     css = """
 *, *::before, *::after { box-sizing:border-box; margin:0; padding:0; }
-body { background:#0f1117; color:#e2e8f0;
+body { background:#090e18; color:#e2e8f0;
   font-family:'Segoe UI',system-ui,sans-serif;
   overflow:hidden; height:100vh; display:flex; flex-direction:column; }
 
-#header { background:linear-gradient(90deg,#1e3a5f,#0f2744);
-  padding:11px 20px; display:flex; align-items:center; gap:14px;
-  border-bottom:1px solid #1e2d40; flex-shrink:0; }
-#header h1 { font-size:.95rem; font-weight:700; color:#63b3ed; }
-.sub { font-size:.68rem; color:#3d5070; margin-top:1px; }
-.sp { padding:3px 10px; border-radius:20px; font-size:.67rem; font-weight:600; }
-.sp-g { background:#1a4731; color:#68d391; border:1px solid #2f855a44; }
-.sp-b { background:#1a365d; color:#63b3ed; border:1px solid #2b6cb044; }
-.sp-p { background:#322659; color:#b794f4; border:1px solid #6b46c144; }
+#hdr { background:linear-gradient(90deg,#1a3356,#0d2040);
+  padding:10px 18px; display:flex; align-items:center; gap:12px;
+  border-bottom:1px solid #1a2840; flex-shrink:0; }
+#hdr h1 { font-size:.92rem; font-weight:700; color:#5aa8e8; }
+.sub { font-size:.67rem; color:#2d4060; margin-top:1px; }
+.sp { padding:2px 9px; border-radius:20px; font-size:.65rem; font-weight:600; }
+.sp-g { background:#0f3020; color:#4ec87a; border:1px solid #2a6040; }
+.sp-b { background:#0f2045; color:#5aa8e8; border:1px solid #1e4080; }
+.sp-p { background:#1e1040; color:#a070e8; border:1px solid #3a2070; }
+.sp-o { background:#2a1500; color:#e09050; border:1px solid #603010; }
 
-#toolbar { background:#161b27; border-bottom:1px solid #1e2d40;
-  padding:6px 14px; display:flex; align-items:center; gap:7px;
+#tb { background:#0d1525; border-bottom:1px solid #1a2535;
+  padding:5px 12px; display:flex; align-items:center; gap:6px;
   flex-shrink:0; flex-wrap:wrap; }
-.tbtn { background:#1e2535; color:#8a9ab0; border:1px solid #252f40;
-  border-radius:5px; padding:4px 12px; font-size:.73rem; cursor:pointer; transition:all .12s; }
-.tbtn:hover { background:#2a3548; color:#e2e8f0; }
-.tbtn.on { background:#17304d; color:#63b3ed; border-color:#2b4a70; }
-.tsep { width:1px; height:20px; background:#1e2d40; margin:0 3px; }
-#srch { background:#1a2230; color:#e2e8f0; border:1px solid #252f40;
-  border-radius:5px; padding:4px 11px; font-size:.73rem; width:190px; outline:none; }
-#srch:focus { border-color:#3a6090; }
-#srch::placeholder { color:#2d3a4a; }
-#legend { display:flex; gap:12px; margin-left:auto; align-items:center; }
-.leg { display:flex; align-items:center; gap:5px; font-size:.67rem; color:#4a5a6a; }
-.leg-b { width:13px; height:9px; border-radius:2px; }
+.btn { background:#111d30; color:#7a90a8; border:1px solid #1e2d40;
+  border-radius:4px; padding:4px 11px; font-size:.71rem; cursor:pointer; transition:all .12s; }
+.btn:hover { background:#1a2d44; color:#c8d8e8; }
+.btn.on { background:#122040; color:#5aa8e8; border-color:#1e4070; }
+.sep { width:1px; height:18px; background:#1a2535; margin:0 2px; }
+#srch { background:#111d30; color:#e2e8f0; border:1px solid #1e2d40;
+  border-radius:4px; padding:4px 10px; font-size:.71rem; width:175px; outline:none; }
+#srch:focus { border-color:#2a5090; }
+#srch::placeholder { color:#2a3848; }
+#leg { display:flex; gap:10px; margin-left:auto; align-items:center; }
+.li { display:flex; align-items:center; gap:4px; font-size:.65rem; color:#3a5068; }
+.lb { width:12px; height:8px; border-radius:2px; }
 
 #wrap { flex:1; position:relative; overflow:hidden; display:flex; }
-#cv-area { flex:1; position:relative; overflow:hidden; background:#0b0f18; }
+#cva { flex:1; position:relative; overflow:hidden; background:#090e18; }
 #cv { position:absolute; top:0; left:0; display:block; cursor:grab; }
 
-/* ── DETAIL PANEL ─────────────────────────────────────────────── */
-#panel {
-  width:430px; min-width:430px; background:#0d1525;
-  border-left:1px solid #1a2535;
-  display:none; flex-direction:column; overflow:hidden; flex-shrink:0;
-}
+#panel { width:420px; min-width:420px; background:#0b1422;
+  border-left:1px solid #162030; display:none; flex-direction:column;
+  overflow:hidden; flex-shrink:0; }
 #panel.open { display:flex; }
-
-#ph {
-  background:#0a1220; padding:12px 14px 10px;
-  border-bottom:1px solid #1a2535; flex-shrink:0;
-}
-#ph-title { font-size:.9rem; font-weight:700; color:#7ec8f8;
-  word-break:break-all; margin-bottom:4px; padding-right:22px; }
-#ph-meta { font-size:.69rem; }
-#ph-close { position:absolute; right:14px; top:14px;
-  background:none; border:none; color:#3a4a5a; cursor:pointer;
-  font-size:1.1rem; transition:color .1s; }
-#ph-close:hover { color:#e2e8f0; }
-
+#ph { background:#091020; padding:11px 13px 9px; border-bottom:1px solid #162030;
+  flex-shrink:0; position:relative; }
+#ph-title { font-size:.87rem; font-weight:700; color:#5aa8e8;
+  word-break:break-all; margin-bottom:3px; padding-right:24px; }
+#ph-meta { font-size:.67rem; }
+#ph-x { position:absolute; right:12px; top:12px; background:none; border:none;
+  color:#2a3848; cursor:pointer; font-size:1rem; transition:color .1s; }
+#ph-x:hover { color:#e2e8f0; }
 #pb { flex:1; overflow-y:auto; }
 #pb::-webkit-scrollbar { width:4px; }
-#pb::-webkit-scrollbar-track { background:#0a1018; }
-#pb::-webkit-scrollbar-thumb { background:#1e2d40; border-radius:3px; }
+#pb::-webkit-scrollbar-track { background:#080f1c; }
+#pb::-webkit-scrollbar-thumb { background:#1a2840; border-radius:3px; }
 
-.sec { border-bottom:1px solid #111d2b; }
-.sec-hdr {
-  padding:9px 14px; font-size:.68rem; font-weight:700;
-  text-transform:uppercase; letter-spacing:.8px;
-  display:flex; align-items:center; gap:8px;
-  cursor:pointer; user-select:none; transition:background .1s;
-  color:#3a5a7a;
-}
-.sec-hdr:hover { background:#0f1c2d; }
-.sec-hdr.src-hdr { color:#5a9060; }
-.sec-hdr.dst-hdr { color:#8a6020; }
-.sec-cnt { margin-left:auto; background:#111d2b; color:#4a7090;
-  font-size:.63rem; padding:1px 8px; border-radius:10px; font-weight:700; }
-.arr { font-size:.65rem; color:#2a3a4a; transition:transform .15s; }
-.sec-hdr.collapsed .arr { transform:rotate(-90deg); }
-.sec-body { display:block; }
-.sec-hdr.collapsed + .sec-body { display:none; }
+.sec { border-bottom:1px solid #0f1e30; }
+.sechdr { padding:8px 13px; font-size:.66rem; font-weight:700; text-transform:uppercase;
+  letter-spacing:.8px; display:flex; align-items:center; gap:7px;
+  cursor:pointer; user-select:none; transition:background .1s; }
+.sechdr:hover { background:#0d1a2a; }
+.sechdr.cols-hdr { color:#3a6888; }
+.sechdr.src-hdr  { color:#2a6840; }
+.sechdr.dst-hdr  { color:#6a4010; }
+.seccnt { margin-left:auto; background:#0f1e2e; color:#3a6888;
+  font-size:.61rem; padding:1px 7px; border-radius:10px; font-weight:700; }
+.arr { font-size:.62rem; color:#1e2d3e; transition:transform .15s; }
+.sechdr.collapsed .arr { transform:rotate(-90deg); }
+.secbody { display:block; }
+.sechdr.collapsed + .secbody { display:none; }
 
-/* table row */
-.trow { padding:8px 12px 8px 16px; border-bottom:1px solid #0d1828;
+.col-row { padding:4px 13px 4px 22px; display:flex; align-items:center; gap:8px;
+  border-bottom:1px solid #0a1520; font-size:.73rem; }
+.col-row:last-child { border-bottom:none; }
+.col-idx { color:#1e3040; font-size:.6rem; min-width:18px; font-family:monospace; }
+.col-name { color:#90b8d8; font-family:'Consolas','Courier New',monospace; }
+
+.trow { padding:7px 11px 7px 15px; border-bottom:1px solid #0a1828;
   cursor:pointer; transition:background .1s; }
-.trow:hover { background:#0f1c2e; }
+.trow:hover { background:#0d1c2e; }
 .trow:last-child { border-bottom:none; }
-.trow-top { display:flex; align-items:flex-start; gap:8px; margin-bottom:5px; }
-.tdot { width:8px; height:8px; border-radius:2px; flex-shrink:0; margin-top:3px; }
-.tname { font-size:.77rem; font-weight:600; color:#c0d0e0; flex:1;
-  word-break:break-all; line-height:1.4; }
-.talias { font-size:.64rem; color:#2d5070; background:#091525;
-  border:1px solid #152535; border-radius:4px;
-  padding:1px 7px; font-family:'Consolas','Courier New',monospace;
-  white-space:nowrap; flex-shrink:0; align-self:flex-start; }
+.trow-top { display:flex; align-items:flex-start; gap:7px; margin-bottom:4px; }
+.tdot { width:7px; height:7px; border-radius:2px; flex-shrink:0; margin-top:4px; }
+.tname { font-size:.75rem; font-weight:600; color:#b0c8d8; flex:1; word-break:break-all; }
+.talias { font-size:.62rem; color:#1e4060; background:#081522;
+  border:1px solid #102030; border-radius:3px; padding:1px 6px;
+  font-family:'Consolas','Courier New',monospace; white-space:nowrap; }
+.jktbl { width:calc(100% - 14px); border-collapse:collapse; margin:2px 0 2px 14px; }
+.jktbl th { font-size:.59rem; color:#1e4050; font-weight:700; text-transform:uppercase;
+  letter-spacing:.4px; padding:2px 6px 2px 0; border-bottom:1px solid #0f1e2e; }
+.jktbl td { font-size:.66rem; font-family:'Consolas','Courier New',monospace;
+  padding:2px 6px 2px 0; vertical-align:top; border-bottom:1px solid #081520; }
+.jktbl tr:last-child td { border-bottom:none; }
+.jk-s { color:#4ec87a; } .jk-e { color:#1e2d3a; padding:0 2px; } .jk-d { color:#e8a040; }
+.no-jk { font-size:.62rem; color:#162028; padding:2px 0 2px 14px; font-style:italic; }
 
-/* join keys table */
-.jk-table { width:100%; border-collapse:collapse;
-  margin:0 0 4px 16px; width:calc(100% - 16px); }
-.jk-table th { font-size:.61rem; color:#2a4a5a; font-weight:600;
-  text-transform:uppercase; letter-spacing:.5px;
-  padding:3px 8px 3px 0; border-bottom:1px solid #0f1e2e; }
-.jk-table td { font-size:.68rem; font-family:'Consolas','Courier New',monospace;
-  padding:3px 8px 3px 0; color:#8ab0c0; vertical-align:top;
-  border-bottom:1px solid #0a1520; }
-.jk-table tr:last-child td { border-bottom:none; }
-.jk-src { color:#68d391; }
-.jk-dst { color:#f6ad55; }
-.jk-eq  { color:#2a3a4a; padding:0 4px; }
-.no-jk  { font-size:.65rem; color:#1e2d3a; padding:3px 0 3px 16px;
-  font-style:italic; }
-
-#sb { background:#161b27; border-top:1px solid #1a2535;
-  padding:3px 14px; font-size:.67rem; color:#2d3a4a;
-  display:flex; gap:18px; flex-shrink:0; }
-#sb b { color:#3d4a5a; }
+#sb { background:#0d1525; border-top:1px solid #162030; padding:3px 13px;
+  font-size:.65rem; color:#1e3040; display:flex; gap:16px; flex-shrink:0; }
+#sb b { color:#2a4050; }
 """
 
     body = """
-<div id="header">
+<div id="hdr">
   <div>
-    <div id="h-title">&#128202; """ + FINAL + """ &mdash; Table Dependency ER Diagram</div>
-    <div class="sub">Click any node to see source/destination tables with aliases and join keys</div>
+    <div id="h1">&#128202; """ + FINAL + """ &mdash; Full SQL Pipeline ER Diagram</div>
+    <div class="sub">All tables, dependencies and relationships &bull; Drag boxes to reposition &bull; Click any table for details</div>
   </div>
-  <span class="sp sp-g" id="sp-n">-- nodes</span>
-  <span class="sp sp-b" id="sp-e">-- edges</span>
-  <span class="sp sp-p" id="sp-l">-- levels</span>
+  <span class="sp sp-g"  id="sp-n">-- nodes</span>
+  <span class="sp sp-b"  id="sp-e">-- edges</span>
+  <span class="sp sp-p"  id="sp-l">-- levels</span>
+  <span class="sp sp-o"  id="sp-i">-- isolated</span>
 </div>
-<div id="toolbar">
-  <button class="tbtn" onclick="resetView()">&#8635; Reset</button>
-  <button class="tbtn" onclick="zoomIn()">+ Zoom</button>
-  <button class="tbtn" onclick="zoomOut()">&#8722; Zoom</button>
-  <div class="tsep"></div>
-  <input id="srch" placeholder="&#128269; Search table..." oninput="onSearch()">
-  <button class="tbtn" onclick="clearSearch()">&#10005;</button>
-  <div class="tsep"></div>
-  <button class="tbtn on" id="btn-ikg" onclick="toggle('ikg')">IKG</button>
-  <button class="tbtn on" id="btn-tmp" onclick="toggle('tmp')">Temp</button>
-  <button class="tbtn on" id="btn-ext" onclick="toggle('ext')">External</button>
-  <div class="tsep"></div>
-  <button class="tbtn" onclick="fitLv(1)">Lv 1</button>
-  <button class="tbtn" onclick="fitLv(2)">Lv 1-2</button>
-  <button class="tbtn" onclick="fitLv(3)">Lv 1-3</button>
-  <button class="tbtn" onclick="fitAll()">All</button>
-  <div id="legend">
-    <div class="leg"><div class="leg-b" style="background:#2ecc71;border:1px solid #27ae60"></div>Final</div>
-    <div class="leg"><div class="leg-b" style="background:#1a5080;border:1px solid #2980b9"></div>IKG</div>
-    <div class="leg"><div class="leg-b" style="background:#3d1a6e;border:1px solid #8e44ad"></div>Temp</div>
-    <div class="leg"><div class="leg-b" style="background:#4a2800;border:1px solid #e67e22"></div>External</div>
+<div id="tb">
+  <button class="btn" onclick="resetView()">&#8635; Reset</button>
+  <button class="btn" onclick="zoomIn()">+ Zoom</button>
+  <button class="btn" onclick="zoomOut()">&#8722; Zoom</button>
+  <div class="sep"></div>
+  <input id="srch" placeholder="&#128269; Search..." oninput="onSearch()">
+  <button class="btn" onclick="clearSearch()">&#10005;</button>
+  <div class="sep"></div>
+  <button class="btn on" id="btn-ikg" onclick="toggle('ikg')">IKG</button>
+  <button class="btn on" id="btn-tmp" onclick="toggle('tmp')">Temp</button>
+  <button class="btn on" id="btn-ext" onclick="toggle('ext')">External</button>
+  <div class="sep"></div>
+  <button class="btn" onclick="fitLv(1)">Lv 1</button>
+  <button class="btn" onclick="fitLv(3)">Lv 1-3</button>
+  <button class="btn" onclick="fitLv(6)">Lv 1-6</button>
+  <button class="btn" onclick="fitAll()">All</button>
+  <div id="leg">
+    <div class="li"><div class="lb" style="background:#2ecc71"></div>Final</div>
+    <div class="li"><div class="lb" style="background:#1a5888"></div>IKG</div>
+    <div class="li"><div class="lb" style="background:#3d1a6e"></div>Temp</div>
+    <div class="li"><div class="lb" style="background:#5a2800"></div>External</div>
   </div>
 </div>
 <div id="wrap">
-  <div id="cv-area"><canvas id="cv"></canvas></div>
+  <div id="cva"><canvas id="cv"></canvas></div>
   <div id="panel">
-    <div id="ph" style="position:relative;">
-      <button id="ph-close" onclick="closePanel()">&#10005;</button>
+    <div id="ph">
+      <button id="ph-x" onclick="closePanel()">&#10005;</button>
       <div id="ph-title"></div>
       <div id="ph-meta"></div>
     </div>
     <div id="pb">
       <div class="sec">
-        <div class="sec-hdr src-hdr" id="hdr-src" onclick="toggleSec('src')">
-          &#8593;&nbsp;Source Tables&nbsp;<span style="color:#2a5a30;font-weight:400;font-size:.62rem;text-transform:none">(inputs to this table)</span>
-          <span class="sec-cnt" id="cnt-src">0</span>
+        <div class="sechdr cols-hdr" id="hdr-cols" onclick="toggleSec('cols')">
+          &#128196;&nbsp;Columns
+          <span class="seccnt" id="cnt-cols">0</span>
           <span class="arr">&#9660;</span>
         </div>
-        <div class="sec-body" id="body-src"></div>
+        <div class="secbody" id="body-cols"></div>
       </div>
       <div class="sec">
-        <div class="sec-hdr dst-hdr collapsed" id="hdr-dst" onclick="toggleSec('dst')">
-          &#8595;&nbsp;Destination Tables&nbsp;<span style="color:#5a3a10;font-weight:400;font-size:.62rem;text-transform:none">(tables that use this table)</span>
-          <span class="sec-cnt" id="cnt-dst">0</span>
+        <div class="sechdr src-hdr" id="hdr-src" onclick="toggleSec('src')">
+          &#8593;&nbsp;Source Tables&nbsp;<em style="color:#1a4828;font-weight:400;font-size:.6rem;text-transform:none">(inputs)</em>
+          <span class="seccnt" id="cnt-src">0</span>
           <span class="arr">&#9660;</span>
         </div>
-        <div class="sec-body" id="body-dst"></div>
+        <div class="secbody" id="body-src"></div>
+      </div>
+      <div class="sec">
+        <div class="sechdr dst-hdr collapsed" id="hdr-dst" onclick="toggleSec('dst')">
+          &#8595;&nbsp;Destination Tables&nbsp;<em style="color:#482810;font-weight:400;font-size:.6rem;text-transform:none">(outputs)</em>
+          <span class="seccnt" id="cnt-dst">0</span>
+          <span class="arr">&#9660;</span>
+        </div>
+        <div class="secbody" id="body-dst"></div>
       </div>
     </div>
   </div>
@@ -708,77 +913,96 @@ body { background:#0f1117; color:#e2e8f0;
 <div id="sb">
   <span>Zoom: <b id="sb-z">100%</b></span>
   <span>Visible: <b id="sb-v">0</b></span>
-  <span>Scroll=zoom &bull; Drag=pan &bull; Click node for details</span>
+  <span>Drag table to move &bull; Drag background to pan &bull; Scroll to zoom</span>
 </div>
 """
 
     js = "const RAW=" + data_json + ";\n" + r"""
-const STYLE={
-  final:{fill:'#0a2a18',stroke:'#2ecc71',text:'#90f0b0'},
-  ikg:  {fill:'#0a1c30',stroke:'#2980b9',text:'#80b8e8'},
-  tmp:  {fill:'#180a2e',stroke:'#8e44ad',text:'#c080e8'},
-  ext:  {fill:'#261200',stroke:'#e67e22',text:'#f0a860'},
+const ST = {
+  final:{ fill:'#081e10', stroke:'#2ecc71', hdr:'#0a3018', text:'#7ae8a0', sub:'#2a6040' },
+  ikg:  { fill:'#071525', stroke:'#2a78b8', hdr:'#0a1e38', text:'#6ab0d8', sub:'#1a4060' },
+  tmp:  { fill:'#12082a', stroke:'#7840c8', hdr:'#180d38', text:'#a878e8', sub:'#3a1870' },
+  ext:  { fill:'#1a0a00', stroke:'#c06020', hdr:'#240e00', text:'#e09050', sub:'#602810' },
 };
-const TC={final:'#2ecc71',ikg:'#2980b9',tmp:'#8e44ad',ext:'#e67e22'};
-const TL={final:'Final Output',ikg:'IKG Table',tmp:'Temp Table',ext:'External/EDW'};
+const TC = { final:'#2ecc71', ikg:'#2a78b8', tmp:'#7840c8', ext:'#c06020' };
+const TL = { final:'Final Output', ikg:'IKG Table', tmp:'Temp Table', ext:'External/EDW' };
 
-const NM={},EO={},EI={};
+const HDR_H=28, ROW_H=16, PREVIEW_N=4, FOOTER_H=10, NODE_W_MIN=190;
+
+function nodeH(n){ var r=Math.min((n.cols||[]).length,PREVIEW_N); return HDR_H+(r>0?r*ROW_H+6:0)+FOOTER_H; }
+function nodeW(n){ return Math.max(NODE_W_MIN, n.id.length*7.4+32); }
+
+const NM={}, EO={}, EI={};
 RAW.nodes.forEach(function(n){
-  n.w=Math.max(180,n.id.length*7.2+32); n.h=36; n.x=0; n.y=0;
+  n.w=nodeW(n); n.h=nodeH(n); n.x=0; n.y=0;
   NM[n.id]=n; EO[n.id]=[]; EI[n.id]=[];
 });
 RAW.edges.forEach(function(e){
-  if(NM[e.from]&&NM[e.to]){EO[e.from].push(e);EI[e.to].push(e);}
+  if(NM[e.from]&&NM[e.to]){ EO[e.from].push(e); EI[e.to].push(e); }
 });
 
+// ── Layout: level-based columns, no overlaps ──────────────────────────────────
 function layout(){
   var byLv={};
-  RAW.nodes.forEach(function(n){if(!byLv[n.level])byLv[n.level]=[];byLv[n.level].push(n);});
-  var maxLv=Math.max.apply(null,RAW.nodes.map(function(n){return n.level;}));
-  var CW=260,RH=52,PX=60,PY=50;
+  RAW.nodes.forEach(function(n){
+    if(!byLv[n.level]) byLv[n.level]=[];
+    byLv[n.level].push(n);
+  });
+  var maxLv=0;
+  RAW.nodes.forEach(function(n){if(n.level>maxLv)maxLv=n.level;});
+
+  // Sort each column by connectivity desc
   Object.keys(byLv).forEach(function(lv){
-    var col=byLv[lv];
-    col.sort(function(a,b){return(EO[b.id].length+EI[b.id].length)-(EO[a.id].length+EI[a.id].length);});
-    col.forEach(function(n,i){n.x=PX+(maxLv-lv)*CW;n.y=PY+i*RH;});
+    byLv[lv].sort(function(a,b){
+      return (EO[b.id].length+EI[b.id].length)-(EO[a.id].length+EI[a.id].length);
+    });
   });
-  for(var i=0;i<80;i++)forceStep();
-}
-function forceStep(){
-  var f={};
-  RAW.nodes.forEach(function(n){f[n.id]={x:0,y:0};});
-  for(var i=0;i<RAW.nodes.length;i++){
-    for(var j=i+1;j<RAW.nodes.length;j++){
-      var a=RAW.nodes[i],b=RAW.nodes[j];
-      var dx=b.x-a.x||.1,dy=b.y-a.y||.1,d=Math.sqrt(dx*dx+dy*dy)||1,rep=500/(d*d);
-      f[a.id].x-=rep*dx/d;f[a.id].y-=rep*dy/d;f[b.id].x+=rep*dx/d;f[b.id].y+=rep*dy/d;
-    }
+
+  var COL_GAP=55, ROW_GAP=18, PAD_X=60, PAD_Y=50;
+
+  // Max width per level
+  var maxW={};
+  Object.keys(byLv).forEach(function(lv){
+    var mw=0; byLv[lv].forEach(function(n){if(n.w>mw)mw=n.w;}); maxW[lv]=mw;
+  });
+
+  // Build column x positions: level 0 = rightmost (final table)
+  var sortedLvs=Object.keys(byLv).map(Number).sort(function(a,b){return a-b;});
+  var xCursor=PAD_X, colX={};
+  for(var li=sortedLvs.length-1;li>=0;li--){
+    var lv=sortedLvs[li]; colX[lv]=xCursor; xCursor+=maxW[lv]+COL_GAP;
   }
-  RAW.edges.forEach(function(e){
-    var a=NM[e.from],b=NM[e.to];if(!a||!b)return;
-    var dx=b.x-a.x,dy=b.y-a.y,att=0.04;
-    f[a.id].x+=att*dx;f[a.id].y+=att*dy;f[b.id].x-=att*dx;f[b.id].y-=att*dy;
+  var totalW=xCursor;
+  var flipped={};
+  sortedLvs.forEach(function(lv){ flipped[lv]=totalW-colX[lv]-maxW[lv]; });
+
+  // Assign y: pack nodes with no overlap
+  Object.keys(byLv).forEach(function(lv){
+    var yCursor=PAD_Y;
+    byLv[lv].forEach(function(n){
+      n.x=flipped[lv]; n.y=yCursor; yCursor+=n.h+ROW_GAP;
+    });
   });
-  RAW.nodes.forEach(function(n){n.x+=f[n.id].x*.8;n.y+=f[n.id].y*.8;});
 }
 layout();
 
-var cvA=document.getElementById('cv-area'),cv=document.getElementById('cv'),ctx=cv.getContext('2d');
-var tx=0,ty=0,sc=1,maxLv=99,showT={ikg:true,tmp:true,ext:true},srchQ='',hlId=null;
+var cva=document.getElementById('cva'), cv=document.getElementById('cv'), ctx=cv.getContext('2d');
+var tx=0,ty=0,sc=1, maxLv=99, showT={ikg:true,tmp:true,ext:true}, srchQ='', hlId=null;
 
 function isVis(n){
-  if(n.level>maxLv)return false;
-  if(n.type!=='final'&&!showT[n.type])return false;
-  if(srchQ&&n.id.indexOf(srchQ)<0)return false;
+  if(n.level>maxLv) return false;
+  if(n.type!=='final'&&!showT[n.type]) return false;
+  if(srchQ&&n.id.indexOf(srchQ)<0) return false;
   return true;
 }
 
 function render(){
   ctx.clearRect(0,0,cv.width,cv.height);
-  ctx.save();ctx.translate(tx,ty);ctx.scale(sc,sc);
+  ctx.save(); ctx.translate(tx,ty); ctx.scale(sc,sc);
   drawGrid();
   RAW.edges.forEach(function(e){
     var a=NM[e.from],b=NM[e.to];
-    if(!a||!b||!isVis(a)||!isVis(b))return;
+    if(!a||!b||!isVis(a)||!isVis(b)) return;
     drawEdge(e,a,b);
   });
   RAW.nodes.forEach(function(n){if(isVis(n))drawNode(n);});
@@ -788,47 +1012,63 @@ function render(){
 
 function drawGrid(){
   var gs=40,ox=-tx/sc,oy=-ty/sc,W=cv.width/sc,H=cv.height/sc;
-  ctx.strokeStyle='#10192a';ctx.lineWidth=1;
+  ctx.strokeStyle='#0c1525'; ctx.lineWidth=1;
   for(var x=Math.floor(ox/gs)*gs;x<ox+W;x+=gs){ctx.beginPath();ctx.moveTo(x,oy);ctx.lineTo(x,oy+H);ctx.stroke();}
   for(var y=Math.floor(oy/gs)*gs;y<oy+H;y+=gs){ctx.beginPath();ctx.moveTo(ox,y);ctx.lineTo(ox+W,y);ctx.stroke();}
 }
 
 function drawEdge(e,a,b){
   var hl=hlId&&(e.from===hlId||e.to===hlId);
-  var x1=a.x+a.w,y1=a.y+a.h/2,x2=b.x,y2=b.y+b.h/2,cp=Math.abs(x2-x1)*.42;
-  ctx.beginPath();ctx.moveTo(x1,y1);ctx.bezierCurveTo(x1+cp,y1,x2-cp,y2,x2,y2);
-  ctx.strokeStyle=hl?(e.to===hlId?'#4adb80':'#f0a840'):(srchQ?'#151f2e':'#1e2d42');
-  ctx.lineWidth=hl?2:1;ctx.globalAlpha=hl?1:.5;ctx.stroke();ctx.globalAlpha=1;
+  var x1=a.x+a.w,y1=a.y+a.h/2,x2=b.x,y2=b.y+b.h/2,cp=Math.abs(x2-x1)*0.4;
+  ctx.beginPath(); ctx.moveTo(x1,y1);
+  ctx.bezierCurveTo(x1+cp,y1,x2-cp,y2,x2,y2);
+  ctx.strokeStyle=hl?(e.to===hlId?'#3adc80':'#e89030'):(srchQ?'#111d2e':'#182840');
+  ctx.lineWidth=hl?2:1; ctx.globalAlpha=hl?1:.45; ctx.stroke(); ctx.globalAlpha=1;
   if(hl){
-    var col=e.to===hlId?'#4adb80':'#f0a840';
-    var ang=Math.atan2(y2-(y1+(y2-y1)*.8),x2-(x1+(x2-x1)*.8)),as=7;
-    ctx.beginPath();ctx.moveTo(x2,y2);
+    var col=e.to===hlId?'#3adc80':'#e89030';
+    var ang=Math.atan2(y2-(y1+(y2-y1)*.8),x2-(x1+(x2-x1)*.8)),as=6;
+    ctx.beginPath(); ctx.moveTo(x2,y2);
     ctx.lineTo(x2-as*Math.cos(ang-.4),y2-as*Math.sin(ang-.4));
     ctx.lineTo(x2-as*Math.cos(ang+.4),y2-as*Math.sin(ang+.4));
-    ctx.closePath();ctx.fillStyle=col;ctx.fill();
+    ctx.closePath(); ctx.fillStyle=col; ctx.fill();
   }
 }
 
 function drawNode(n){
-  var s=STYLE[n.type],isFinal=n.id===RAW.final,isHl=hlId===n.id;
+  var s=ST[n.type],isFinal=(n.id===RAW.final),isHl=(hlId===n.id);
   var conn=hlId&&(EO[n.id].some(function(e){return e.to===hlId;})||EI[n.id].some(function(e){return e.from===hlId;}));
   var dim=hlId&&!isHl&&!conn;
-  if(isHl||isFinal){ctx.shadowColor=s.stroke;ctx.shadowBlur=isHl?18:10;}
-  ctx.globalAlpha=dim?.18:1;
-  ctx.fillStyle=s.fill;rrect(n.x,n.y,n.w,n.h,6);ctx.fill();
-  ctx.strokeStyle=isHl?'#ffffff':(srchQ&&n.id.indexOf(srchQ)>=0?'#f0d060':s.stroke);
-  ctx.lineWidth=isHl||isFinal?2:1;rrect(n.x,n.y,n.w,n.h,6);ctx.stroke();
+  if(isHl||isFinal){ctx.shadowColor=s.stroke;ctx.shadowBlur=isHl?16:8;}
+  ctx.globalAlpha=dim?0.2:1;
+  ctx.fillStyle=s.fill; rrect(n.x,n.y,n.w,n.h,7); ctx.fill();
+  ctx.fillStyle=s.hdr; rrect(n.x,n.y,n.w,HDR_H,{tl:7,tr:7,bl:0,br:0}); ctx.fill();
+  ctx.strokeStyle=isHl?'#fff':(srchQ&&n.id.indexOf(srchQ)>=0?'#e8d040':s.stroke);
+  ctx.lineWidth=isHl||isFinal?2:1; rrect(n.x,n.y,n.w,n.h,7); ctx.stroke();
   ctx.shadowBlur=0;
-  ctx.fillStyle=s.stroke;rrect(n.x,n.y,n.w,3,{tl:6,tr:6,bl:0,br:0});ctx.fill();
-  ctx.fillStyle=dim?'#1e2a38':s.text;
+  ctx.fillStyle=s.stroke; rrect(n.x,n.y,n.w,3,{tl:7,tr:7,bl:0,br:0}); ctx.fill();
+  ctx.fillStyle=dim?'#1e2d3e':s.text;
   ctx.font=(isFinal?'bold ':'')+' 10.5px Segoe UI,system-ui,sans-serif';
-  ctx.textAlign='left';ctx.textBaseline='middle';
-  var lbl=n.id,mw=n.w-36;
-  while(ctx.measureText(lbl).width>mw&&lbl.length>4)lbl=lbl.slice(0,-4)+'...';
-  ctx.fillText(lbl,n.x+10,n.y+n.h/2+2);
-  ctx.font='8px Segoe UI,system-ui,sans-serif';
-  ctx.fillStyle=dim?'#1e2a38':s.stroke+'99';ctx.textAlign='right';
-  ctx.fillText(isFinal?'OUTPUT':'L'+n.level,n.x+n.w-5,n.y+n.h/2+2);
+  ctx.textAlign='left'; ctx.textBaseline='middle';
+  var lbl=n.id,mw=n.w-52;
+  while(ctx.measureText(lbl).width>mw&&lbl.length>4) lbl=lbl.slice(0,-4)+'...';
+  ctx.fillText(lbl,n.x+10,n.y+HDR_H/2+1);
+  ctx.font='8px Segoe UI,system-ui,sans-serif'; ctx.fillStyle=dim?'#1a2838':s.sub; ctx.textAlign='right';
+  ctx.fillText(isFinal?'OUT':'L'+n.level,n.x+n.w-5,n.y+HDR_H/2+1);
+  if((n.cols||[]).length>0&&!dim){
+    var cols=n.cols.slice(0,PREVIEW_N);
+    ctx.font='9px Consolas,Courier New,monospace'; ctx.textAlign='left';
+    cols.forEach(function(col,i){
+      var cy=n.y+HDR_H+5+i*ROW_H+ROW_H/2;
+      ctx.fillStyle=s.sub; ctx.beginPath(); ctx.arc(n.x+14,cy,2,0,Math.PI*2); ctx.fill();
+      ctx.fillStyle='#5a7888';
+      var clbl=col; while(ctx.measureText(clbl).width>n.w-28&&clbl.length>4) clbl=clbl.slice(0,-3)+'..';
+      ctx.fillText(clbl,n.x+21,cy+1);
+    });
+    if(n.cols.length>PREVIEW_N){
+      ctx.fillStyle=s.sub; ctx.font='8px Segoe UI,system-ui,sans-serif';
+      ctx.fillText('+'+(n.cols.length-PREVIEW_N)+' more',n.x+10,n.y+HDR_H+5+PREVIEW_N*ROW_H+2);
+    }
+  }
   ctx.globalAlpha=1;
 }
 
@@ -843,137 +1083,147 @@ function rrect(x,y,w,h,r){
   ctx.closePath();
 }
 
-var panning=null;
-cv.addEventListener('mousedown',function(e){panning={mx:e.clientX,my:e.clientY,tx:tx,ty:ty};});
-cv.addEventListener('mousemove',function(e){
-  if(!panning)return;
-  tx=panning.tx+(e.clientX-panning.mx);ty=panning.ty+(e.clientY-panning.my);render();
+// Separate drag vs click properly
+var panning=null, draggingNode=null, dragOffX=0, dragOffY=0;
+var mouseDownX=0, mouseDownY=0, nodeDragMoved=false;
+
+cv.addEventListener('mousedown',function(e){
+  mouseDownX=e.clientX; mouseDownY=e.clientY; nodeDragMoved=false;
+  var p=s2w(e.offsetX,e.offsetY), hit=hitNode(p.x,p.y);
+  if(hit){ draggingNode=hit; dragOffX=p.x-hit.x; dragOffY=p.y-hit.y; }
+  else    { panning={mx:e.clientX,my:e.clientY,tx:tx,ty:ty}; }
+  cv.style.cursor='grabbing';
 });
-cv.addEventListener('mouseup',function(e){
-  var moved=panning&&(Math.abs(e.clientX-panning.mx)>4||Math.abs(e.clientY-panning.my)>4);
-  panning=null;
-  if(!moved){
-    var p=s2w(e.offsetX,e.offsetY),hit=hitNode(p.x,p.y);
-    if(hit){hlId=hit.id;openPanel(hit);}else{hlId=null;closePanel();}
-    render();
+cv.addEventListener('mousemove',function(e){
+  if(draggingNode){
+    if(Math.abs(e.clientX-mouseDownX)>3||Math.abs(e.clientY-mouseDownY)>3) nodeDragMoved=true;
+    var p=s2w(e.offsetX,e.offsetY);
+    draggingNode.x=p.x-dragOffX; draggingNode.y=p.y-dragOffY; render();
+  } else if(panning){
+    tx=panning.tx+(e.clientX-panning.mx); ty=panning.ty+(e.clientY-panning.my); render();
   }
 });
-cv.addEventListener('mouseleave',function(){panning=null;});
+cv.addEventListener('mouseup',function(e){
+  var hitN=draggingNode, wasPan=panning;
+  var panDx=wasPan?Math.abs(e.clientX-panning.mx):0, panDy=wasPan?Math.abs(e.clientY-panning.my):0;
+  var wasClick=hitN&&!nodeDragMoved, wasPanClick=wasPan&&panDx<4&&panDy<4;
+  draggingNode=null; panning=null; nodeDragMoved=false; cv.style.cursor='grab';
+  if(wasClick){ hlId=hitN.id; openPanel(hitN); render(); }
+  else if(wasPanClick){ hlId=null; closePanel(); render(); }
+});
+cv.addEventListener('mouseleave',function(){ draggingNode=null; panning=null; cv.style.cursor='grab'; });
 cv.addEventListener('wheel',function(e){
   e.preventDefault();
   var d=e.deltaY>0?.88:1.14;
-  tx=e.offsetX-d*(e.offsetX-tx);ty=e.offsetY-d*(e.offsetY-ty);
+  tx=e.offsetX-d*(e.offsetX-tx); ty=e.offsetY-d*(e.offsetY-ty);
   sc=Math.max(.04,Math.min(6,sc*d));
-  document.getElementById('sb-z').textContent=Math.round(sc*100)+'%';render();
+  document.getElementById('sb-z').textContent=Math.round(sc*100)+'%'; render();
 },{passive:false});
 
 function s2w(sx,sy){return{x:(sx-tx)/sc,y:(sy-ty)/sc};}
 function hitNode(wx,wy){
   for(var i=RAW.nodes.length-1;i>=0;i--){
-    var n=RAW.nodes[i];if(!isVis(n))continue;
-    if(wx>=n.x&&wx<=n.x+n.w&&wy>=n.y&&wy<=n.y+n.h)return n;
+    var n=RAW.nodes[i]; if(!isVis(n)) continue;
+    if(wx>=n.x&&wx<=n.x+n.w&&wy>=n.y&&wy<=n.y+n.h) return n;
   }
   return null;
 }
 
-// ── Panel ────────────────────────────────────────────────────────────────────
+// ── Panel ─────────────────────────────────────────────────────────────────────
 function openPanel(n){
-  var p=document.getElementById('panel');p.classList.add('open');
+  document.getElementById('panel').classList.add('open');
   document.getElementById('ph-title').textContent=n.id;
   document.getElementById('ph-meta').textContent=
     TL[n.type]+' \u2022 Level '+n.level+
+    ' \u2022 '+(n.cols||[]).length+' cols'+
     ' \u2022 '+EI[n.id].length+' inputs \u2022 '+EO[n.id].length+' outputs';
   document.getElementById('ph-meta').style.color=TC[n.type]+'88';
-  buildSec('src',EI[n.id],n.id,true);
-  buildSec('dst',EO[n.id],n.id,false);
+  buildCols(n);
+  buildRelSec('src',EI[n.id],true);
+  buildRelSec('dst',EO[n.id],false);
 }
 
-function buildSec(sec,edges,nodeId,isSource){
+function buildCols(n){
+  var cols=n.cols||[];
+  document.getElementById('cnt-cols').textContent=cols.length;
+  var body=document.getElementById('body-cols'); body.innerHTML='';
+  if(!cols.length){
+    var em=document.createElement('div');
+    em.style.cssText='padding:7px 13px;color:#1a2e3e;font-size:.7rem;font-style:italic;';
+    em.textContent='No columns found in SQL (external/base table or not in parsed files)';
+    body.appendChild(em); return;
+  }
+  cols.forEach(function(col,i){
+    var row=document.createElement('div'); row.className='col-row';
+    var idx=document.createElement('span'); idx.className='col-idx'; idx.textContent=(i+1)+'.';
+    var nm=document.createElement('span'); nm.className='col-name'; nm.textContent=col;
+    row.appendChild(idx); row.appendChild(nm); body.appendChild(row);
+  });
+}
+
+function buildRelSec(sec,edges,isSource){
   document.getElementById('cnt-'+sec).textContent=edges.length;
-  var body=document.getElementById('body-'+sec);
-  body.innerHTML='';
+  var body=document.getElementById('body-'+sec); body.innerHTML='';
   if(!edges.length){
     var em=document.createElement('div');
-    em.style.cssText='padding:8px 14px;color:#1e2d3a;font-size:.72rem;font-style:italic;';
-    em.textContent=isSource?'No source tables (base/external input)':'No downstream tables (leaf output)';
-    body.appendChild(em);return;
+    em.style.cssText='padding:7px 13px;color:#162030;font-size:.7rem;font-style:italic;';
+    em.textContent=isSource?'No source tables (base/external input)':'No downstream tables (leaf)';
+    body.appendChild(em); return;
   }
-
   edges.forEach(function(e){
     var otherId=isSource?e.from:e.to;
-    var other=NM[otherId];
-    var type=other?other.type:'ext';
-    var col=TC[type]||'#718096';
-
-    // Determine which alias belongs to which side
-    var thisAlias=isSource?e.src_alias:e.tgt_alias;
-    var otherAlias=isSource?e.src_alias:e.tgt_alias;
-    // src_alias = alias of "from" table, tgt_alias = alias of "to" table
-    var fromAlias=e.src_alias||'';
-    var toAlias=e.tgt_alias||'';
+    var other=NM[otherId], type=other?other.type:'ext', col=TC[type]||'#718096';
+    var fromAlias=e.src_alias||'', toAlias=e.tgt_alias||'';
     var displayAlias=isSource?fromAlias:toAlias;
-
-    var row=document.createElement('div');row.className='trow';
+    var row=document.createElement('div'); row.className='trow';
     row.addEventListener('click',function(){
-      var target=NM[otherId];
-      if(target){hlId=otherId;openPanel(target);focusNode(otherId);render();}
+      if(NM[otherId]){hlId=otherId;openPanel(NM[otherId]);focusNode(otherId);render();}
     });
-
-    // Top line
-    var top=document.createElement('div');top.className='trow-top';
-    var dot=document.createElement('div');dot.className='tdot';
-    dot.style.background=col;dot.style.border='1px solid '+col+'66';
-    var nm=document.createElement('div');nm.className='tname';nm.textContent=otherId;
-    top.appendChild(dot);top.appendChild(nm);
+    var top=document.createElement('div'); top.className='trow-top';
+    var dot=document.createElement('div'); dot.className='tdot';
+    dot.style.background=col; dot.style.border='1px solid '+col+'55';
+    var nm=document.createElement('div'); nm.className='tname'; nm.textContent=otherId;
+    top.appendChild(dot); top.appendChild(nm);
     if(displayAlias){
-      var ab=document.createElement('span');ab.className='talias';
-      ab.textContent='alias: '+displayAlias;top.appendChild(ab);
+      var ab=document.createElement('span'); ab.className='talias';
+      ab.textContent='alias: '+displayAlias; top.appendChild(ab);
     }
     row.appendChild(top);
-
-    // Join keys table
     var jks=e.jk||[];
     if(jks.length){
-      var tbl=document.createElement('table');tbl.className='jk-table';
-      var thead=tbl.createTHead();var hr=thead.insertRow();
-      var th1=document.createElement('th');th1.textContent='Source ('+( fromAlias||e.from.slice(0,12))+')';
-      var th2=document.createElement('th');th2.style.cssText='width:18px;text-align:center;';th2.textContent='';
-      var th3=document.createElement('th');th3.textContent='Destination ('+( toAlias||e.to.slice(0,12))+')';
-      hr.appendChild(th1);hr.appendChild(th2);hr.appendChild(th3);
-      var tbody=tbl.createTBody();
+      var tbl=document.createElement('table'); tbl.className='jktbl';
+      var thead=tbl.createTHead(), hr=thead.insertRow();
+      function th(t){var el=document.createElement('th');el.textContent=t;hr.appendChild(el);}
+      th('Source ('+(fromAlias||e.from.slice(0,14))+')');th('');th('Dest ('+(toAlias||e.to.slice(0,14))+')');
+      var tb2=tbl.createTBody();
       jks.forEach(function(jk){
-        var tr=tbody.insertRow();
+        var tr=tb2.insertRow();
         if(jk.left&&jk.right){
-          var td1=tr.insertCell();td1.className='jk-src';td1.textContent=jk.left;
-          var td2=tr.insertCell();td2.className='jk-eq';td2.textContent='=';
-          var td3=tr.insertCell();td3.className='jk-dst';td3.textContent=jk.right;
+          tr.insertCell().className='jk-s'; tr.cells[0].textContent=jk.left;
+          tr.insertCell().className='jk-e'; tr.cells[1].textContent='=';
+          tr.insertCell().className='jk-d'; tr.cells[2].textContent=jk.right;
         } else if(jk.col){
-          var td1=tr.insertCell();td1.className='jk-src';td1.textContent=jk.col;td1.colSpan=3;
+          var td=tr.insertCell(); td.className='jk-s'; td.textContent=jk.col; td.colSpan=3;
         }
       });
       row.appendChild(tbl);
     } else {
-      var nj=document.createElement('div');nj.className='no-jk';
-      nj.textContent='(no explicit join key \u2014 derived or subquery source)';
-      row.appendChild(nj);
+      var nj=document.createElement('div'); nj.className='no-jk';
+      nj.textContent='(no explicit join key)'; row.appendChild(nj);
     }
     body.appendChild(row);
   });
 }
 
-function closePanel(){
-  document.getElementById('panel').classList.remove('open');
-  hlId=null;render();
-}
+function closePanel(){document.getElementById('panel').classList.remove('open');hlId=null;render();}
 function toggleSec(s){document.getElementById('hdr-'+s).classList.toggle('collapsed');}
-
 function focusNode(id){
   var n=NM[id];if(!n)return;
-  var r=cvA.getBoundingClientRect();
-  tx=r.width/2-n.x*sc-(n.w/2)*sc;ty=r.height/2-n.y*sc-(n.h/2)*sc;
+  var r=cva.getBoundingClientRect();
+  tx=r.width/2-n.x*sc-(n.w/2)*sc; ty=r.height/2-n.y*sc-(n.h/2)*sc;
 }
 
-function resize(){var r=cvA.getBoundingClientRect();cv.width=r.width;cv.height=r.height;render();}
+function resize(){var r=cva.getBoundingClientRect();cv.width=r.width;cv.height=r.height;render();}
 window.addEventListener('resize',resize);
 
 function resetView(){hlId=null;closePanel();fitAll();}
@@ -984,21 +1234,21 @@ function fitAll(){
 }
 function fitLv(lv){maxLv=lv;fitVisible();}
 function fitVisible(){
-  var vis=RAW.nodes.filter(isVis);if(!vis.length)return;
+  var vis=RAW.nodes.filter(isVis); if(!vis.length)return;
   var x1=Math.min.apply(null,vis.map(function(n){return n.x;}));
   var x2=Math.max.apply(null,vis.map(function(n){return n.x+n.w;}));
   var y1=Math.min.apply(null,vis.map(function(n){return n.y;}));
   var y2=Math.max.apply(null,vis.map(function(n){return n.y+n.h;}));
-  var pad=60;
+  var pad=50;
   sc=Math.min((cv.width-pad*2)/(x2-x1||1),(cv.height-pad*2)/(y2-y1||1),1.4);
-  tx=pad-x1*sc;ty=(cv.height-(y2-y1)*sc)/2-y1*sc;
-  document.getElementById('sb-z').textContent=Math.round(sc*100)+'%';render();
+  tx=pad-x1*sc; ty=(cv.height-(y2-y1)*sc)/2-y1*sc;
+  document.getElementById('sb-z').textContent=Math.round(sc*100)+'%'; render();
 }
-function zoomIn(){applyZoom(1.2);}function zoomOut(){applyZoom(.83);}
+function zoomIn(){applyZoom(1.2);} function zoomOut(){applyZoom(.83);}
 function applyZoom(d){
-  var cx=cv.width/2,cy=cv.height/2;tx=cx-d*(cx-tx);ty=cy-d*(cy-ty);
+  var cx=cv.width/2,cy=cv.height/2; tx=cx-d*(cx-tx); ty=cy-d*(cy-ty);
   sc=Math.max(.04,Math.min(6,sc*d));
-  document.getElementById('sb-z').textContent=Math.round(sc*100)+'%';render();
+  document.getElementById('sb-z').textContent=Math.round(sc*100)+'%'; render();
 }
 function toggle(t){showT[t]=!showT[t];document.getElementById('btn-'+t).classList.toggle('on',showT[t]);render();}
 function onSearch(){srchQ=document.getElementById('srch').value.toLowerCase().trim();render();}
@@ -1006,22 +1256,23 @@ function clearSearch(){srchQ='';document.getElementById('srch').value='';render(
 
 window.addEventListener('load',function(){
   resize();
-  var mx=Math.max.apply(null,RAW.nodes.map(function(n){return n.level;}));
+  var maxL=0; RAW.nodes.forEach(function(n){if(n.level>maxL)maxL=n.level;});
+  var isolated=RAW.nodes.filter(function(n){return EI[n.id].length===0&&EO[n.id].length===0;}).length;
   document.getElementById('sp-n').textContent=RAW.nodes.length+' nodes';
   document.getElementById('sp-e').textContent=RAW.edges.length+' edges';
-  document.getElementById('sp-l').textContent=(mx+1)+' levels';
+  document.getElementById('sp-l').textContent=(maxL+1)+' levels';
+  document.getElementById('sp-i').textContent=isolated+' isolated';
   fitVisible();
 });
 """
 
     return (
         "<!DOCTYPE html>\n<html lang='en'>\n<head>\n"
-        "<meta charset='UTF-8'>\n"
-        "<meta name='viewport' content='width=device-width,initial-scale=1'>\n"
-        "<title>" + FINAL + " \u2014 ER Diagram</title>\n"
-        "<style>\n" + css + "</style>\n</head>\n<body>\n"
-        + body +
-        "<script>\n" + js + "\n</script>\n</body>\n</html>\n"
+        "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>\n"
+        "<title>"+FINAL+" \u2014 ER Diagram</title>\n"
+        "<style>\n"+css+"</style>\n</head>\n<body>\n"
+        +body+
+        "<script>\n"+js+"\n</script>\n</body>\n</html>\n"
     )
 
 
@@ -1090,7 +1341,21 @@ def main():
     parser.parse()
     summary = parser.summary()
     summary['final_table'] = auto_detect_final_table(summary, sql_text)
-    summary['_sql_text'] = sql_text  # cache for build_er_html
+    summary['_sql_text'] = sql_text
+
+    # Scan same folder for additional SQL files to enrich column data
+    extra_sqls = []
+    for ext in ('*.sql', '*.txt'):
+        for f2 in script_dir.glob(ext):
+            if f2.resolve() != sql_path.resolve():
+                try:
+                    with open(f2, encoding='utf-8', errors='replace') as fh:
+                        extra_sqls.append(fh.read())
+                except Exception:
+                    pass
+    summary['_extra_sql_texts'] = extra_sqls
+    if extra_sqls:
+        print(f"  [+] Loaded {len(extra_sqls)} additional SQL file(s) for column enrichment")
 
     print("\n" + "=" * 60)
     print("  PARSE SUMMARY")
