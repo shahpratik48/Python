@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+<meta charset='UTF-8'>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>account_profile_curr_ikg — ER Diagram</title>
+<style>
+
+*, *::before, *::after { box-sizing:border-box; margin:0; padding:0; }
+body { background:#0f1117; color:#e2e8f0;
+  font-family:'Segoe UI',system-ui,sans-serif;
+  overflow:hidden; height:100vh; display:flex; flex-direction:column; }
+
+#header { background:linear-gradient(90deg,#1e3a5f,#0f2744);
+  padding:11px 20px; display:flex; align-items:center; gap:14px;
+  border-bottom:1px solid #1e2d40; flex-shrink:0; }
+#header h1 { font-size:.95rem; font-weight:700; color:#63b3ed; }
+.sub { font-size:.68rem; color:#3d5070; margin-top:1px; }
+.sp { padding:3px 10px; border-radius:20px; font-size:.67rem; font-weight:600; }
+.sp-g { background:#1a4731; color:#68d391; border:1px solid #2f855a44; }
+.sp-b { background:#1a365d; color:#63b3ed; border:1px solid #2b6cb044; }
+.sp-p { background:#322659; color:#b794f4; border:1px solid #6b46c144; }
+
+#toolbar { background:#161b27; border-bottom:1px solid #1e2d40;
+  padding:6px 14px; display:flex; align-items:center; gap:7px;
+  flex-shrink:0; flex-wrap:wrap; }
+.tbtn { background:#1e2535; color:#8a9ab0; border:1px solid #252f40;
+  border-radius:5px; padding:4px 12px; font-size:.73rem; cursor:pointer; transition:all .12s; }
+.tbtn:hover { background:#2a3548; color:#e2e8f0; }
+.tbtn.on { background:#17304d; color:#63b3ed; border-color:#2b4a70; }
+.tsep { width:1px; height:20px; background:#1e2d40; margin:0 3px; }
+#srch { background:#1a2230; color:#e2e8f0; border:1px solid #252f40;
+  border-radius:5px; padding:4px 11px; font-size:.73rem; width:190px; outline:none; }
+#srch:focus { border-color:#3a6090; }
+#srch::placeholder { color:#2d3a4a; }
+#legend { display:flex; gap:12px; margin-left:auto; align-items:center; }
+.leg { display:flex; align-items:center; gap:5px; font-size:.67rem; color:#4a5a6a; }
+.leg-b { width:13px; height:9px; border-radius:2px; }
+
+#wrap { flex:1; position:relative; overflow:hidden; display:flex; }
+#cv-area { flex:1; position:relative; overflow:hidden; background:#0b0f18; }
+#cv { position:absolute; top:0; left:0; display:block; cursor:grab; }
+
+/* ── DETAIL PANEL ─────────────────────────────────────────────── */
+#panel {
+  width:430px; min-width:430px; background:#0d1525;
+  border-left:1px solid #1a2535;
+  display:none; flex-direction:column; overflow:hidden; flex-shrink:0;
+}
+#panel.open { display:flex; }
+
+#ph {
+  background:#0a1220; padding:12px 14px 10px;
+  border-bottom:1px solid #1a2535; flex-shrink:0;
+}
+#ph-title { font-size:.9rem; font-weight:700; color:#7ec8f8;
+  word-break:break-all; margin-bottom:4px; padding-right:22px; }
+#ph-meta { font-size:.69rem; }
+#ph-close { position:absolute; right:14px; top:14px;
+  background:none; border:none; color:#3a4a5a; cursor:pointer;
+  font-size:1.1rem; transition:color .1s; }
+#ph-close:hover { color:#e2e8f0; }
+
+#pb { flex:1; overflow-y:auto; }
+#pb::-webkit-scrollbar { width:4px; }
+#pb::-webkit-scrollbar-track { background:#0a1018; }
+#pb::-webkit-scrollbar-thumb { background:#1e2d40; border-radius:3px; }
+
+.sec { border-bottom:1px solid #111d2b; }
+.sec-hdr {
+  padding:9px 14px; font-size:.68rem; font-weight:700;
+  text-transform:uppercase; letter-spacing:.8px;
+  display:flex; align-items:center; gap:8px;
+  cursor:pointer; user-select:none; transition:background .1s;
+  color:#3a5a7a;
+}
+.sec-hdr:hover { background:#0f1c2d; }
+.sec-hdr.src-hdr { color:#5a9060; }
+.sec-hdr.dst-hdr { color:#8a6020; }
+.sec-cnt { margin-left:auto; background:#111d2b; color:#4a7090;
+  font-size:.63rem; padding:1px 8px; border-radius:10px; font-weight:700; }
+.arr { font-size:.65rem; color:#2a3a4a; transition:transform .15s; }
+.sec-hdr.collapsed .arr { transform:rotate(-90deg); }
+.sec-body { display:block; }
+.sec-hdr.collapsed + .sec-body { display:none; }
+
+/* table row */
+.trow { padding:8px 12px 8px 16px; border-bottom:1px solid #0d1828;
+  cursor:pointer; transition:background .1s; }
+.trow:hover { background:#0f1c2e; }
+.trow:last-child { border-bottom:none; }
+.trow-top { display:flex; align-items:flex-start; gap:8px; margin-bottom:5px; }
+.tdot { width:8px; height:8px; border-radius:2px; flex-shrink:0; margin-top:3px; }
+.tname { font-size:.77rem; font-weight:600; color:#c0d0e0; flex:1;
+  word-break:break-all; line-height:1.4; }
+.talias { font-size:.64rem; color:#2d5070; background:#091525;
+  border:1px solid #152535; border-radius:4px;
+  padding:1px 7px; font-family:'Consolas','Courier New',monospace;
+  white-space:nowrap; flex-shrink:0; align-self:flex-start; }
+
+/* join keys table */
+.jk-table { width:100%; border-collapse:collapse;
+  margin:0 0 4px 16px; width:calc(100% - 16px); }
+.jk-table th { font-size:.61rem; color:#2a4a5a; font-weight:600;
+  text-transform:uppercase; letter-spacing:.5px;
+  padding:3px 8px 3px 0; border-bottom:1px solid #0f1e2e; }
+.jk-table td { font-size:.68rem; font-family:'Consolas','Courier New',monospace;
+  padding:3px 8px 3px 0; color:#8ab0c0; vertical-align:top;
+  border-bottom:1px solid #0a1520; }
+.jk-table tr:last-child td { border-bottom:none; }
+.jk-src { color:#68d391; }
+.jk-dst { color:#f6ad55; }
+.jk-eq  { color:#2a3a4a; padding:0 4px; }
+.no-jk  { font-size:.65rem; color:#1e2d3a; padding:3px 0 3px 16px;
+  font-style:italic; }
+
+#sb { background:#161b27; border-top:1px solid #1a2535;
+  padding:3px 14px; font-size:.67rem; color:#2d3a4a;
+  display:flex; gap:18px; flex-shrink:0; }
+#sb b { color:#3d4a5a; }
+</style>
+</head>
+<body>
+
+<div id="header">
+  <div>
+    <div id="h-title">&#128202; account_profile_curr_ikg &mdash; Table Dependency ER Diagram</div>
+    <div class="sub">Click any node to see source/destination tables with aliases and join keys</div>
+  </div>
+  <span class="sp sp-g" id="sp-n">-- nodes</span>
+  <span class="sp sp-b" id="sp-e">-- edges</span>
+  <span class="sp sp-p" id="sp-l">-- levels</span>
+</div>
+<div id="toolbar">
+  <button class="tbtn" onclick="resetView()">&#8635; Reset</button>
+  <button class="tbtn" onclick="zoomIn()">+ Zoom</button>
+  <button class="tbtn" onclick="zoomOut()">&#8722; Zoom</button>
+  <div class="tsep"></div>
+  <input id="srch" placeholder="&#128269; Search table..." oninput="onSearch()">
+  <button class="tbtn" onclick="clearSearch()">&#10005;</button>
+  <div class="tsep"></div>
+  <button class="tbtn on" id="btn-ikg" onclick="toggle('ikg')">IKG</button>
+  <button class="tbtn on" id="btn-tmp" onclick="toggle('tmp')">Temp</button>
+  <button class="tbtn on" id="btn-ext" onclick="toggle('ext')">External</button>
+  <div class="tsep"></div>
+  <button class="tbtn" onclick="fitLv(1)">Lv 1</button>
+  <button class="tbtn" onclick="fitLv(2)">Lv 1-2</button>
+  <button class="tbtn" onclick="fitLv(3)">Lv 1-3</button>
+  <button class="tbtn" onclick="fitAll()">All</button>
+  <div id="legend">
+    <div class="leg"><div class="leg-b" style="background:#2ecc71;border:1px solid #27ae60"></div>Final</div>
+    <div class="leg"><div class="leg-b" style="background:#1a5080;border:1px solid #2980b9"></div>IKG</div>
+    <div class="leg"><div class="leg-b" style="background:#3d1a6e;border:1px solid #8e44ad"></div>Temp</div>
+    <div class="leg"><div class="leg-b" style="background:#4a2800;border:1px solid #e67e22"></div>External</div>
+  </div>
+</div>
+<div id="wrap">
+  <div id="cv-area"><canvas id="cv"></canvas></div>
+  <div id="panel">
+    <div id="ph" style="position:relative;">
+      <button id="ph-close" onclick="closePanel()">&#10005;</button>
+      <div id="ph-title"></div>
+      <div id="ph-meta"></div>
+    </div>
+    <div id="pb">
+      <div class="sec">
+        <div class="sec-hdr src-hdr" id="hdr-src" onclick="toggleSec('src')">
+          &#8593;&nbsp;Source Tables&nbsp;<span style="color:#2a5a30;font-weight:400;font-size:.62rem;text-transform:none">(inputs to this table)</span>
+          <span class="sec-cnt" id="cnt-src">0</span>
+          <span class="arr">&#9660;</span>
+        </div>
+        <div class="sec-body" id="body-src"></div>
+      </div>
+      <div class="sec">
+        <div class="sec-hdr dst-hdr collapsed" id="hdr-dst" onclick="toggleSec('dst')">
+          &#8595;&nbsp;Destination Tables&nbsp;<span style="color:#5a3a10;font-weight:400;font-size:.62rem;text-transform:none">(tables that use this table)</span>
+          <span class="sec-cnt" id="cnt-dst">0</span>
+          <span class="arr">&#9660;</span>
+        </div>
+        <div class="sec-body" id="body-dst"></div>
+      </div>
+    </div>
+  </div>
+</div>
+<div id="sb">
+  <span>Zoom: <b id="sb-z">100%</b></span>
+  <span>Visible: <b id="sb-v">0</b></span>
+  <span>Scroll=zoom &bull; Drag=pan &bull; Click node for details</span>
+</div>
+<script>
+const RAW={"nodes":[{"id":"account_profile_curr_ikg","level":0,"type":"final"},{"id":"acc_structured_prod_ikg","level":1,"type":"ikg"},{"id":"account_profile_curr_ikg_tmp","level":1,"type":"tmp"},{"id":"household_lead_client_ikg","level":1,"type":"ikg"},{"id":"acc_mut_fund_gains","level":1,"type":"ikg"},{"id":"acc_with_poa_ikg","level":1,"type":"ikg"},{"id":"sbl_approach_margin_call_ikg","level":1,"type":"ikg"},{"id":"account_revenue_t12","level":1,"type":"ikg"},{"id":"rmd_ira_ikg","level":1,"type":"ikg"},{"id":"client_rmd_ira_ikg","level":1,"type":"ikg"},{"id":"intl_household_plus_ids","level":1,"type":"ikg"},{"id":"sbl_loan_cheapener_ikg","level":1,"type":"ikg"},{"id":"acc_unused_credit_card_benefit_ikg","level":1,"type":"ikg"},{"id":"international_exposure_ikg","level":1,"type":"ikg"},{"id":"sma_overlap_ikg","level":1,"type":"ikg"},{"id":"fee_waiver_rma_ikg","level":1,"type":"ikg"},{"id":"wac_advisory_status_ikg","level":1,"type":"ikg"},{"id":"wac_sma_overlap_ikg","level":1,"type":"ikg"},{"id":"ubs_base_acc_features_ikg","level":2,"type":"ikg"},{"id":"sbl_maturation_date_rule_ikg","level":2,"type":"ikg"},{"id":"mtg_closing_rule_ikg","level":2,"type":"ikg"},{"id":"cust_dimn_curr","level":2,"type":"ext"},{"id":"household_profile_curr_ikg","level":2,"type":"ikg"},{"id":"missing_beneficiaries_ira_ikg","level":2,"type":"ikg"},{"id":"foa_code_tmp","level":2,"type":"tmp"},{"id":"ptm_foa","level":2,"type":"ikg"},{"id":"multibank_sweep_weekly","level":2,"type":"ikg"},{"id":"fga_ikg","level":2,"type":"ikg"},{"id":"mike_acc_performance_drivers_cur","level":2,"type":"ikg"},{"id":"mike_acc_performance_drivers_prev_year","level":2,"type":"ikg"},{"id":"tax_acc_gain_loss","level":2,"type":"ikg"},{"id":"tax_acc_gain_loss_prev_year","level":2,"type":"ikg"},{"id":"aladdin_accounts_risk_alert_ikg","level":2,"type":"ikg"},{"id":"max_asset_client_ids_ikg","level":2,"type":"ikg"},{"id":"asset_amount_acct_cli_ikg","level":2,"type":"ikg"},{"id":"client_email_dimn","level":2,"type":"ext"},{"id":"acc_cli_shhp_map_ikg","level":2,"type":"ikg"},{"id":"internaltional_branches_tmp","level":2,"type":"tmp"},{"id":"imr_foa_status_ikg","level":3,"type":"ikg"},{"id":"master_ids_curr_ikg","level":3,"type":"ikg"},{"id":"asset_account_ikg","level":3,"type":"ikg"},{"id":"asset_amount_acct_ikg","level":3,"type":"ikg"},{"id":"acc_ast_pre_splt_fact_curr","level":3,"type":"ext"},{"id":"mv_acct_dimn_curr_weekly","level":3,"type":"ext"},{"id":"mv_branch_division_dimn_curr_weekly","level":3,"type":"ext"},{"id":"use_consultworks_id","level":3,"type":"ikg"},{"id":"master_ids_ikg","level":4,"type":"ikg"},{"id":"asset_amount_account_shhp_ikg","level":4,"type":"ikg"},{"id":"asset_security_hist","level":4,"type":"ikg"},{"id":"mv_acct_dimn_weekly","level":5,"type":"ext"},{"id":"statement_plus_ids","level":5,"type":"ikg"},{"id":"rmd_reports_into_staat_ipclii_distinct","level":5,"type":"ext"},{"id":"acc_omit_ikg","level":5,"type":"ikg"},{"id":"acc_ast_pre_split_hist_ikg","level":5,"type":"ikg"},{"id":"statement_plus","level":6,"type":"ikg"},{"id":"acc_ast_pre_splt_fact_curr_hist_ikg","level":6,"type":"ikg"},{"id":"mv_product_dimn_weekly","level":6,"type":"ext"},{"id":"statement_plus_temp","level":7,"type":"ikg"},{"id":"closed_convereted_to_statement_plus_ikg","level":7,"type":"ikg"},{"id":"cw_used_data","level":8,"type":"ikg"}],"edges":[{"from":"acc_structured_prod_ikg","to":"account_profile_curr_ikg","jk":[{"left":"a.acc_mhh_n","right":"hlc.acc_mhh_n"},{"left":"a.acc_n","right":"amfg.acc_n"},{"left":"a.acc_i","right":"acp.acc_i"},{"left":"a.acc_n","right":"samc.acc_n"},{"left":"a.acc_n","right":"t12.acc_n"},{"left":"a.acc_n","right":"rmd.acc_n"},{"left":"crmd.ip_cli_i","right":"a.ip_cli_i"},{"left":"a.acc_mhh_n","right":"ihh.household_plus"},{"left":"a.acc_i","right":"ah.acc_i"},{"left":"a.acc_i","right":"lc.acc_i"},{"left":"a.acc_i","right":"ar.acc_i"},{"left":"a.acc_i","right":"uccb.acc_i"},{"left":"a.acc_i","right":"icd.acc_i"},{"left":"a.acc_n","right":"sma.acc_n"},{"left":"a.acc_n","right":"rma_fee.acc_n"},{"left":"a.acc_n","right":"wac_adv.acc_n"}],"src_alias":"ah","tgt_alias":"","is_external":false},{"from":"account_profile_curr_ikg_tmp","to":"account_profile_curr_ikg","jk":[{"left":"a.acc_mhh_n","right":"hlc.acc_mhh_n"},{"left":"a.acc_n","right":"amfg.acc_n"},{"left":"a.acc_i","right":"acp.acc_i"},{"left":"a.acc_n","right":"samc.acc_n"},{"left":"a.acc_n","right":"t12.acc_n"},{"left":"a.acc_n","right":"rmd.acc_n"},{"left":"crmd.ip_cli_i","right":"a.ip_cli_i"},{"left":"a.acc_mhh_n","right":"ihh.household_plus"},{"left":"a.acc_i","right":"ah.acc_i"},{"left":"a.acc_i","right":"lc.acc_i"},{"left":"a.acc_i","right":"ar.acc_i"},{"left":"a.acc_i","right":"uccb.acc_i"},{"left":"a.acc_i","right":"icd.acc_i"},{"left":"a.acc_n","right":"sma.acc_n"},{"left":"a.acc_n","right":"rma_fee.acc_n"},{"left":"a.acc_n","right":"wac_adv.acc_n"}],"src_alias":"a","tgt_alias":"","is_external":false},{"from":"household_lead_client_ikg","to":"account_profile_curr_ikg","jk":[{"left":"a.acc_mhh_n","right":"hlc.acc_mhh_n"},{"left":"a.acc_n","right":"amfg.acc_n"},{"left":"a.acc_i","right":"acp.acc_i"},{"left":"a.acc_n","right":"samc.acc_n"},{"left":"a.acc_n","right":"t12.acc_n"},{"left":"a.acc_n","right":"rmd.acc_n"},{"left":"crmd.ip_cli_i","right":"a.ip_cli_i"},{"left":"a.acc_mhh_n","right":"ihh.household_plus"},{"left":"a.acc_i","right":"ah.acc_i"},{"left":"a.acc_i","right":"lc.acc_i"},{"left":"a.acc_i","right":"ar.acc_i"},{"left":"a.acc_i","right":"uccb.acc_i"},{"left":"a.acc_i","right":"icd.acc_i"},{"left":"a.acc_n","right":"sma.acc_n"},{"left":"a.acc_n","right":"rma_fee.acc_n"},{"left":"a.acc_n","right":"wac_adv.acc_n"}],"src_alias":"hlc","tgt_alias":"","is_external":false},{"from":"acc_mut_fund_gains","to":"account_profile_curr_ikg","jk":[{"left":"a.acc_mhh_n","right":"hlc.acc_mhh_n"},{"left":"a.acc_n","right":"amfg.acc_n"},{"left":"a.acc_i","right":"acp.acc_i"},{"left":"a.acc_n","right":"samc.acc_n"},{"left":"a.acc_n","right":"t12.acc_n"},{"left":"a.acc_n","right":"rmd.acc_n"},{"left":"crmd.ip_cli_i","right":"a.ip_cli_i"},{"left":"a.acc_mhh_n","right":"ihh.household_plus"},{"left":"a.acc_i","right":"ah.acc_i"},{"left":"a.acc_i","right":"lc.acc_i"},{"left":"a.acc_i","right":"ar.acc_i"},{"left":"a.acc_i","right":"uccb.acc_i"},{"left":"a.acc_i","right":"icd.acc_i"},{"left":"a.acc_n","right":"sma.acc_n"},{"left":"a.acc_n","right":"rma_fee.acc_n"},{"left":"a.acc_n","right":"wac_adv.acc_n"}],"src_alias":"amfg","tgt_alias":"","is_external":false},{"from":"acc_with_poa_ikg","to":"account_profile_curr_ikg","jk":[{"left":"a.acc_mhh_n","right":"hlc.acc_mhh_n"},{"left":"a.acc_n","right":"amfg.acc_n"},{"left":"a.acc_i","right":"acp.acc_i"},{"left":"a.acc_n","right":"samc.acc_n"},{"left":"a.acc_n","right":"t12.acc_n"},{"left":"a.acc_n","right":"rmd.acc_n"},{"left":"crmd.ip_cli_i","right":"a.ip_cli_i"},{"left":"a.acc_mhh_n","right":"ihh.household_plus"},{"left":"a.acc_i","right":"ah.acc_i"},{"left":"a.acc_i","right":"lc.acc_i"},{"left":"a.acc_i","right":"ar.acc_i"},{"left":"a.acc_i","right":"uccb.acc_i"},{"left":"a.acc_i","right":"icd.acc_i"},{"left":"a.acc_n","right":"sma.acc_n"},{"left":"a.acc_n","right":"rma_fee.acc_n"},{"left":"a.acc_n","right":"wac_adv.acc_n"}],"src_alias":"acp","tgt_alias":"","is_external":false},{"from":"sbl_approach_margin_call_ikg","to":"account_profile_curr_ikg","jk":[{"left":"a.acc_mhh_n","right":"hlc.acc_mhh_n"},{"left":"a.acc_n","right":"amfg.acc_n"},{"left":"a.acc_i","right":"acp.acc_i"},{"left":"a.acc_n","right":"samc.acc_n"},{"left":"a.acc_n","right":"t12.acc_n"},{"left":"a.acc_n","right":"rmd.acc_n"},{"left":"crmd.ip_cli_i","right":"a.ip_cli_i"},{"left":"a.acc_mhh_n","right":"ihh.household_plus"},{"left":"a.acc_i","right":"ah.acc_i"},{"left":"a.acc_i","right":"lc.acc_i"},{"left":"a.acc_i","right":"ar.acc_i"},{"left":"a.acc_i","right":"uccb.acc_i"},{"left":"a.acc_i","right":"icd.acc_i"},{"left":"a.acc_n","right":"sma.acc_n"},{"left":"a.acc_n","right":"rma_fee.acc_n"},{"left":"a.acc_n","right":"wac_adv.acc_n"}],"src_alias":"samc","tgt_alias":"","is_external":false},{"from":"account_revenue_t12","to":"account_profile_curr_ikg","jk":[{"left":"a.acc_mhh_n","right":"hlc.acc_mhh_n"},{"left":"a.acc_n","right":"amfg.acc_n"},{"left":"a.acc_i","right":"acp.acc_i"},{"left":"a.acc_n","right":"samc.acc_n"},{"left":"a.acc_n","right":"t12.acc_n"},{"left":"a.acc_n","right":"rmd.acc_n"},{"left":"crmd.ip_cli_i","right":"a.ip_cli_i"},{"left":"a.acc_mhh_n","right":"ihh.household_plus"},{"left":"a.acc_i","right":"ah.acc_i"},{"left":"a.acc_i","right":"lc.acc_i"},{"left":"a.acc_i","right":"ar.acc_i"},{"left":"a.acc_i","right":"uccb.acc_i"},{"left":"a.acc_i","right":"icd.acc_i"},{"left":"a.acc_n","right":"sma.acc_n"},{"left":"a.acc_n","right":"rma_fee.acc_n"},{"left":"a.acc_n","right":"wac_adv.acc_n"}],"src_alias":"t12","tgt_alias":"","is_external":false},{"from":"rmd_ira_ikg","to":"account_profile_curr_ikg","jk":[{"left":"a.acc_mhh_n","right":"hlc.acc_mhh_n"},{"left":"a.acc_n","right":"amfg.acc_n"},{"left":"a.acc_i","right":"acp.acc_i"},{"left":"a.acc_n","right":"samc.acc_n"},{"left":"a.acc_n","right":"t12.acc_n"},{"left":"a.acc_n","right":"rmd.acc_n"},{"left":"crmd.ip_cli_i","right":"a.ip_cli_i"},{"left":"a.acc_mhh_n","right":"ihh.household_plus"},{"left":"a.acc_i","right":"ah.acc_i"},{"left":"a.acc_i","right":"lc.acc_i"},{"left":"a.acc_i","right":"ar.acc_i"},{"left":"a.acc_i","right":"uccb.acc_i"},{"left":"a.acc_i","right":"icd.acc_i"},{"left":"a.acc_n","right":"sma.acc_n"},{"left":"a.acc_n","right":"rma_fee.acc_n"},{"left":"a.acc_n","right":"wac_adv.acc_n"}],"src_alias":"rmd","tgt_alias":"","is_external":false},{"from":"client_rmd_ira_ikg","to":"account_profile_curr_ikg","jk":[{"left":"a.acc_mhh_n","right":"hlc.acc_mhh_n"},{"left":"a.acc_n","right":"amfg.acc_n"},{"left":"a.acc_i","right":"acp.acc_i"},{"left":"a.acc_n","right":"samc.acc_n"},{"left":"a.acc_n","right":"t12.acc_n"},{"left":"a.acc_n","right":"rmd.acc_n"},{"left":"crmd.ip_cli_i","right":"a.ip_cli_i"},{"left":"a.acc_mhh_n","right":"ihh.household_plus"},{"left":"a.acc_i","right":"ah.acc_i"},{"left":"a.acc_i","right":"lc.acc_i"},{"left":"a.acc_i","right":"ar.acc_i"},{"left":"a.acc_i","right":"uccb.acc_i"},{"left":"a.acc_i","right":"icd.acc_i"},{"left":"a.acc_n","right":"sma.acc_n"},{"left":"a.acc_n","right":"rma_fee.acc_n"},{"left":"a.acc_n","right":"wac_adv.acc_n"}],"src_alias":"crmd","tgt_alias":"","is_external":false},{"from":"intl_household_plus_ids","to":"account_profile_curr_ikg","jk":[{"left":"a.acc_mhh_n","right":"hlc.acc_mhh_n"},{"left":"a.acc_n","right":"amfg.acc_n"},{"left":"a.acc_i","right":"acp.acc_i"},{"left":"a.acc_n","right":"samc.acc_n"},{"left":"a.acc_n","right":"t12.acc_n"},{"left":"a.acc_n","right":"rmd.acc_n"},{"left":"crmd.ip_cli_i","right":"a.ip_cli_i"},{"left":"a.acc_mhh_n","right":"ihh.household_plus"},{"left":"a.acc_i","right":"ah.acc_i"},{"left":"a.acc_i","right":"lc.acc_i"},{"left":"a.acc_i","right":"ar.acc_i"},{"left":"a.acc_i","right":"uccb.acc_i"},{"left":"a.acc_i","right":"icd.acc_i"},{"left":"a.acc_n","right":"sma.acc_n"},{"left":"a.acc_n","right":"rma_fee.acc_n"},{"left":"a.acc_n","right":"wac_adv.acc_n"}],"src_alias":"ihh","tgt_alias":"","is_external":false},{"from":"sbl_loan_cheapener_ikg","to":"account_profile_curr_ikg","jk":[{"left":"a.acc_mhh_n","right":"hlc.acc_mhh_n"},{"left":"a.acc_n","right":"amfg.acc_n"},{"left":"a.acc_i","right":"acp.acc_i"},{"left":"a.acc_n","right":"samc.acc_n"},{"left":"a.acc_n","right":"t12.acc_n"},{"left":"a.acc_n","right":"rmd.acc_n"},{"left":"crmd.ip_cli_i","right":"a.ip_cli_i"},{"left":"a.acc_mhh_n","right":"ihh.household_plus"},{"left":"a.acc_i","right":"ah.acc_i"},{"left":"a.acc_i","right":"lc.acc_i"},{"left":"a.acc_i","right":"ar.acc_i"},{"left":"a.acc_i","right":"uccb.acc_i"},{"left":"a.acc_i","right":"icd.acc_i"},{"left":"a.acc_n","right":"sma.acc_n"},{"left":"a.acc_n","right":"rma_fee.acc_n"},{"left":"a.acc_n","right":"wac_adv.acc_n"}],"src_alias":"lc","tgt_alias":"","is_external":false},{"from":"acc_unused_credit_card_benefit_ikg","to":"account_profile_curr_ikg","jk":[{"left":"a.acc_mhh_n","right":"hlc.acc_mhh_n"},{"left":"a.acc_n","right":"amfg.acc_n"},{"left":"a.acc_i","right":"acp.acc_i"},{"left":"a.acc_n","right":"samc.acc_n"},{"left":"a.acc_n","right":"t12.acc_n"},{"left":"a.acc_n","right":"rmd.acc_n"},{"left":"crmd.ip_cli_i","right":"a.ip_cli_i"},{"left":"a.acc_mhh_n","right":"ihh.household_plus"},{"left":"a.acc_i","right":"ah.acc_i"},{"left":"a.acc_i","right":"lc.acc_i"},{"left":"a.acc_i","right":"ar.acc_i"},{"left":"a.acc_i","right":"uccb.acc_i"},{"left":"a.acc_i","right":"icd.acc_i"},{"left":"a.acc_n","right":"sma.acc_n"},{"left":"a.acc_n","right":"rma_fee.acc_n"},{"left":"a.acc_n","right":"wac_adv.acc_n"}],"src_alias":"uccb","tgt_alias":"","is_external":false},{"from":"international_exposure_ikg","to":"account_profile_curr_ikg","jk":[{"left":"a.acc_mhh_n","right":"hlc.acc_mhh_n"},{"left":"a.acc_n","right":"amfg.acc_n"},{"left":"a.acc_i","right":"acp.acc_i"},{"left":"a.acc_n","right":"samc.acc_n"},{"left":"a.acc_n","right":"t12.acc_n"},{"left":"a.acc_n","right":"rmd.acc_n"},{"left":"crmd.ip_cli_i","right":"a.ip_cli_i"},{"left":"a.acc_mhh_n","right":"ihh.household_plus"},{"left":"a.acc_i","right":"ah.acc_i"},{"left":"a.acc_i","right":"lc.acc_i"},{"left":"a.acc_i","right":"ar.acc_i"},{"left":"a.acc_i","right":"uccb.acc_i"},{"left":"a.acc_i","right":"icd.acc_i"},{"left":"a.acc_n","right":"sma.acc_n"},{"left":"a.acc_n","right":"rma_fee.acc_n"},{"left":"a.acc_n","right":"wac_adv.acc_n"}],"src_alias":"icd","tgt_alias":"","is_external":false},{"from":"sma_overlap_ikg","to":"account_profile_curr_ikg","jk":[{"left":"a.acc_mhh_n","right":"hlc.acc_mhh_n"},{"left":"a.acc_n","right":"amfg.acc_n"},{"left":"a.acc_i","right":"acp.acc_i"},{"left":"a.acc_n","right":"samc.acc_n"},{"left":"a.acc_n","right":"t12.acc_n"},{"left":"a.acc_n","right":"rmd.acc_n"},{"left":"crmd.ip_cli_i","right":"a.ip_cli_i"},{"left":"a.acc_mhh_n","right":"ihh.household_plus"},{"left":"a.acc_i","right":"ah.acc_i"},{"left":"a.acc_i","right":"lc.acc_i"},{"left":"a.acc_i","right":"ar.acc_i"},{"left":"a.acc_i","right":"uccb.acc_i"},{"left":"a.acc_i","right":"icd.acc_i"},{"left":"a.acc_n","right":"sma.acc_n"},{"left":"a.acc_n","right":"rma_fee.acc_n"},{"left":"a.acc_n","right":"wac_adv.acc_n"}],"src_alias":"sma","tgt_alias":"","is_external":false},{"from":"fee_waiver_rma_ikg","to":"account_profile_curr_ikg","jk":[{"left":"a.acc_mhh_n","right":"hlc.acc_mhh_n"},{"left":"a.acc_n","right":"amfg.acc_n"},{"left":"a.acc_i","right":"acp.acc_i"},{"left":"a.acc_n","right":"samc.acc_n"},{"left":"a.acc_n","right":"t12.acc_n"},{"left":"a.acc_n","right":"rmd.acc_n"},{"left":"crmd.ip_cli_i","right":"a.ip_cli_i"},{"left":"a.acc_mhh_n","right":"ihh.household_plus"},{"left":"a.acc_i","right":"ah.acc_i"},{"left":"a.acc_i","right":"lc.acc_i"},{"left":"a.acc_i","right":"ar.acc_i"},{"left":"a.acc_i","right":"uccb.acc_i"},{"left":"a.acc_i","right":"icd.acc_i"},{"left":"a.acc_n","right":"sma.acc_n"},{"left":"a.acc_n","right":"rma_fee.acc_n"},{"left":"a.acc_n","right":"wac_adv.acc_n"}],"src_alias":"rma_fee","tgt_alias":"","is_external":false},{"from":"wac_advisory_status_ikg","to":"account_profile_curr_ikg","jk":[{"left":"a.acc_mhh_n","right":"hlc.acc_mhh_n"},{"left":"a.acc_n","right":"amfg.acc_n"},{"left":"a.acc_i","right":"acp.acc_i"},{"left":"a.acc_n","right":"samc.acc_n"},{"left":"a.acc_n","right":"t12.acc_n"},{"left":"a.acc_n","right":"rmd.acc_n"},{"left":"crmd.ip_cli_i","right":"a.ip_cli_i"},{"left":"a.acc_mhh_n","right":"ihh.household_plus"},{"left":"a.acc_i","right":"ah.acc_i"},{"left":"a.acc_i","right":"lc.acc_i"},{"left":"a.acc_i","right":"ar.acc_i"},{"left":"a.acc_i","right":"uccb.acc_i"},{"left":"a.acc_i","right":"icd.acc_i"},{"left":"a.acc_n","right":"sma.acc_n"},{"left":"a.acc_n","right":"rma_fee.acc_n"},{"left":"a.acc_n","right":"wac_adv.acc_n"}],"src_alias":"wac_adv","tgt_alias":"","is_external":false},{"from":"wac_sma_overlap_ikg","to":"account_profile_curr_ikg","jk":[{"left":"a.acc_mhh_n","right":"hlc.acc_mhh_n"},{"left":"a.acc_n","right":"amfg.acc_n"},{"left":"a.acc_i","right":"acp.acc_i"},{"left":"a.acc_n","right":"samc.acc_n"},{"left":"a.acc_n","right":"t12.acc_n"},{"left":"a.acc_n","right":"rmd.acc_n"},{"left":"crmd.ip_cli_i","right":"a.ip_cli_i"},{"left":"a.acc_mhh_n","right":"ihh.household_plus"},{"left":"a.acc_i","right":"ah.acc_i"},{"left":"a.acc_i","right":"lc.acc_i"},{"left":"a.acc_i","right":"ar.acc_i"},{"left":"a.acc_i","right":"uccb.acc_i"},{"left":"a.acc_i","right":"icd.acc_i"},{"left":"a.acc_n","right":"sma.acc_n"},{"left":"a.acc_n","right":"rma_fee.acc_n"},{"left":"a.acc_n","right":"wac_adv.acc_n"}],"src_alias":"wac","tgt_alias":"","is_external":false},{"from":"ubs_base_acc_features_ikg","to":"account_profile_curr_ikg_tmp","jk":[{"left":"a.acc_n","right":"s.fxd_acc_n"},{"left":"a.profile_date","right":"s.profile_date"},{"left":"a.acc_n","right":"mcr.acc_n"},{"left":"a.profile_date","right":"mcr.profile_date"},{"left":"a.ip_cli_i","right":"cdc.ip_cli_i"},{"left":"a.acc_mhh_n","right":"h.acc_mhh_n"},{"left":"a.profile_date","right":"h.profile_date"},{"left":"mbi.acc_n","right":"a.acc_n"},{"left":"mbi.profile_date","right":"a.profile_date"},{"left":"mbi.ip_cli_i","right":"a.ip_cli_i"},{"left":"foa.acc_n","right":"a.acc_n"},{"left":"a.acc_n","right":"ptm.acc_n"},{"left":"a.acc_i","right":"msw.acc_i"},{"left":"a.ip_cli_i","right":"fga_c.fga_client_ip_cli_i"},{"left":"a.ip_cli_i","right":"fga_co.fga_coclient_ip_cli_i"},{"left":"a.acc_n","right":"mapdc.acc_n"},{"left":"a.acc_n","right":"mapdpy.acc_n"},{"left":"a.acc_n","right":"tagl.acc_n"},{"left":"a.acc_n","right":"taglpy.acc_n"},{"left":"a.acc_n","right":"aara.acc_n"}],"src_alias":"a","tgt_alias":"","is_external":false},{"from":"sbl_maturation_date_rule_ikg","to":"account_profile_curr_ikg_tmp","jk":[{"left":"a.acc_n","right":"s.fxd_acc_n"},{"left":"a.profile_date","right":"s.profile_date"},{"left":"a.acc_n","right":"mcr.acc_n"},{"left":"a.profile_date","right":"mcr.profile_date"},{"left":"a.ip_cli_i","right":"cdc.ip_cli_i"},{"left":"a.acc_mhh_n","right":"h.acc_mhh_n"},{"left":"a.profile_date","right":"h.profile_date"},{"left":"mbi.acc_n","right":"a.acc_n"},{"left":"mbi.profile_date","right":"a.profile_date"},{"left":"mbi.ip_cli_i","right":"a.ip_cli_i"},{"left":"foa.acc_n","right":"a.acc_n"},{"left":"a.acc_n","right":"ptm.acc_n"},{"left":"a.acc_i","right":"msw.acc_i"},{"left":"a.ip_cli_i","right":"fga_c.fga_client_ip_cli_i"},{"left":"a.ip_cli_i","right":"fga_co.fga_coclient_ip_cli_i"},{"left":"a.acc_n","right":"mapdc.acc_n"},{"left":"a.acc_n","right":"mapdpy.acc_n"},{"left":"a.acc_n","right":"tagl.acc_n"},{"left":"a.acc_n","right":"taglpy.acc_n"},{"left":"a.acc_n","right":"aara.acc_n"}],"src_alias":"s","tgt_alias":"","is_external":false},{"from":"mtg_closing_rule_ikg","to":"account_profile_curr_ikg_tmp","jk":[{"left":"a.acc_n","right":"s.fxd_acc_n"},{"left":"a.profile_date","right":"s.profile_date"},{"left":"a.acc_n","right":"mcr.acc_n"},{"left":"a.profile_date","right":"mcr.profile_date"},{"left":"a.ip_cli_i","right":"cdc.ip_cli_i"},{"left":"a.acc_mhh_n","right":"h.acc_mhh_n"},{"left":"a.profile_date","right":"h.profile_date"},{"left":"mbi.acc_n","right":"a.acc_n"},{"left":"mbi.profile_date","right":"a.profile_date"},{"left":"mbi.ip_cli_i","right":"a.ip_cli_i"},{"left":"foa.acc_n","right":"a.acc_n"},{"left":"a.acc_n","right":"ptm.acc_n"},{"left":"a.acc_i","right":"msw.acc_i"},{"left":"a.ip_cli_i","right":"fga_c.fga_client_ip_cli_i"},{"left":"a.ip_cli_i","right":"fga_co.fga_coclient_ip_cli_i"},{"left":"a.acc_n","right":"mapdc.acc_n"},{"left":"a.acc_n","right":"mapdpy.acc_n"},{"left":"a.acc_n","right":"tagl.acc_n"},{"left":"a.acc_n","right":"taglpy.acc_n"},{"left":"a.acc_n","right":"aara.acc_n"}],"src_alias":"mcr","tgt_alias":"","is_external":false},{"from":"cust_dimn_curr","to":"account_profile_curr_ikg_tmp","jk":[{"left":"a.acc_n","right":"s.fxd_acc_n"},{"left":"a.profile_date","right":"s.profile_date"},{"left":"a.acc_n","right":"mcr.acc_n"},{"left":"a.profile_date","right":"mcr.profile_date"},{"left":"a.ip_cli_i","right":"cdc.ip_cli_i"},{"left":"a.acc_mhh_n","right":"h.acc_mhh_n"},{"left":"a.profile_date","right":"h.profile_date"},{"left":"mbi.acc_n","right":"a.acc_n"},{"left":"mbi.profile_date","right":"a.profile_date"},{"left":"mbi.ip_cli_i","right":"a.ip_cli_i"},{"left":"foa.acc_n","right":"a.acc_n"},{"left":"a.acc_n","right":"ptm.acc_n"},{"left":"a.acc_i","right":"msw.acc_i"},{"left":"a.ip_cli_i","right":"fga_c.fga_client_ip_cli_i"},{"left":"a.ip_cli_i","right":"fga_co.fga_coclient_ip_cli_i"},{"left":"a.acc_n","right":"mapdc.acc_n"},{"left":"a.acc_n","right":"mapdpy.acc_n"},{"left":"a.acc_n","right":"tagl.acc_n"},{"left":"a.acc_n","right":"taglpy.acc_n"},{"left":"a.acc_n","right":"aara.acc_n"}],"src_alias":"cdc","tgt_alias":"","is_external":true},{"from":"household_profile_curr_ikg","to":"account_profile_curr_ikg_tmp","jk":[{"left":"a.acc_n","right":"s.fxd_acc_n"},{"left":"a.profile_date","right":"s.profile_date"},{"left":"a.acc_n","right":"mcr.acc_n"},{"left":"a.profile_date","right":"mcr.profile_date"},{"left":"a.ip_cli_i","right":"cdc.ip_cli_i"},{"left":"a.acc_mhh_n","right":"h.acc_mhh_n"},{"left":"a.profile_date","right":"h.profile_date"},{"left":"mbi.acc_n","right":"a.acc_n"},{"left":"mbi.profile_date","right":"a.profile_date"},{"left":"mbi.ip_cli_i","right":"a.ip_cli_i"},{"left":"foa.acc_n","right":"a.acc_n"},{"left":"a.acc_n","right":"ptm.acc_n"},{"left":"a.acc_i","right":"msw.acc_i"},{"left":"a.ip_cli_i","right":"fga_c.fga_client_ip_cli_i"},{"left":"a.ip_cli_i","right":"fga_co.fga_coclient_ip_cli_i"},{"left":"a.acc_n","right":"mapdc.acc_n"},{"left":"a.acc_n","right":"mapdpy.acc_n"},{"left":"a.acc_n","right":"tagl.acc_n"},{"left":"a.acc_n","right":"taglpy.acc_n"},{"left":"a.acc_n","right":"aara.acc_n"}],"src_alias":"h","tgt_alias":"","is_external":false},{"from":"missing_beneficiaries_ira_ikg","to":"account_profile_curr_ikg_tmp","jk":[{"left":"a.acc_n","right":"s.fxd_acc_n"},{"left":"a.profile_date","right":"s.profile_date"},{"left":"a.acc_n","right":"mcr.acc_n"},{"left":"a.profile_date","right":"mcr.profile_date"},{"left":"a.ip_cli_i","right":"cdc.ip_cli_i"},{"left":"a.acc_mhh_n","right":"h.acc_mhh_n"},{"left":"a.profile_date","right":"h.profile_date"},{"left":"mbi.acc_n","right":"a.acc_n"},{"left":"mbi.profile_date","right":"a.profile_date"},{"left":"mbi.ip_cli_i","right":"a.ip_cli_i"},{"left":"foa.acc_n","right":"a.acc_n"},{"left":"a.acc_n","right":"ptm.acc_n"},{"left":"a.acc_i","right":"msw.acc_i"},{"left":"a.ip_cli_i","right":"fga_c.fga_client_ip_cli_i"},{"left":"a.ip_cli_i","right":"fga_co.fga_coclient_ip_cli_i"},{"left":"a.acc_n","right":"mapdc.acc_n"},{"left":"a.acc_n","right":"mapdpy.acc_n"},{"left":"a.acc_n","right":"tagl.acc_n"},{"left":"a.acc_n","right":"taglpy.acc_n"},{"left":"a.acc_n","right":"aara.acc_n"}],"src_alias":"mbi","tgt_alias":"","is_external":false},{"from":"foa_code_tmp","to":"account_profile_curr_ikg_tmp","jk":[{"left":"a.acc_n","right":"s.fxd_acc_n"},{"left":"a.profile_date","right":"s.profile_date"},{"left":"a.acc_n","right":"mcr.acc_n"},{"left":"a.profile_date","right":"mcr.profile_date"},{"left":"a.ip_cli_i","right":"cdc.ip_cli_i"},{"left":"a.acc_mhh_n","right":"h.acc_mhh_n"},{"left":"a.profile_date","right":"h.profile_date"},{"left":"mbi.acc_n","right":"a.acc_n"},{"left":"mbi.profile_date","right":"a.profile_date"},{"left":"mbi.ip_cli_i","right":"a.ip_cli_i"},{"left":"foa.acc_n","right":"a.acc_n"},{"left":"a.acc_n","right":"ptm.acc_n"},{"left":"a.acc_i","right":"msw.acc_i"},{"left":"a.ip_cli_i","right":"fga_c.fga_client_ip_cli_i"},{"left":"a.ip_cli_i","right":"fga_co.fga_coclient_ip_cli_i"},{"left":"a.acc_n","right":"mapdc.acc_n"},{"left":"a.acc_n","right":"mapdpy.acc_n"},{"left":"a.acc_n","right":"tagl.acc_n"},{"left":"a.acc_n","right":"taglpy.acc_n"},{"left":"a.acc_n","right":"aara.acc_n"}],"src_alias":"foa","tgt_alias":"","is_external":false},{"from":"ptm_foa","to":"account_profile_curr_ikg_tmp","jk":[{"left":"a.acc_n","right":"s.fxd_acc_n"},{"left":"a.profile_date","right":"s.profile_date"},{"left":"a.acc_n","right":"mcr.acc_n"},{"left":"a.profile_date","right":"mcr.profile_date"},{"left":"a.ip_cli_i","right":"cdc.ip_cli_i"},{"left":"a.acc_mhh_n","right":"h.acc_mhh_n"},{"left":"a.profile_date","right":"h.profile_date"},{"left":"mbi.acc_n","right":"a.acc_n"},{"left":"mbi.profile_date","right":"a.profile_date"},{"left":"mbi.ip_cli_i","right":"a.ip_cli_i"},{"left":"foa.acc_n","right":"a.acc_n"},{"left":"a.acc_n","right":"ptm.acc_n"},{"left":"a.acc_i","right":"msw.acc_i"},{"left":"a.ip_cli_i","right":"fga_c.fga_client_ip_cli_i"},{"left":"a.ip_cli_i","right":"fga_co.fga_coclient_ip_cli_i"},{"left":"a.acc_n","right":"mapdc.acc_n"},{"left":"a.acc_n","right":"mapdpy.acc_n"},{"left":"a.acc_n","right":"tagl.acc_n"},{"left":"a.acc_n","right":"taglpy.acc_n"},{"left":"a.acc_n","right":"aara.acc_n"}],"src_alias":"ptm","tgt_alias":"","is_external":false},{"from":"multibank_sweep_weekly","to":"account_profile_curr_ikg_tmp","jk":[{"left":"a.acc_n","right":"s.fxd_acc_n"},{"left":"a.profile_date","right":"s.profile_date"},{"left":"a.acc_n","right":"mcr.acc_n"},{"left":"a.profile_date","right":"mcr.profile_date"},{"left":"a.ip_cli_i","right":"cdc.ip_cli_i"},{"left":"a.acc_mhh_n","right":"h.acc_mhh_n"},{"left":"a.profile_date","right":"h.profile_date"},{"left":"mbi.acc_n","right":"a.acc_n"},{"left":"mbi.profile_date","right":"a.profile_date"},{"left":"mbi.ip_cli_i","right":"a.ip_cli_i"},{"left":"foa.acc_n","right":"a.acc_n"},{"left":"a.acc_n","right":"ptm.acc_n"},{"left":"a.acc_i","right":"msw.acc_i"},{"left":"a.ip_cli_i","right":"fga_c.fga_client_ip_cli_i"},{"left":"a.ip_cli_i","right":"fga_co.fga_coclient_ip_cli_i"},{"left":"a.acc_n","right":"mapdc.acc_n"},{"left":"a.acc_n","right":"mapdpy.acc_n"},{"left":"a.acc_n","right":"tagl.acc_n"},{"left":"a.acc_n","right":"taglpy.acc_n"},{"left":"a.acc_n","right":"aara.acc_n"}],"src_alias":"msw","tgt_alias":"","is_external":false},{"from":"fga_ikg","to":"account_profile_curr_ikg_tmp","jk":[{"left":"a.acc_n","right":"s.fxd_acc_n"},{"left":"a.profile_date","right":"s.profile_date"},{"left":"a.acc_n","right":"mcr.acc_n"},{"left":"a.profile_date","right":"mcr.profile_date"},{"left":"a.ip_cli_i","right":"cdc.ip_cli_i"},{"left":"a.acc_mhh_n","right":"h.acc_mhh_n"},{"left":"a.profile_date","right":"h.profile_date"},{"left":"mbi.acc_n","right":"a.acc_n"},{"left":"mbi.profile_date","right":"a.profile_date"},{"left":"mbi.ip_cli_i","right":"a.ip_cli_i"},{"left":"foa.acc_n","right":"a.acc_n"},{"left":"a.acc_n","right":"ptm.acc_n"},{"left":"a.acc_i","right":"msw.acc_i"},{"left":"a.ip_cli_i","right":"fga_c.fga_client_ip_cli_i"},{"left":"a.ip_cli_i","right":"fga_co.fga_coclient_ip_cli_i"},{"left":"a.acc_n","right":"mapdc.acc_n"},{"left":"a.acc_n","right":"mapdpy.acc_n"},{"left":"a.acc_n","right":"tagl.acc_n"},{"left":"a.acc_n","right":"taglpy.acc_n"},{"left":"a.acc_n","right":"aara.acc_n"}],"src_alias":"fga_co","tgt_alias":"","is_external":false},{"from":"mike_acc_performance_drivers_cur","to":"account_profile_curr_ikg_tmp","jk":[{"left":"a.acc_n","right":"s.fxd_acc_n"},{"left":"a.profile_date","right":"s.profile_date"},{"left":"a.acc_n","right":"mcr.acc_n"},{"left":"a.profile_date","right":"mcr.profile_date"},{"left":"a.ip_cli_i","right":"cdc.ip_cli_i"},{"left":"a.acc_mhh_n","right":"h.acc_mhh_n"},{"left":"a.profile_date","right":"h.profile_date"},{"left":"mbi.acc_n","right":"a.acc_n"},{"left":"mbi.profile_date","right":"a.profile_date"},{"left":"mbi.ip_cli_i","right":"a.ip_cli_i"},{"left":"foa.acc_n","right":"a.acc_n"},{"left":"a.acc_n","right":"ptm.acc_n"},{"left":"a.acc_i","right":"msw.acc_i"},{"left":"a.ip_cli_i","right":"fga_c.fga_client_ip_cli_i"},{"left":"a.ip_cli_i","right":"fga_co.fga_coclient_ip_cli_i"},{"left":"a.acc_n","right":"mapdc.acc_n"},{"left":"a.acc_n","right":"mapdpy.acc_n"},{"left":"a.acc_n","right":"tagl.acc_n"},{"left":"a.acc_n","right":"taglpy.acc_n"},{"left":"a.acc_n","right":"aara.acc_n"}],"src_alias":"mapdc","tgt_alias":"","is_external":false},{"from":"mike_acc_performance_drivers_prev_year","to":"account_profile_curr_ikg_tmp","jk":[{"left":"a.acc_n","right":"s.fxd_acc_n"},{"left":"a.profile_date","right":"s.profile_date"},{"left":"a.acc_n","right":"mcr.acc_n"},{"left":"a.profile_date","right":"mcr.profile_date"},{"left":"a.ip_cli_i","right":"cdc.ip_cli_i"},{"left":"a.acc_mhh_n","right":"h.acc_mhh_n"},{"left":"a.profile_date","right":"h.profile_date"},{"left":"mbi.acc_n","right":"a.acc_n"},{"left":"mbi.profile_date","right":"a.profile_date"},{"left":"mbi.ip_cli_i","right":"a.ip_cli_i"},{"left":"foa.acc_n","right":"a.acc_n"},{"left":"a.acc_n","right":"ptm.acc_n"},{"left":"a.acc_i","right":"msw.acc_i"},{"left":"a.ip_cli_i","right":"fga_c.fga_client_ip_cli_i"},{"left":"a.ip_cli_i","right":"fga_co.fga_coclient_ip_cli_i"},{"left":"a.acc_n","right":"mapdc.acc_n"},{"left":"a.acc_n","right":"mapdpy.acc_n"},{"left":"a.acc_n","right":"tagl.acc_n"},{"left":"a.acc_n","right":"taglpy.acc_n"},{"left":"a.acc_n","right":"aara.acc_n"}],"src_alias":"mapdpy","tgt_alias":"","is_external":false},{"from":"tax_acc_gain_loss","to":"account_profile_curr_ikg_tmp","jk":[{"left":"a.acc_n","right":"s.fxd_acc_n"},{"left":"a.profile_date","right":"s.profile_date"},{"left":"a.acc_n","right":"mcr.acc_n"},{"left":"a.profile_date","right":"mcr.profile_date"},{"left":"a.ip_cli_i","right":"cdc.ip_cli_i"},{"left":"a.acc_mhh_n","right":"h.acc_mhh_n"},{"left":"a.profile_date","right":"h.profile_date"},{"left":"mbi.acc_n","right":"a.acc_n"},{"left":"mbi.profile_date","right":"a.profile_date"},{"left":"mbi.ip_cli_i","right":"a.ip_cli_i"},{"left":"foa.acc_n","right":"a.acc_n"},{"left":"a.acc_n","right":"ptm.acc_n"},{"left":"a.acc_i","right":"msw.acc_i"},{"left":"a.ip_cli_i","right":"fga_c.fga_client_ip_cli_i"},{"left":"a.ip_cli_i","right":"fga_co.fga_coclient_ip_cli_i"},{"left":"a.acc_n","right":"mapdc.acc_n"},{"left":"a.acc_n","right":"mapdpy.acc_n"},{"left":"a.acc_n","right":"tagl.acc_n"},{"left":"a.acc_n","right":"taglpy.acc_n"},{"left":"a.acc_n","right":"aara.acc_n"}],"src_alias":"tagl","tgt_alias":"","is_external":false},{"from":"tax_acc_gain_loss_prev_year","to":"account_profile_curr_ikg_tmp","jk":[{"left":"a.acc_n","right":"s.fxd_acc_n"},{"left":"a.profile_date","right":"s.profile_date"},{"left":"a.acc_n","right":"mcr.acc_n"},{"left":"a.profile_date","right":"mcr.profile_date"},{"left":"a.ip_cli_i","right":"cdc.ip_cli_i"},{"left":"a.acc_mhh_n","right":"h.acc_mhh_n"},{"left":"a.profile_date","right":"h.profile_date"},{"left":"mbi.acc_n","right":"a.acc_n"},{"left":"mbi.profile_date","right":"a.profile_date"},{"left":"mbi.ip_cli_i","right":"a.ip_cli_i"},{"left":"foa.acc_n","right":"a.acc_n"},{"left":"a.acc_n","right":"ptm.acc_n"},{"left":"a.acc_i","right":"msw.acc_i"},{"left":"a.ip_cli_i","right":"fga_c.fga_client_ip_cli_i"},{"left":"a.ip_cli_i","right":"fga_co.fga_coclient_ip_cli_i"},{"left":"a.acc_n","right":"mapdc.acc_n"},{"left":"a.acc_n","right":"mapdpy.acc_n"},{"left":"a.acc_n","right":"tagl.acc_n"},{"left":"a.acc_n","right":"taglpy.acc_n"},{"left":"a.acc_n","right":"aara.acc_n"}],"src_alias":"taglpy","tgt_alias":"","is_external":false},{"from":"aladdin_accounts_risk_alert_ikg","to":"account_profile_curr_ikg_tmp","jk":[{"left":"a.acc_n","right":"s.fxd_acc_n"},{"left":"a.profile_date","right":"s.profile_date"},{"left":"a.acc_n","right":"mcr.acc_n"},{"left":"a.profile_date","right":"mcr.profile_date"},{"left":"a.ip_cli_i","right":"cdc.ip_cli_i"},{"left":"a.acc_mhh_n","right":"h.acc_mhh_n"},{"left":"a.profile_date","right":"h.profile_date"},{"left":"mbi.acc_n","right":"a.acc_n"},{"left":"mbi.profile_date","right":"a.profile_date"},{"left":"mbi.ip_cli_i","right":"a.ip_cli_i"},{"left":"foa.acc_n","right":"a.acc_n"},{"left":"a.acc_n","right":"ptm.acc_n"},{"left":"a.acc_i","right":"msw.acc_i"},{"left":"a.ip_cli_i","right":"fga_c.fga_client_ip_cli_i"},{"left":"a.ip_cli_i","right":"fga_co.fga_coclient_ip_cli_i"},{"left":"a.acc_n","right":"mapdc.acc_n"},{"left":"a.acc_n","right":"mapdpy.acc_n"},{"left":"a.acc_n","right":"tagl.acc_n"},{"left":"a.acc_n","right":"taglpy.acc_n"},{"left":"a.acc_n","right":"aara.acc_n"}],"src_alias":"aara","tgt_alias":"","is_external":false},{"from":"max_asset_client_ids_ikg","to":"household_lead_client_ikg","jk":[{"left":"b.ip_cli_i","right":"a.ip_cli_i"},{"left":"ce.ip_cli_i","right":"a.ip_cli_i"}],"src_alias":"a","tgt_alias":"","is_external":false},{"from":"asset_amount_acct_cli_ikg","to":"household_lead_client_ikg","jk":[{"left":"b.ip_cli_i","right":"a.ip_cli_i"},{"left":"ce.ip_cli_i","right":"a.ip_cli_i"}],"src_alias":"b","tgt_alias":"","is_external":false},{"from":"client_email_dimn","to":"household_lead_client_ikg","jk":[{"left":"b.ip_cli_i","right":"a.ip_cli_i"},{"left":"ce.ip_cli_i","right":"a.ip_cli_i"}],"src_alias":"x","tgt_alias":"","is_external":true},{"from":"acc_cli_shhp_map_ikg","to":"intl_household_plus_ids","jk":[],"src_alias":"a","tgt_alias":"","is_external":false},{"from":"internaltional_branches_tmp","to":"intl_household_plus_ids","jk":[],"src_alias":"ib","tgt_alias":"","is_external":false},{"from":"imr_foa_status_ikg","to":"foa_code_tmp","jk":[],"src_alias":"","tgt_alias":"","is_external":false},{"from":"master_ids_curr_ikg","to":"max_asset_client_ids_ikg","jk":[{"left":"d.acc_mhh_n","right":"m.acc_mhh_n"},{"left":"m.profile_date","right":"d.profile_date"}],"src_alias":"m","tgt_alias":"","is_external":false},{"from":"asset_account_ikg","to":"max_asset_client_ids_ikg","jk":[{"left":"d.acc_mhh_n","right":"m.acc_mhh_n"},{"left":"m.profile_date","right":"d.profile_date"}],"src_alias":"d","tgt_alias":"","is_external":false},{"from":"master_ids_curr_ikg","to":"asset_amount_acct_cli_ikg","jk":[{"left":"a.acc_n","right":"m.acc_n"}],"src_alias":"m","tgt_alias":"","is_external":false},{"from":"asset_amount_acct_ikg","to":"asset_amount_acct_cli_ikg","jk":[{"left":"a.acc_n","right":"m.acc_n"}],"src_alias":"a","tgt_alias":"","is_external":false},{"from":"acc_ast_pre_splt_fact_curr","to":"acc_cli_shhp_map_ikg","jk":[{"left":"m.brn_i","right":"b.brn_i"},{"left":"m.acc_mhh_n","right":"cw.acc_mhh_n"},{"left":"m.acc_n","right":"asset_d.acc_n"}],"src_alias":"a","tgt_alias":"","is_external":true},{"from":"mv_acct_dimn_curr_weekly","to":"acc_cli_shhp_map_ikg","jk":[{"left":"m.brn_i","right":"b.brn_i"},{"left":"m.acc_mhh_n","right":"cw.acc_mhh_n"},{"left":"m.acc_n","right":"asset_d.acc_n"}],"src_alias":"m","tgt_alias":"","is_external":true},{"from":"mv_branch_division_dimn_curr_weekly","to":"acc_cli_shhp_map_ikg","jk":[{"left":"m.brn_i","right":"b.brn_i"},{"left":"m.acc_mhh_n","right":"cw.acc_mhh_n"},{"left":"m.acc_n","right":"asset_d.acc_n"}],"src_alias":"b","tgt_alias":"","is_external":true},{"from":"use_consultworks_id","to":"acc_cli_shhp_map_ikg","jk":[{"left":"m.brn_i","right":"b.brn_i"},{"left":"m.acc_mhh_n","right":"cw.acc_mhh_n"},{"left":"m.acc_n","right":"asset_d.acc_n"}],"src_alias":"","tgt_alias":"","is_external":false},{"from":"mv_branch_division_dimn_curr_weekly","to":"internaltional_branches_tmp","jk":[],"src_alias":"bdd","tgt_alias":"","is_external":true},{"from":"master_ids_ikg","to":"master_ids_curr_ikg","jk":[],"src_alias":"","tgt_alias":"","is_external":false},{"from":"asset_amount_account_shhp_ikg","to":"asset_account_ikg","jk":[],"src_alias":"","tgt_alias":"","is_external":false},{"from":"asset_security_hist","to":"asset_amount_acct_ikg","jk":[],"src_alias":"a","tgt_alias":"","is_external":false},{"from":"mv_acct_dimn_curr_weekly","to":"use_consultworks_id","jk":[],"src_alias":"","tgt_alias":"","is_external":true},{"from":"mv_acct_dimn_weekly","to":"master_ids_ikg","jk":[{"left":"a.acc_dimn_i","right":"b.acc_dimn_i"},{"left":"a.acc_i","right":"c.acc_i"},{"left":"a.ip_cli_i","right":"s.ip_cli_i"}],"src_alias":"a","tgt_alias":"","is_external":true},{"from":"statement_plus_ids","to":"master_ids_ikg","jk":[{"left":"a.acc_dimn_i","right":"b.acc_dimn_i"},{"left":"a.acc_i","right":"c.acc_i"},{"left":"a.ip_cli_i","right":"s.ip_cli_i"}],"src_alias":"","tgt_alias":"","is_external":false},{"from":"mv_acct_dimn_curr_weekly","to":"master_ids_ikg","jk":[{"left":"a.acc_dimn_i","right":"b.acc_dimn_i"},{"left":"a.acc_i","right":"c.acc_i"},{"left":"a.ip_cli_i","right":"s.ip_cli_i"}],"src_alias":"","tgt_alias":"","is_external":true},{"from":"rmd_reports_into_staat_ipclii_distinct","to":"master_ids_ikg","jk":[{"left":"a.acc_dimn_i","right":"b.acc_dimn_i"},{"left":"a.acc_i","right":"c.acc_i"},{"left":"a.ip_cli_i","right":"s.ip_cli_i"}],"src_alias":"s","tgt_alias":"","is_external":true},{"from":"acc_omit_ikg","to":"master_ids_ikg","jk":[{"left":"a.acc_dimn_i","right":"b.acc_dimn_i"},{"left":"a.acc_i","right":"c.acc_i"},{"left":"a.ip_cli_i","right":"s.ip_cli_i"}],"src_alias":"","tgt_alias":"","is_external":false},{"from":"asset_amount_acct_ikg","to":"asset_amount_account_shhp_ikg","jk":[],"src_alias":"a","tgt_alias":"","is_external":false},{"from":"master_ids_ikg","to":"asset_security_hist","jk":[{"left":"a.new_acc_i","right":"b.acc_i"}],"src_alias":"","tgt_alias":"","is_external":false},{"from":"acc_ast_pre_split_hist_ikg","to":"asset_security_hist","jk":[{"left":"a.new_acc_i","right":"b.acc_i"}],"src_alias":"b","tgt_alias":"","is_external":false},{"from":"statement_plus","to":"statement_plus_ids","jk":[],"src_alias":"","tgt_alias":"","is_external":false},{"from":"acc_ast_pre_splt_fact_curr_hist_ikg","to":"acc_ast_pre_split_hist_ikg","jk":[{"left":"a.pw_scty_i","right":"b.pw_scty_i"}],"src_alias":"a","tgt_alias":"","is_external":false},{"from":"mv_product_dimn_weekly","to":"acc_ast_pre_split_hist_ikg","jk":[{"left":"a.pw_scty_i","right":"b.pw_scty_i"}],"src_alias":"b","tgt_alias":"","is_external":true},{"from":"statement_plus_temp","to":"statement_plus","jk":[{"left":"a.acc_dimn_i","right":"b.acc_dimn_i"}],"src_alias":"a","tgt_alias":"","is_external":false},{"from":"mv_acct_dimn_curr_weekly","to":"statement_plus","jk":[{"left":"a.acc_dimn_i","right":"b.acc_dimn_i"}],"src_alias":"b","tgt_alias":"","is_external":true},{"from":"closed_convereted_to_statement_plus_ikg","to":"statement_plus","jk":[{"left":"a.acc_dimn_i","right":"b.acc_dimn_i"}],"src_alias":"a","tgt_alias":"","is_external":false},{"from":"acc_ast_pre_splt_fact_curr","to":"acc_ast_pre_splt_fact_curr_hist_ikg","jk":[],"src_alias":"","tgt_alias":"","is_external":true},{"from":"acc_cli_shhp_map_ikg","to":"statement_plus_temp","jk":[],"src_alias":"s","tgt_alias":"","is_external":false},{"from":"statement_plus_temp","to":"closed_convereted_to_statement_plus_ikg","jk":[{"left":"msp.cw_rel_i","right":"sp.household_plus"},{"left":"msp.ip_cli_i","right":"sp.client_id"},{"left":"msp.acc_i","right":"cw.new_account_id"}],"src_alias":"","tgt_alias":"","is_external":false},{"from":"cw_used_data","to":"closed_convereted_to_statement_plus_ikg","jk":[{"left":"msp.cw_rel_i","right":"sp.household_plus"},{"left":"msp.ip_cli_i","right":"sp.client_id"},{"left":"msp.acc_i","right":"cw.new_account_id"}],"src_alias":"","tgt_alias":"","is_external":false}],"final":"account_profile_curr_ikg"};
+
+const STYLE={
+  final:{fill:'#0a2a18',stroke:'#2ecc71',text:'#90f0b0'},
+  ikg:  {fill:'#0a1c30',stroke:'#2980b9',text:'#80b8e8'},
+  tmp:  {fill:'#180a2e',stroke:'#8e44ad',text:'#c080e8'},
+  ext:  {fill:'#261200',stroke:'#e67e22',text:'#f0a860'},
+};
+const TC={final:'#2ecc71',ikg:'#2980b9',tmp:'#8e44ad',ext:'#e67e22'};
+const TL={final:'Final Output',ikg:'IKG Table',tmp:'Temp Table',ext:'External/EDW'};
+
+const NM={},EO={},EI={};
+RAW.nodes.forEach(function(n){
+  n.w=Math.max(180,n.id.length*7.2+32); n.h=36; n.x=0; n.y=0;
+  NM[n.id]=n; EO[n.id]=[]; EI[n.id]=[];
+});
+RAW.edges.forEach(function(e){
+  if(NM[e.from]&&NM[e.to]){EO[e.from].push(e);EI[e.to].push(e);}
+});
+
+function layout(){
+  var byLv={};
+  RAW.nodes.forEach(function(n){if(!byLv[n.level])byLv[n.level]=[];byLv[n.level].push(n);});
+  var maxLv=Math.max.apply(null,RAW.nodes.map(function(n){return n.level;}));
+  var CW=260,RH=52,PX=60,PY=50;
+  Object.keys(byLv).forEach(function(lv){
+    var col=byLv[lv];
+    col.sort(function(a,b){return(EO[b.id].length+EI[b.id].length)-(EO[a.id].length+EI[a.id].length);});
+    col.forEach(function(n,i){n.x=PX+(maxLv-lv)*CW;n.y=PY+i*RH;});
+  });
+  for(var i=0;i<80;i++)forceStep();
+}
+function forceStep(){
+  var f={};
+  RAW.nodes.forEach(function(n){f[n.id]={x:0,y:0};});
+  for(var i=0;i<RAW.nodes.length;i++){
+    for(var j=i+1;j<RAW.nodes.length;j++){
+      var a=RAW.nodes[i],b=RAW.nodes[j];
+      var dx=b.x-a.x||.1,dy=b.y-a.y||.1,d=Math.sqrt(dx*dx+dy*dy)||1,rep=500/(d*d);
+      f[a.id].x-=rep*dx/d;f[a.id].y-=rep*dy/d;f[b.id].x+=rep*dx/d;f[b.id].y+=rep*dy/d;
+    }
+  }
+  RAW.edges.forEach(function(e){
+    var a=NM[e.from],b=NM[e.to];if(!a||!b)return;
+    var dx=b.x-a.x,dy=b.y-a.y,att=0.04;
+    f[a.id].x+=att*dx;f[a.id].y+=att*dy;f[b.id].x-=att*dx;f[b.id].y-=att*dy;
+  });
+  RAW.nodes.forEach(function(n){n.x+=f[n.id].x*.8;n.y+=f[n.id].y*.8;});
+}
+layout();
+
+var cvA=document.getElementById('cv-area'),cv=document.getElementById('cv'),ctx=cv.getContext('2d');
+var tx=0,ty=0,sc=1,maxLv=99,showT={ikg:true,tmp:true,ext:true},srchQ='',hlId=null;
+
+function isVis(n){
+  if(n.level>maxLv)return false;
+  if(n.type!=='final'&&!showT[n.type])return false;
+  if(srchQ&&n.id.indexOf(srchQ)<0)return false;
+  return true;
+}
+
+function render(){
+  ctx.clearRect(0,0,cv.width,cv.height);
+  ctx.save();ctx.translate(tx,ty);ctx.scale(sc,sc);
+  drawGrid();
+  RAW.edges.forEach(function(e){
+    var a=NM[e.from],b=NM[e.to];
+    if(!a||!b||!isVis(a)||!isVis(b))return;
+    drawEdge(e,a,b);
+  });
+  RAW.nodes.forEach(function(n){if(isVis(n))drawNode(n);});
+  ctx.restore();
+  document.getElementById('sb-v').textContent=RAW.nodes.filter(isVis).length;
+}
+
+function drawGrid(){
+  var gs=40,ox=-tx/sc,oy=-ty/sc,W=cv.width/sc,H=cv.height/sc;
+  ctx.strokeStyle='#10192a';ctx.lineWidth=1;
+  for(var x=Math.floor(ox/gs)*gs;x<ox+W;x+=gs){ctx.beginPath();ctx.moveTo(x,oy);ctx.lineTo(x,oy+H);ctx.stroke();}
+  for(var y=Math.floor(oy/gs)*gs;y<oy+H;y+=gs){ctx.beginPath();ctx.moveTo(ox,y);ctx.lineTo(ox+W,y);ctx.stroke();}
+}
+
+function drawEdge(e,a,b){
+  var hl=hlId&&(e.from===hlId||e.to===hlId);
+  var x1=a.x+a.w,y1=a.y+a.h/2,x2=b.x,y2=b.y+b.h/2,cp=Math.abs(x2-x1)*.42;
+  ctx.beginPath();ctx.moveTo(x1,y1);ctx.bezierCurveTo(x1+cp,y1,x2-cp,y2,x2,y2);
+  ctx.strokeStyle=hl?(e.to===hlId?'#4adb80':'#f0a840'):(srchQ?'#151f2e':'#1e2d42');
+  ctx.lineWidth=hl?2:1;ctx.globalAlpha=hl?1:.5;ctx.stroke();ctx.globalAlpha=1;
+  if(hl){
+    var col=e.to===hlId?'#4adb80':'#f0a840';
+    var ang=Math.atan2(y2-(y1+(y2-y1)*.8),x2-(x1+(x2-x1)*.8)),as=7;
+    ctx.beginPath();ctx.moveTo(x2,y2);
+    ctx.lineTo(x2-as*Math.cos(ang-.4),y2-as*Math.sin(ang-.4));
+    ctx.lineTo(x2-as*Math.cos(ang+.4),y2-as*Math.sin(ang+.4));
+    ctx.closePath();ctx.fillStyle=col;ctx.fill();
+  }
+}
+
+function drawNode(n){
+  var s=STYLE[n.type],isFinal=n.id===RAW.final,isHl=hlId===n.id;
+  var conn=hlId&&(EO[n.id].some(function(e){return e.to===hlId;})||EI[n.id].some(function(e){return e.from===hlId;}));
+  var dim=hlId&&!isHl&&!conn;
+  if(isHl||isFinal){ctx.shadowColor=s.stroke;ctx.shadowBlur=isHl?18:10;}
+  ctx.globalAlpha=dim?.18:1;
+  ctx.fillStyle=s.fill;rrect(n.x,n.y,n.w,n.h,6);ctx.fill();
+  ctx.strokeStyle=isHl?'#ffffff':(srchQ&&n.id.indexOf(srchQ)>=0?'#f0d060':s.stroke);
+  ctx.lineWidth=isHl||isFinal?2:1;rrect(n.x,n.y,n.w,n.h,6);ctx.stroke();
+  ctx.shadowBlur=0;
+  ctx.fillStyle=s.stroke;rrect(n.x,n.y,n.w,3,{tl:6,tr:6,bl:0,br:0});ctx.fill();
+  ctx.fillStyle=dim?'#1e2a38':s.text;
+  ctx.font=(isFinal?'bold ':'')+' 10.5px Segoe UI,system-ui,sans-serif';
+  ctx.textAlign='left';ctx.textBaseline='middle';
+  var lbl=n.id,mw=n.w-36;
+  while(ctx.measureText(lbl).width>mw&&lbl.length>4)lbl=lbl.slice(0,-4)+'...';
+  ctx.fillText(lbl,n.x+10,n.y+n.h/2+2);
+  ctx.font='8px Segoe UI,system-ui,sans-serif';
+  ctx.fillStyle=dim?'#1e2a38':s.stroke+'99';ctx.textAlign='right';
+  ctx.fillText(isFinal?'OUTPUT':'L'+n.level,n.x+n.w-5,n.y+n.h/2+2);
+  ctx.globalAlpha=1;
+}
+
+function rrect(x,y,w,h,r){
+  var tl,tr,bl,br;
+  if(typeof r==='number'){tl=tr=bl=br=r;}else{tl=r.tl||0;tr=r.tr||0;bl=r.bl||0;br=r.br||0;}
+  ctx.beginPath();
+  ctx.moveTo(x+tl,y);ctx.lineTo(x+w-tr,y);ctx.arcTo(x+w,y,x+w,y+tr,tr);
+  ctx.lineTo(x+w,y+h-br);ctx.arcTo(x+w,y+h,x+w-br,y+h,br);
+  ctx.lineTo(x+bl,y+h);ctx.arcTo(x,y+h,x,y+h-bl,bl);
+  ctx.lineTo(x,y+tl);ctx.arcTo(x,y,x+tl,y,tl);
+  ctx.closePath();
+}
+
+var panning=null;
+cv.addEventListener('mousedown',function(e){panning={mx:e.clientX,my:e.clientY,tx:tx,ty:ty};});
+cv.addEventListener('mousemove',function(e){
+  if(!panning)return;
+  tx=panning.tx+(e.clientX-panning.mx);ty=panning.ty+(e.clientY-panning.my);render();
+});
+cv.addEventListener('mouseup',function(e){
+  var moved=panning&&(Math.abs(e.clientX-panning.mx)>4||Math.abs(e.clientY-panning.my)>4);
+  panning=null;
+  if(!moved){
+    var p=s2w(e.offsetX,e.offsetY),hit=hitNode(p.x,p.y);
+    if(hit){hlId=hit.id;openPanel(hit);}else{hlId=null;closePanel();}
+    render();
+  }
+});
+cv.addEventListener('mouseleave',function(){panning=null;});
+cv.addEventListener('wheel',function(e){
+  e.preventDefault();
+  var d=e.deltaY>0?.88:1.14;
+  tx=e.offsetX-d*(e.offsetX-tx);ty=e.offsetY-d*(e.offsetY-ty);
+  sc=Math.max(.04,Math.min(6,sc*d));
+  document.getElementById('sb-z').textContent=Math.round(sc*100)+'%';render();
+},{passive:false});
+
+function s2w(sx,sy){return{x:(sx-tx)/sc,y:(sy-ty)/sc};}
+function hitNode(wx,wy){
+  for(var i=RAW.nodes.length-1;i>=0;i--){
+    var n=RAW.nodes[i];if(!isVis(n))continue;
+    if(wx>=n.x&&wx<=n.x+n.w&&wy>=n.y&&wy<=n.y+n.h)return n;
+  }
+  return null;
+}
+
+// ── Panel ────────────────────────────────────────────────────────────────────
+function openPanel(n){
+  var p=document.getElementById('panel');p.classList.add('open');
+  document.getElementById('ph-title').textContent=n.id;
+  document.getElementById('ph-meta').textContent=
+    TL[n.type]+' \u2022 Level '+n.level+
+    ' \u2022 '+EI[n.id].length+' inputs \u2022 '+EO[n.id].length+' outputs';
+  document.getElementById('ph-meta').style.color=TC[n.type]+'88';
+  buildSec('src',EI[n.id],n.id,true);
+  buildSec('dst',EO[n.id],n.id,false);
+}
+
+function buildSec(sec,edges,nodeId,isSource){
+  document.getElementById('cnt-'+sec).textContent=edges.length;
+  var body=document.getElementById('body-'+sec);
+  body.innerHTML='';
+  if(!edges.length){
+    var em=document.createElement('div');
+    em.style.cssText='padding:8px 14px;color:#1e2d3a;font-size:.72rem;font-style:italic;';
+    em.textContent=isSource?'No source tables (base/external input)':'No downstream tables (leaf output)';
+    body.appendChild(em);return;
+  }
+
+  edges.forEach(function(e){
+    var otherId=isSource?e.from:e.to;
+    var other=NM[otherId];
+    var type=other?other.type:'ext';
+    var col=TC[type]||'#718096';
+
+    // Determine which alias belongs to which side
+    var thisAlias=isSource?e.src_alias:e.tgt_alias;
+    var otherAlias=isSource?e.src_alias:e.tgt_alias;
+    // src_alias = alias of "from" table, tgt_alias = alias of "to" table
+    var fromAlias=e.src_alias||'';
+    var toAlias=e.tgt_alias||'';
+    var displayAlias=isSource?fromAlias:toAlias;
+
+    var row=document.createElement('div');row.className='trow';
+    row.addEventListener('click',function(){
+      var target=NM[otherId];
+      if(target){hlId=otherId;openPanel(target);focusNode(otherId);render();}
+    });
+
+    // Top line
+    var top=document.createElement('div');top.className='trow-top';
+    var dot=document.createElement('div');dot.className='tdot';
+    dot.style.background=col;dot.style.border='1px solid '+col+'66';
+    var nm=document.createElement('div');nm.className='tname';nm.textContent=otherId;
+    top.appendChild(dot);top.appendChild(nm);
+    if(displayAlias){
+      var ab=document.createElement('span');ab.className='talias';
+      ab.textContent='alias: '+displayAlias;top.appendChild(ab);
+    }
+    row.appendChild(top);
+
+    // Join keys table
+    var jks=e.jk||[];
+    if(jks.length){
+      var tbl=document.createElement('table');tbl.className='jk-table';
+      var thead=tbl.createTHead();var hr=thead.insertRow();
+      var th1=document.createElement('th');th1.textContent='Source ('+( fromAlias||e.from.slice(0,12))+')';
+      var th2=document.createElement('th');th2.style.cssText='width:18px;text-align:center;';th2.textContent='';
+      var th3=document.createElement('th');th3.textContent='Destination ('+( toAlias||e.to.slice(0,12))+')';
+      hr.appendChild(th1);hr.appendChild(th2);hr.appendChild(th3);
+      var tbody=tbl.createTBody();
+      jks.forEach(function(jk){
+        var tr=tbody.insertRow();
+        if(jk.left&&jk.right){
+          var td1=tr.insertCell();td1.className='jk-src';td1.textContent=jk.left;
+          var td2=tr.insertCell();td2.className='jk-eq';td2.textContent='=';
+          var td3=tr.insertCell();td3.className='jk-dst';td3.textContent=jk.right;
+        } else if(jk.col){
+          var td1=tr.insertCell();td1.className='jk-src';td1.textContent=jk.col;td1.colSpan=3;
+        }
+      });
+      row.appendChild(tbl);
+    } else {
+      var nj=document.createElement('div');nj.className='no-jk';
+      nj.textContent='(no explicit join key \u2014 derived or subquery source)';
+      row.appendChild(nj);
+    }
+    body.appendChild(row);
+  });
+}
+
+function closePanel(){
+  document.getElementById('panel').classList.remove('open');
+  hlId=null;render();
+}
+function toggleSec(s){document.getElementById('hdr-'+s).classList.toggle('collapsed');}
+
+function focusNode(id){
+  var n=NM[id];if(!n)return;
+  var r=cvA.getBoundingClientRect();
+  tx=r.width/2-n.x*sc-(n.w/2)*sc;ty=r.height/2-n.y*sc-(n.h/2)*sc;
+}
+
+function resize(){var r=cvA.getBoundingClientRect();cv.width=r.width;cv.height=r.height;render();}
+window.addEventListener('resize',resize);
+
+function resetView(){hlId=null;closePanel();fitAll();}
+function fitAll(){
+  maxLv=99;
+  ['ikg','tmp','ext'].forEach(function(t){showT[t]=true;document.getElementById('btn-'+t).classList.add('on');});
+  fitVisible();
+}
+function fitLv(lv){maxLv=lv;fitVisible();}
+function fitVisible(){
+  var vis=RAW.nodes.filter(isVis);if(!vis.length)return;
+  var x1=Math.min.apply(null,vis.map(function(n){return n.x;}));
+  var x2=Math.max.apply(null,vis.map(function(n){return n.x+n.w;}));
+  var y1=Math.min.apply(null,vis.map(function(n){return n.y;}));
+  var y2=Math.max.apply(null,vis.map(function(n){return n.y+n.h;}));
+  var pad=60;
+  sc=Math.min((cv.width-pad*2)/(x2-x1||1),(cv.height-pad*2)/(y2-y1||1),1.4);
+  tx=pad-x1*sc;ty=(cv.height-(y2-y1)*sc)/2-y1*sc;
+  document.getElementById('sb-z').textContent=Math.round(sc*100)+'%';render();
+}
+function zoomIn(){applyZoom(1.2);}function zoomOut(){applyZoom(.83);}
+function applyZoom(d){
+  var cx=cv.width/2,cy=cv.height/2;tx=cx-d*(cx-tx);ty=cy-d*(cy-ty);
+  sc=Math.max(.04,Math.min(6,sc*d));
+  document.getElementById('sb-z').textContent=Math.round(sc*100)+'%';render();
+}
+function toggle(t){showT[t]=!showT[t];document.getElementById('btn-'+t).classList.toggle('on',showT[t]);render();}
+function onSearch(){srchQ=document.getElementById('srch').value.toLowerCase().trim();render();}
+function clearSearch(){srchQ='';document.getElementById('srch').value='';render();}
+
+window.addEventListener('load',function(){
+  resize();
+  var mx=Math.max.apply(null,RAW.nodes.map(function(n){return n.level;}));
+  document.getElementById('sp-n').textContent=RAW.nodes.length+' nodes';
+  document.getElementById('sp-e').textContent=RAW.edges.length+' edges';
+  document.getElementById('sp-l').textContent=(mx+1)+' levels';
+  fitVisible();
+});
+
+</script>
+</body>
+</html>

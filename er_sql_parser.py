@@ -351,16 +351,88 @@ class SQLParser:
             "external_tables": sorted(self.external_tables),
             "relationships": deduped,
             "table_sources": {k: list(v) for k, v in self.table_sources.items()},
+            "final_table": "",  # populated by auto_detect_final_table if empty
         }
 
 
 import json
 
+def auto_detect_final_table(summary: dict, sql_text: str = "") -> str:
+    """
+    Auto-detect the final output table using multiple signals:
+    1. Last CREATE TABLE in the SQL script (most reliable for pipelines)
+    2. Leaf node with the most upstream dependencies (fallback)
+    """
+    created = list(summary['created_tables'])  # already sorted alphabetically
+
+    if not created:
+        return ''
+
+    # Signal 1: Find the LAST created table by position in SQL script
+    if sql_text:
+        import re
+        # Find all CREATE TABLE statements and their positions
+        pattern = re.compile(
+            r'CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:\{\{[^}]+\}\}\.)?(\w+)',
+            re.IGNORECASE
+        )
+        positions = []
+        for m in pattern.finditer(sql_text):
+            tbl = m.group(1).lower()
+            if tbl in summary['created_tables']:
+                positions.append((m.start(), tbl))
+        if positions:
+            # The last CREATE TABLE that is a proper IKG table (not temp/internal)
+            positions.sort(key=lambda x: x[0])
+            # Try last non-temp, non-internal table
+            for _, tbl in reversed(positions):
+                if tbl in set(summary['created_tables']) and tbl not in set(summary['temp_tables']):
+                    return tbl
+            # Fallback to absolute last
+            return positions[-1][1]
+
+    # Signal 2: Leaf node (never used as source) with most upstream deps
+    all_sources = set(r['from'] for r in summary['relationships'])
+    all_targets = set(r['to']   for r in summary['relationships'])
+    created_set = set(summary['created_tables'])
+
+    leaf_tables = [t for t in created_set if t not in all_sources and t in all_targets]
+
+    if not leaf_tables:
+        # No leaf found — use the table with most incoming edges
+        from collections import Counter
+        in_deg = Counter(r['to'] for r in summary['relationships'])
+        candidates = sorted(created_set, key=lambda t: -in_deg.get(t, 0))
+        return candidates[0] if candidates else created[-1]
+
+    if len(leaf_tables) == 1:
+        return leaf_tables[0]
+
+    # Multiple leaves — pick the one with most upstream nodes
+    from collections import deque
+    rel_up = {}
+    for r in summary['relationships']:
+        rel_up.setdefault(r['to'], []).append(r['from'])
+
+    def count_upstream(root):
+        visited, q = set(), deque([root])
+        while q:
+            t = q.popleft()
+            if t in visited: continue
+            visited.add(t)
+            for s in rel_up.get(t, []): q.append(s)
+        return len(visited)
+
+    leaf_tables.sort(key=lambda t: -count_upstream(t))
+    return leaf_tables[0]
+
+
+
 def build_er_html(summary: dict) -> str:
     import json as _json
     from collections import deque as _deque
 
-    FINAL = 'account_profile_curr_ikg_temp_auto'
+    FINAL = summary.get('final_table') or auto_detect_final_table(summary, summary.get('_sql_text',''))
 
     rel_up = {}
     for r in summary['relationships']:
@@ -575,7 +647,7 @@ body { background:#0f1117; color:#e2e8f0;
     body = """
 <div id="header">
   <div>
-    <div id="h-title">&#128202; account_profile_curr_ikg &mdash; Table Dependency ER Diagram</div>
+    <div id="h-title">&#128202; """ + FINAL + """ &mdash; Table Dependency ER Diagram</div>
     <div class="sub">Click any node to see source/destination tables with aliases and join keys</div>
   </div>
   <span class="sp sp-g" id="sp-n">-- nodes</span>
@@ -946,7 +1018,7 @@ window.addEventListener('load',function(){
         "<!DOCTYPE html>\n<html lang='en'>\n<head>\n"
         "<meta charset='UTF-8'>\n"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>\n"
-        "<title>account_profile_curr_ikg \u2014 ER Diagram</title>\n"
+        "<title>" + FINAL + " \u2014 ER Diagram</title>\n"
         "<style>\n" + css + "</style>\n</head>\n<body>\n"
         + body +
         "<script>\n" + js + "\n</script>\n</body>\n</html>\n"
@@ -1017,10 +1089,13 @@ def main():
     parser = SQLParser(sql_text)
     parser.parse()
     summary = parser.summary()
+    summary['final_table'] = auto_detect_final_table(summary, sql_text)
+    summary['_sql_text'] = sql_text  # cache for build_er_html
 
     print("\n" + "=" * 60)
     print("  PARSE SUMMARY")
     print("=" * 60)
+    print(f"  Final table        : {summary['final_table']}")
     print(f"  IKG tables created : {len(summary['created_tables'])}")
     print(f"  Temp tables        : {len(summary['temp_tables'])}")
     print(f"  External tables    : {len(summary['external_tables'])}")
