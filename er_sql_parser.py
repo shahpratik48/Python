@@ -1169,7 +1169,6 @@ window.addEventListener('load', init);
 
 def build_er_html(summary: dict) -> str:
     """Inject parsed data into the ER diagram HTML template."""
-    # Prepare a clean data dict for JS injection
     js_data = {
         "created_tables": summary["created_tables"],
         "temp_tables": summary["temp_tables"],
@@ -1188,7 +1187,32 @@ def build_er_html(summary: dict) -> str:
         ],
     }
     data_str = json.dumps(js_data, indent=2)
-    return ER_DIAGRAM_TEMPLATE.replace("{DATA_PLACEHOLDER}", data_str)
+
+    # Step 1: inject the JSON data block
+    html = ER_DIAGRAM_TEMPLATE.replace("{DATA_PLACEHOLDER}", data_str)
+
+    # Step 2: unescape {{ }} that Python uses to escape braces inside the
+    # template string.  Those appear throughout the JS code and must become
+    # real { } for the browser.  We protect the already-injected JSON data
+    # block (which contains real braces) with sentinels so it is not touched.
+    SENT_S = "<<<DATA_START>>>"
+    SENT_E = "<<<DATA_END>>>"
+
+    marker_start = "const DATA = "
+    marker_end   = "\n};\n"
+
+    ds = html.find(marker_start)
+    de = html.find(marker_end, ds) + len(marker_end)
+
+    protected = html[:ds] + SENT_S + html[ds:de] + SENT_E + html[de:]
+
+    before, rest    = protected.split(SENT_S, 1)
+    data_block, after = rest.split(SENT_E, 1)
+
+    before = before.replace("{{", "{").replace("}}", "}")
+    after  = after.replace("{{", "{").replace("}}", "}")
+
+    return before + data_block + after
 
 
 # ---------------------------------------------------------------------------
