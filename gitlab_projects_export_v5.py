@@ -32,6 +32,26 @@
 #   Columns: project_id | name | path | deps_inserted | imports_inserted
 #   Values:  Yes / No   (Yes = that table received rows for this project this run)
 #
+# NEW COLUMNS — gwma_ui_projects
+# ──────────────────────────────
+#   division  TEXT  — 1st ancestor group below ubs/gwma root
+#                     (e.g. "Global Wealth Management Americas")
+#   stream    TEXT  — 2nd ancestor group
+#                     (e.g. "Digital Client and Marketing Platforms")
+#   crew      TEXT  — 3rd ancestor group
+#                     (e.g. "Client Onboarding")
+#   Display names (not URL slugs) are fetched via GitLab Groups API and cached.
+#
+# PHASE 3 — gwma_ui_imports enrichment
+# ─────────────────────────────────────
+#   Adds import_what (TEXT) and import_from (TEXT) columns to gwma_ui_imports.
+#   Parses every import_statement row:
+#     "import React, { useState } from 'react'"
+#       → import_what = "React, { useState }"
+#       → import_from = "react"
+#   Side-effect imports ("import './style.css'") → import_what = NULL, import_from = "./style.css"
+#   Runs in UPDATE batches; safe to re-run (skips already-enriched rows).
+#
 # SAMPLING
 # ────────
 #   SAMPLE_MODE = True   asks for a single project_id, writes to *_sample tables.
@@ -120,6 +140,14 @@ PROJECTS_COLS: List[Tuple[str, str]] = [
     ('open_issues_count',   'INTEGER'),
     ('team_name',           'TEXT'),
     ('package_json',        'TEXT'),
+    # Hierarchy columns derived from GitLab group ancestors
+    # Example breadcrumb: UBS Agile / Global Wealth Mgmt Americas / Digital Client... / Client Onboarding / ...
+    #   division = 1st ancestor group after ubs/gwma   (e.g. "Global Wealth Management Americas")
+    #   stream   = 2nd ancestor group                  (e.g. "Digital Client and Marketing Platforms")
+    #   crew     = 3rd ancestor group                  (e.g. "Client Onboarding")
+    ('division',            'TEXT'),
+    ('stream',              'TEXT'),
+    ('crew',                'TEXT'),
     ('batch',               'INTEGER'),
     ('inserted_at',         'TIMESTAMP WITH TIME ZONE'),
 ]
@@ -276,6 +304,79 @@ def extract_team_name(web_url: str) -> str:
     except Exception:
         return ''
 
+
+# Cache of group_id → ancestor name list so we don't re-fetch for every project
+_group_ancestor_cache: Dict[int, List[str]] = {}
+_group_cache_lock = threading.Lock()
+
+def _get_ancestor_names(namespace: Dict[str, Any]) -> List[str]:
+    """
+    Return the list of ancestor group *display names* (not slugs) for a project,
+    ordered from top-level down.
+
+    GitLab stores the full slug path in namespace['full_path'], e.g.:
+      ubs/gwma/global-wealth-mgmt/digital-client/client-onboarding/overdrive/assisted-mock-ui
+
+    We strip the fixed GROUP_PATH prefix ('ubs/gwma'), split the remainder,
+    then resolve each slug to its display name by fetching the group object.
+    Results are cached by namespace id to avoid repeated API calls.
+
+    Returns a list that may have 0-N entries depending on nesting depth.
+    """
+    ns_id   = namespace.get('id')
+    ns_path = namespace.get('full_path', '')
+
+    # Try cache first
+    with _group_cache_lock:
+        if ns_id and ns_id in _group_ancestor_cache:
+            return _group_ancestor_cache[ns_id]
+
+    # Strip the root GROUP_PATH prefix from the full path
+    prefix  = GROUP_PATH.rstrip('/')            # e.g. 'ubs/gwma'
+    if ns_path.startswith(prefix + '/'):
+        rel = ns_path[len(prefix) + 1:]         # everything after 'ubs/gwma/'
+    elif ns_path == prefix:
+        rel = ''
+    else:
+        rel = ns_path                            # unexpected structure — use as-is
+
+    slugs = [s for s in rel.split('/') if s]    # intermediate group slugs
+
+    # Resolve each slug to its display name by fetching its group object
+    ancestor_names: List[str] = []
+    current_path = prefix
+    for slug in slugs:
+        current_path = f'{current_path}/{slug}'
+        with _gitlab_sem:
+            try:
+                grp = client.groups.get(current_path)
+                ancestor_names.append(grp.name)
+            except Exception:
+                # Fallback: use the slug itself (converted to title case)
+                ancestor_names.append(slug.replace('-', ' ').title())
+
+    # Store in cache
+    with _group_cache_lock:
+        if ns_id:
+            _group_ancestor_cache[ns_id] = ancestor_names
+
+    return ancestor_names
+
+
+def extract_division_stream_crew(namespace: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Return (division, stream, crew) from the group ancestor name list.
+      division = ancestor[0]  (1st group below ubs/gwma root)
+      stream   = ancestor[1]  (2nd group)
+      crew     = ancestor[2]  (3rd group)
+    Any missing level is returned as None.
+    """
+    names = _get_ancestor_names(namespace)
+    division = names[0] if len(names) > 0 else None
+    stream   = names[1] if len(names) > 1 else None
+    crew     = names[2] if len(names) > 2 else None
+    return division, stream, crew
+
 def _raw_file(project: Any, path: str, ref: str) -> Optional[str]:
     """Fetch file as UTF-8, normalising all line endings to \\n."""
     with _gitlab_sem:
@@ -362,17 +463,36 @@ def _column_exists(conn, fqtable: str, column: str) -> bool:
 
 def db_add_columns_if_missing(conn, fqtable: str) -> None:
     """
-    One-time migration: add 'batch' (INTEGER) and 'inserted_at'
-    (TIMESTAMP WITH TIME ZONE) to an existing table if they are absent.
+    One-time migration: adds missing columns to an existing table.
 
-    Uses information_schema to check first — compatible with Greenplum
-    and older PostgreSQL that do not support ALTER TABLE ADD COLUMN IF NOT EXISTS.
+    Columns added to ALL tables if absent:
+      batch (INTEGER), inserted_at (TIMESTAMP WITH TIME ZONE)
+
+    Columns added only to gwma_ui_projects if absent:
+      division (TEXT), stream (TEXT), crew (TEXT)
+
+    Uses information_schema — compatible with Greenplum / older PostgreSQL
+    (no ALTER TABLE ADD COLUMN IF NOT EXISTS needed).
     Safe to call on every run; no-ops when columns already exist.
     """
-    for col, dtype in [
+    # Columns for every table
+    cols_all = [
         ('batch',       'INTEGER'),
         ('inserted_at', 'TIMESTAMP WITH TIME ZONE'),
-    ]:
+    ]
+    # Extra columns only for the projects table
+    cols_projects_extra = [
+        ('division', 'TEXT'),
+        ('stream',   'TEXT'),
+        ('crew',     'TEXT'),
+    ]
+
+    target_cols = cols_all[:]
+    # Check if this is the projects table (handles both _sample and normal)
+    if fqtable.endswith('gwma_ui_projects') or fqtable.endswith('gwma_ui_projects_sample'):
+        target_cols += cols_projects_extra
+
+    for col, dtype in target_cols:
         if _column_exists(conn, fqtable, col):
             logger.info('MIGRATE | column "%s" already exists in %s — skipped', col, fqtable)
         else:
@@ -577,6 +697,10 @@ def fetch_project_with_pkg(proj_ref: Any) -> Optional[Dict[str, Any]]:
     logger.info('P1 | YES pkg | %s', project.path_with_namespace)
     _inc('has_package_json')
 
+    division, stream, crew = extract_division_stream_crew(ns_d)
+    logger.info('P1 | hierarchy | div=%s  stream=%s  crew=%s | %s',
+                division, stream, crew, project.path_with_namespace)
+
     return {
         '_project': project, '_ref': ref,
         'project_id'         : int(project.id),
@@ -597,6 +721,9 @@ def fetch_project_with_pkg(proj_ref: Any) -> Optional[Dict[str, Any]]:
         'open_issues_count'  : int(project.open_issues_count) if project.open_issues_count is not None else None,
         'team_name'          : extract_team_name(project.web_url),
         'package_json'       : 'Yes',
+        'division'           : division,
+        'stream'             : stream,
+        'crew'               : crew,
     }
 
 
@@ -1122,6 +1249,177 @@ print(f'    {TBL_PROJECTS}')
 print(f'    {TBL_DEPS}')
 print(f'    {TBL_IMPORTS}')
 print(f'  Progress XLSX: {xlsx_path}')
+
+# =============================================================================
+#  PHASE 3 — Enrich gwma_ui_imports with import_what + import_from columns
+# =============================================================================
+# This runs independently of Phase 1 and Phase 2.
+# It adds two columns to the imports table (if they do not already exist) and
+# populates them by parsing the existing import_statement values in-place:
+#
+#   import_statement : "import React, { useState } from 'react'"
+#   import_what      : "React, { useState }"        (everything between 'import' and 'from')
+#   import_from      : "react"                       (the quoted module specifier)
+#
+# For side-effect imports ("import './styles.css'") import_what is NULL and
+# import_from is the quoted path.
+#
+# The UPDATE runs in batches of PHASE3_BATCH rows for safety.
+
+PHASE3_BATCH = 1000   # rows per UPDATE batch
+
+def _parse_import_statement(stmt: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Parse a single import statement string into (import_what, import_from).
+
+    Handles all ES-module forms:
+      import React from 'react'                  → ('React', 'react')
+      import { useState } from 'react'           → ('{ useState }', 'react')
+      import React, { useState } from 'react'    → ('React, { useState }', 'react')
+      import * as Icons from '@uwr/icons'        → ('* as Icons', '@uwr/icons')
+      import './styles.css'                      → (None, './styles.css')
+    """
+    stmt = stmt.strip()
+    # Match: import <what> from '<from>'
+    m_from = re.match(
+        r'^import\s+(.+?)\s+from\s+[\'\"]([^\'\"]+)[\'\"](\s*;?)?$',
+        stmt, re.DOTALL
+    )
+    if m_from:
+        what = m_from.group(1).strip()
+        frm  = m_from.group(2).strip()
+        return what, frm
+    # Match: import '<from>'  (side-effect)
+    m_side = re.match(
+        r'^import\s+[\'\"]([^\'\"]+)[\'\"](\s*;?)?$',
+        stmt
+    )
+    if m_side:
+        return None, m_side.group(1).strip()
+    # Fallback: could not parse
+    return None, None
+
+
+def run_phase3_enrich_imports() -> None:
+    """
+    Phase 3: add import_what + import_from columns to gwma_ui_imports and
+    populate them from the existing import_statement column.
+
+    Steps:
+      1. Add columns if missing (via db_add_columns_if_missing variant).
+      2. SELECT rows where import_what IS NULL (unpopulated).
+      3. Parse each import_statement in Python.
+      4. UPDATE in batches of PHASE3_BATCH.
+    """
+    print()
+    print('=' * 70)
+    print('  PHASE 3 — Enrich imports table: import_what + import_from')
+    print('=' * 70)
+    logger.info('PHASE 3 | start | table=%s', TBL_IMPORTS)
+
+    conn = _get_conn()
+
+    # Step 1: ensure columns exist
+    for col, dtype in [('import_what', 'TEXT'), ('import_from', 'TEXT')]:
+        if _column_exists(conn, TBL_IMPORTS, col):
+            logger.info('PHASE 3 | column "%s" already exists', col)
+        else:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(f'ALTER TABLE {TBL_IMPORTS} ADD COLUMN "{col}" {dtype};')
+                conn.commit()
+                logger.info('PHASE 3 | added column "%s" %s', col, dtype)
+                print(f'  Added column: {col} ({dtype})')
+            except Exception as exc:
+                conn.rollback()
+                logger.error('PHASE 3 | could not add column "%s": %s', col, exc)
+                print(f'  ERROR adding column {col}: {exc}')
+                conn.close()
+                return
+
+    # Step 2: count rows needing enrichment
+    with conn.cursor() as cur:
+        cur.execute(
+            f'SELECT COUNT(*) FROM {TBL_IMPORTS} WHERE import_what IS NULL AND import_from IS NULL;'
+        )
+        total_pending = cur.fetchone()[0]
+
+    if total_pending == 0:
+        print('  All rows already enriched — nothing to do.')
+        logger.info('PHASE 3 | all rows already enriched')
+        conn.close()
+        return
+
+    print(f'  Rows to enrich: {total_pending}')
+    logger.info('PHASE 3 | rows to enrich: %d', total_pending)
+
+    # Step 3 + 4: fetch in batches, parse, update
+    updated_total = 0
+    offset = 0
+
+    while True:
+        # Fetch a batch of rows needing enrichment
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute(
+                f'SELECT ctid, import_statement FROM {TBL_IMPORTS} '
+                f'WHERE import_what IS NULL AND import_from IS NULL '
+                f'LIMIT %s OFFSET %s;',
+                (PHASE3_BATCH, offset)
+            )
+            batch = cur.fetchall()
+
+        if not batch:
+            break
+
+        # Parse each statement
+        updates: List[Tuple[Optional[str], Optional[str], Any]] = []
+        for r in batch:
+            what, frm = _parse_import_statement(r['import_statement'] or '')
+            updates.append((what, frm, r['ctid']))
+
+        # Bulk update using a VALUES list
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_values(
+                cur,
+                f'UPDATE {TBL_IMPORTS} AS t '
+                f'SET import_what = v.iw, import_from = v.ifr '
+                f'FROM (VALUES %s) AS v(iw, ifr, row_ctid) '
+                f'WHERE t.ctid = v.row_ctid::tid;',
+                updates,
+                template='(%s, %s, %s)',
+            )
+        conn.commit()
+
+        updated_total += len(batch)
+        pct = 100 * updated_total // total_pending if total_pending else 100
+        print(f'\r  Enriched: {updated_total}/{total_pending} ({pct}%)   ',
+              end='', flush=True)
+        logger.info('PHASE 3 | enriched %d / %d', updated_total, total_pending)
+
+        if len(batch) < PHASE3_BATCH:
+            break
+        offset += PHASE3_BATCH
+
+    print()
+    conn.close()
+    print(f'  Phase 3 complete — {updated_total} rows enriched in {TBL_IMPORTS}')
+    logger.info('PHASE 3 | done — %d rows enriched', updated_total)
+
+
+# ── Ask user whether to run Phase 3 ──────────────────────────────────────────
+print()
+print('=' * 70)
+print('  PHASE 3 — Parse import_statement into import_what + import_from')
+print('=' * 70)
+print(f'  Table: {TBL_IMPORTS}')
+print('  Adds columns import_what and import_from (one-time if missing).')
+print('  Populates unpopulated rows by parsing import_statement.')
+
+_run_p3 = _ask('Run Phase 3? (enriches import_what + import_from in imports table)')
+if _run_p3:
+    run_phase3_enrich_imports()
+else:
+    print('  Skipping Phase 3.')
 
 logger.info('=' * 70)
 logger.info('GitLab Projects Export  v5 -- complete (%.1fs)', t_elapsed)
