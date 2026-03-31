@@ -1300,27 +1300,92 @@ if run_phase2 and _progress:
 PHASE3_FETCH  = 50_000   # rows per SELECT when reading distinct statements
 PHASE3_INSERT = 5_000    # rows per INSERT into temp table
 
-_RE_FROM = re.compile(
-    r'^import\s+(.+?)\s+from\s+[\'"]([^\'"]+)[\'"][\s;]*$',
+_RE_WHAT_FROM = re.compile(
+    r'^import\s+'                                           # import keyword
+    r'(.+?)'                                                # import_what  (non-greedy)
+    r'\s*from\s*'                                           # from  (spaces around it are optional)
+    r'["\']([^"\']+)["\']'                                  # quoted module path  (single or double)
+    r'(?:\s*(?:assert|with)\s*\{[^}]*\})?'                 # optional assert/with import-attribute clause
+    r'\s*;?\s*$',                                           # optional trailing semicolon
     re.DOTALL,
 )
 _RE_SIDE = re.compile(
-    r'^import\s+[\'"]([^\'"]+)[\'"][\s;]*$',
+    r'^import\s*'                                           # import  (no space required before quote)
+    r'["\']([^"\']+)["\']'                                  # quoted module path
+    r'(?:\s*(?:assert|with)\s*\{[^}]*\})?'
+    r'\s*;?\s*$',
 )
+
+
+def _strip_comment(s: str) -> str:
+    """Remove // line-comment, but only outside string literals."""
+    in_s = in_d = False
+    for i, ch in enumerate(s):
+        if   ch == "'" and not in_d: in_s = not in_s
+        elif ch == '"' and not in_s: in_d = not in_d
+        elif ch == '/' and not in_s and not in_d:
+            if i + 1 < len(s) and s[i + 1] == '/':
+                return s[:i].rstrip()
+    return s
+
+
+def _strip_block_comment_suffix(s: str) -> str:
+    """Remove trailing block-comment closure, e.g. "import X from '../Y'; */" """
+    return re.sub(r'\s*\*/\s*$', '', s).rstrip()
+
+
+def _extract_first_import(s: str) -> str:
+    """
+    If the string contains multiple statements on one line (minified bundles),
+    return only the first import statement — everything up to and including the
+    first semicolon that closes the module specifier.
+
+    Examples handled:
+      import A from"x";import B from"y";...   → "import A from\"x\""
+      import"./foo.js";import{a}from"./bar";  → "import\"./foo.js\""
+    """
+    m = re.match(
+        r'^(import\s*(?:[^;"\']*?)?["\'][^"\']*?["\']'
+        r'(?:\s*(?:assert|with)\s*\{[^}]*\})?)\s*;',
+        s,
+    )
+    if m:
+        return m.group(1).strip()
+    return s
+
 
 def _parse_import_statement(stmt: str) -> Tuple[Optional[str], Optional[str]]:
     """
     Parse one import statement into (import_what, import_from).
 
-    import React, { useState } from 'react'  → ('React, { useState }', 'react')
-    import * as Icons from '@uwr/icons'       → ('* as Icons', '@uwr/icons')
-    import './styles.css'                     → (None, './styles.css')
+    Pre-processing pipeline (in order):
+      1. Strip // line comment (respects string literals)
+      2. Strip trailing */ block-comment closure
+      3. Extract only the first import from minified multi-import lines
+      4. Match with flexible regex (no-space-before-quote, assert/with clause, etc.)
+
+    Returns (None, None) when the statement cannot be parsed.
+
+    Examples:
+      import React, { useState } from 'react'           → ('React, { useState }', 'react')
+      import * as Icons from '@uwr/icons'               → ('* as Icons', '@uwr/icons')
+      import './styles.css'                             → (None, './styles.css')
+      import Foo from'./bar';                           → ('Foo', './bar')          ← no space
+      import x from 'y' assert { type: "json" };       → ('x', 'y')               ← assert clause
+      import './chat.scss'; // comment                  → (None, './chat.scss')    ← comment stripped
+      import A from"x";import B from"y";               → ('A', 'x')               ← first only
     """
-    stmt = stmt.strip()
-    m = _RE_FROM.match(stmt)
+    s = stmt.strip()
+    s = _strip_comment(s)
+    s = _strip_block_comment_suffix(s)
+    s = _extract_first_import(s).strip()
+    if not s:
+        return None, None
+
+    m = _RE_WHAT_FROM.match(s)
     if m:
         return m.group(1).strip(), m.group(2).strip()
-    m = _RE_SIDE.match(stmt)
+    m = _RE_SIDE.match(s)
     if m:
         return None, m.group(1).strip()
     return None, None
