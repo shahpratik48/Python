@@ -803,9 +803,9 @@ function drawEdge(e,a,b){{
   ctx.beginPath();
   ctx.moveTo(x1,y1);
   ctx.bezierCurveTo(x1+cp,y1, x2-cp,y2, x2,y2);
-  ctx.strokeStyle = hl ? (e.to===selectedId?'#3adc80':'#e89030') : '#182840';
-  ctx.lineWidth   = hl ? 2/sc : 1/sc;
-  ctx.globalAlpha = hl ? 1 : 0.5;
+  ctx.strokeStyle = hl ? (e.to===selectedId?'#3adc80':'#e89030') : '#ffffff';
+  ctx.lineWidth   = hl ? 2.5/sc : 1/sc;
+  ctx.globalAlpha = hl ? 1 : 0.2;
   ctx.stroke();
   ctx.globalAlpha = 1;
 
@@ -856,15 +856,15 @@ function drawNode(n){{
   // Columns preview
   if(n.cols&&n.cols.length>0&&!dim){{
     var cols=n.cols.slice(0,PREV_N);
-    ctx.font='9px Consolas,Courier New,monospace'; ctx.textAlign='left';
+    ctx.font='11px Consolas,Courier New,monospace'; ctx.textAlign='left';
     cols.forEach(function(col,i){{
-      var cy=n.y+HDR_H+5+i*ROW_H+ROW_H/2;
-      ctx.fillStyle=s.sub;
-      ctx.beginPath();ctx.arc(n.x+14,cy,2,0,Math.PI*2);ctx.fill();
-      ctx.fillStyle='#5a7888';
+      var cy=n.y+HDR_H+6+i*ROW_H+ROW_H/2;
+      ctx.fillStyle=s.stroke;
+      ctx.beginPath();ctx.arc(n.x+14,cy,2.5,0,Math.PI*2);ctx.fill();
+      ctx.fillStyle='#90b8d8';
       var clbl=col;
-      while(ctx.measureText(clbl).width>n.w-28&&clbl.length>3) clbl=clbl.slice(0,-3)+'..';
-      ctx.fillText(clbl,n.x+21,cy+1);
+      while(ctx.measureText(clbl).width>n.w-30&&clbl.length>3) clbl=clbl.slice(0,-3)+'..';
+      ctx.fillText(clbl,n.x+22,cy+1);
     }});
     if(n.cols.length>PREV_N){{
       ctx.fillStyle=s.sub; ctx.font='8px Segoe UI,system-ui,sans-serif';
