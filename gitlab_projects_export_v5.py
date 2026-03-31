@@ -902,6 +902,212 @@ def write_progress_xlsx(progress: Dict[int, Dict], filepath: str) -> None:
 
 
 
+
+# =============================================================================
+#  STATISTICS HELPER — always computed at the end regardless of phases run
+# =============================================================================
+
+def collect_run_statistics() -> Dict[str, Any]:
+    """
+    Collect 8 project counts:
+      For each of two time windows (since Jan 2025  AND  since 1 year ago today):
+        1. Total projects modified
+        2. Total projects created
+        3. UI projects (have package.json) modified
+        4. UI projects (have package.json) created
+
+    Strategy (in priority order):
+      A. If Phase 1 already ran this session → proj_refs is in memory.
+         We already have every project object with updated_at + created_at.
+         Also p1_rows gives the UI subset.  No extra API calls.
+
+      B. If Phase 1 was skipped → try to fetch the project list from GitLab
+         (same call as Phase 1, no package.json check).  Then check the
+         gwma_ui_projects table to get the UI-project list for package.json filter.
+
+      C. If GitLab is unreachable → fall back to DB only (gwma_ui_projects
+         contains only UI projects so total-project counts will be marked N/A).
+
+    Returns a dict with keys:
+      jan2025_modified, jan2025_created,
+      jan2025_ui_modified, jan2025_ui_created,
+      year_modified, year_created,
+      year_ui_modified, year_ui_created,
+      source   ('phase1_memory' | 'gitlab_api' | 'db_only')
+      note     (any warning string, or empty)
+    """
+    stats: Dict[str, Any] = {
+        'jan2025_modified'  : None,
+        'jan2025_created'   : None,
+        'jan2025_ui_modified': None,
+        'jan2025_ui_created': None,
+        'year_modified'     : None,
+        'year_created'      : None,
+        'year_ui_modified'  : None,
+        'year_ui_created'   : None,
+        'source'            : 'unknown',
+        'note'              : '',
+    }
+
+    cutoff_jan2025  = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    cutoff_1yr      = datetime(run_ts.year - 1, run_ts.month, run_ts.day,
+                               run_ts.hour, run_ts.minute, run_ts.second,
+                               tzinfo=timezone.utc)
+
+    def _dt(val) -> Optional[datetime]:
+        """Parse a datetime value that may be a string or already a datetime."""
+        if val is None:
+            return None
+        if isinstance(val, datetime):
+            return val if val.tzinfo else val.replace(tzinfo=timezone.utc)
+        try:
+            s = str(val).replace('Z', '+00:00')
+            return datetime.fromisoformat(s)
+        except Exception:
+            return None
+
+    # ── Strategy A: Phase 1 already ran — use in-memory data ─────────────────
+    if run_phase1 and 'proj_refs' in dir():   # proj_refs exists in module scope
+        logger.info('STATS | using in-memory Phase-1 data')
+        all_refs = proj_refs   # full list from GitLab
+        ui_ids   = {r['project_id'] for r in p1_rows}
+
+        def _count(refs, cutoff, field, ui_only=False):
+            n = 0
+            for p in refs:
+                val = _dt(getattr(p, field, None))
+                if val and val >= cutoff:
+                    if not ui_only or int(p.id) in ui_ids:
+                        n += 1
+            return n
+
+        stats['jan2025_modified']    = _count(all_refs, cutoff_jan2025, 'last_activity_at')
+        stats['jan2025_created']     = _count(all_refs, cutoff_jan2025, 'created_at')
+        stats['jan2025_ui_modified'] = _count(all_refs, cutoff_jan2025, 'last_activity_at', ui_only=True)
+        stats['jan2025_ui_created']  = _count(all_refs, cutoff_jan2025, 'created_at',        ui_only=True)
+        stats['year_modified']       = _count(all_refs, cutoff_1yr,     'last_activity_at')
+        stats['year_created']        = _count(all_refs, cutoff_1yr,     'created_at')
+        stats['year_ui_modified']    = _count(all_refs, cutoff_1yr,     'last_activity_at', ui_only=True)
+        stats['year_ui_created']     = _count(all_refs, cutoff_1yr,     'created_at',        ui_only=True)
+        stats['source'] = 'phase1_memory'
+        return stats
+
+    # ── Strategy B: Phase 1 skipped — fetch from GitLab ──────────────────────
+    logger.info('STATS | fetching project list from GitLab for statistics ...')
+    print('\n  Fetching project list from GitLab for statistics ...')
+    try:
+        _grp       = client.groups.get(GROUP_PATH)
+        _all_refs  = _grp.projects.list(include_subgroups=True, all=True, per_page=PER_PAGE)
+        logger.info('STATS | fetched %d projects from GitLab', len(_all_refs))
+        print(f'  Fetched {len(_all_refs):,} projects.')
+
+        # Get UI project ids from DB (gwma_ui_projects = those with package.json)
+        _ui_ids: set = set()
+        try:
+            _sc = _get_conn()
+            with _sc.cursor() as _cur:
+                _cur.execute(
+                    f'SELECT DISTINCT project_id FROM {TBL_PROJECTS};')
+                _ui_ids = {int(r[0]) for r in _cur.fetchall()}
+            _sc.close()
+            logger.info('STATS | %d UI project ids loaded from DB', len(_ui_ids))
+        except Exception as _dbe:
+            logger.warning('STATS | could not load UI ids from DB: %s', _dbe)
+            stats['note'] = 'UI counts may be incomplete (DB unavailable)'
+
+        def _count2(refs, cutoff, field, ui_only=False):
+            n = 0
+            for p in refs:
+                val = _dt(getattr(p, field, None))
+                if val and val >= cutoff:
+                    if not ui_only or int(p.id) in _ui_ids:
+                        n += 1
+            return n
+
+        stats['jan2025_modified']    = _count2(_all_refs, cutoff_jan2025, 'last_activity_at')
+        stats['jan2025_created']     = _count2(_all_refs, cutoff_jan2025, 'created_at')
+        stats['jan2025_ui_modified'] = _count2(_all_refs, cutoff_jan2025, 'last_activity_at', ui_only=True)
+        stats['jan2025_ui_created']  = _count2(_all_refs, cutoff_jan2025, 'created_at',        ui_only=True)
+        stats['year_modified']       = _count2(_all_refs, cutoff_1yr,     'last_activity_at')
+        stats['year_created']        = _count2(_all_refs, cutoff_1yr,     'created_at')
+        stats['year_ui_modified']    = _count2(_all_refs, cutoff_1yr,     'last_activity_at', ui_only=True)
+        stats['year_ui_created']     = _count2(_all_refs, cutoff_1yr,     'created_at',        ui_only=True)
+        stats['source'] = 'gitlab_api'
+        return stats
+
+    except Exception as _ge:
+        logger.warning('STATS | GitLab API call failed: %s', _ge)
+        stats['note'] = f'GitLab API unavailable ({_ge}); using DB fallback'
+        print(f'  WARNING: GitLab unavailable ({_ge}). Falling back to DB.')
+
+    # ── Strategy C: DB fallback — gwma_ui_projects only ──────────────────────
+    # DB only has UI projects, so total-project counts cannot be computed.
+    logger.info('STATS | falling back to DB for statistics')
+    try:
+        _fc = _get_conn()
+        with _fc.cursor() as _cur:
+            # UI projects modified/created since Jan 2025
+            _cur.execute(
+                f'SELECT COUNT(DISTINCT project_id) FROM {TBL_PROJECTS} WHERE last_activity_at >= %s;',
+                (cutoff_jan2025,))
+            stats['jan2025_ui_modified'] = _cur.fetchone()[0]
+
+            _cur.execute(
+                f'SELECT COUNT(DISTINCT project_id) FROM {TBL_PROJECTS} WHERE created_at >= %s;',
+                (cutoff_jan2025,))
+            stats['jan2025_ui_created'] = _cur.fetchone()[0]
+
+            # UI projects modified/created since 1 year ago
+            _cur.execute(
+                f'SELECT COUNT(DISTINCT project_id) FROM {TBL_PROJECTS} WHERE last_activity_at >= %s;',
+                (cutoff_1yr,))
+            stats['year_ui_modified'] = _cur.fetchone()[0]
+
+            _cur.execute(
+                f'SELECT COUNT(DISTINCT project_id) FROM {TBL_PROJECTS} WHERE created_at >= %s;',
+                (cutoff_1yr,))
+            stats['year_ui_created'] = _cur.fetchone()[0]
+
+        _fc.close()
+        stats['source'] = 'db_only'
+        stats['note']  += ' Total-project counts unavailable (no GitLab access)'
+    except Exception as _dbe2:
+        logger.error('STATS | DB fallback also failed: %s', _dbe2)
+        stats['note'] += f' DB also failed: {_dbe2}'
+        stats['source'] = 'unavailable'
+
+    return stats
+
+
+def print_statistics(stats: Dict[str, Any]) -> None:
+    """Print the statistics summary block."""
+    def _fmt(v) -> str:
+        return f'{v:,}' if isinstance(v, int) else 'N/A'
+
+    yr_label = f'{run_ts.year - 1}-{run_ts.month:02d}-{run_ts.day:02d}' \
+               f' to {run_ts.year}-{run_ts.month:02d}-{run_ts.day:02d}'
+
+    print()
+    print('=' * 70)
+    print('  PROJECT STATISTICS')
+    print('=' * 70)
+    print(f'  Data source : {stats["source"]}')
+    if stats['note']:
+        print(f'  Note        : {stats["note"]}')
+    print()
+    print(f'  ── Since Jan 2025  (2025-01-01  →  today) ────────────────────')
+    print(f'  Modified (all projects)           : {_fmt(stats["jan2025_modified"])}')
+    print(f'  Created  (all projects)           : {_fmt(stats["jan2025_created"])}')
+    print(f'  Modified + has package.json (UI)  : {_fmt(stats["jan2025_ui_modified"])}')
+    print(f'  Created  + has package.json (UI)  : {_fmt(stats["jan2025_ui_created"])}')
+    print()
+    print(f'  ── Last 1 year  ({yr_label}) ─────────────────')
+    print(f'  Modified (all projects)           : {_fmt(stats["year_modified"])}')
+    print(f'  Created  (all projects)           : {_fmt(stats["year_created"])}')
+    print(f'  Modified + has package.json (UI)  : {_fmt(stats["year_ui_modified"])}')
+    print(f'  Created  + has package.json (UI)  : {_fmt(stats["year_ui_created"])}')
+    print('=' * 70)
+
 # =============================================================================
 #  MAIN PIPELINE
 # =============================================================================
@@ -1590,6 +1796,12 @@ if _run_p3:
     run_phase3_enrich_imports()
 else:
     print('  Skipping Phase 3.')
+
+# =============================================================================
+#  FINAL STATISTICS  (always printed regardless of which phases ran)
+# =============================================================================
+_stats = collect_run_statistics()
+print_statistics(_stats)
 
 logger.info('=' * 70)
 logger.info('GitLab Projects Export  v5 -- complete (%.1fs)', t_elapsed)
