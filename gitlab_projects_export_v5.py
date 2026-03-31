@@ -1110,13 +1110,29 @@ if run_phase1:
         sys.exit(1)
 
     print()
-    print(f'  Projects with package.json : {len(p1_rows)}')
-    print(f'  No package.json (skipped)  : {run_stats["skipped_no_package_json"]}')
-    print(f'  Elapsed                    : {t_p1_elapsed:.1f}s')
-    print(f'  Batch                      : {batch_projects}')
+    print(f'  Total projects in group               : {total_all}')
+    print(f'  Modified since {UPDATED_SINCE.date()}        : {len(recent_refs)}')
+    print(f'    └─ Too old (skipped)                : {old_count}')
+    print(f'  UI projects (have package.json)       : {len(p1_rows)}')
+    print(f'    └─ No package.json (skipped)        : {run_stats["skipped_no_package_json"]}')
+    print(f'    └─ Errors / timeouts                : {run_stats["p1_errors"] + run_stats["p1_timeouts"]}')
+    print(f'  Phase 1 elapsed (s)                   : {t_p1_elapsed:.1f}')
+    print(f'  Batch                                 : {batch_projects}')
 
 else:
-    print('\n  Skipping Phase 1 — using existing data in gwma_ui_projects.')
+    print('\n  Skipping Phase 1 — reading counts from existing DB table ...')
+    # Read total-project and UI-project counts from what's already in the DB
+    try:
+        _cnt_conn = _get_conn()
+        with _cnt_conn.cursor() as _cur:
+            _cur.execute(f'SELECT COUNT(DISTINCT project_id) FROM {TBL_PROJECTS};')
+            _db_ui_count = _cur.fetchone()[0]
+        _cnt_conn.close()
+        print(f'  UI projects in {TBL_PROJECTS}: {_db_ui_count}')
+        logger.info('P1 SKIP | UI projects in DB: %d', _db_ui_count)
+    except Exception as _ce:
+        logger.warning('P1 SKIP | could not count DB projects: %s', _ce)
+        print(f'  (Could not read count from DB: {_ce})')
 
 # =============================================================================
 #  PHASE 2 GATE
@@ -1128,127 +1144,137 @@ print('=' * 70)
 run_phase2 = _ask('Run Phase 2? Parses package.json + scans files for imports')
 
 if not run_phase2:
-    print(f'\n  Exiting. Total elapsed: {time.perf_counter() - t_total:.1f}s')
-    sys.exit(0)
+    print('\n  Skipping Phase 2 — continuing to Phase 3.')
+    # Declare sentinel variables so the final summary block doesn't crash
+    flusher       = type('_F', (), {'total_deps': 0, 'total_imports': 0})()
+    batch_deps    = 0
+    batch_imports = 0
+    t_p2_elapsed  = 0.0
 
-# ── Load project list ─────────────────────────────────────────────────────────
-if p1_rows:
-    phase2_projects = p1_rows
-    logger.info('P2 | using %d in-memory Phase-1 rows', len(phase2_projects))
-else:
-    try:
-        db_rows = db_load_projects()
-    except Exception as exc:
-        logger.error('DB | failed to load projects: %s', exc, exc_info=True)
-        print(f'\n  ERROR: {exc}')
-        sys.exit(1)
-    if not db_rows:
-        print(f'\n  ERROR: {TBL_PROJECTS} is empty. Run Phase 1 first.')
-        sys.exit(1)
-    phase2_projects = [
-        {'project_id': int(r['project_id']), 'name': r['name'], 'path': r['path'],
-         'path_with_namespace': r.get('path_with_namespace', r['path']),
-         'web_url': r['web_url'], 'default_branch': r['default_branch'] or 'main',
-         '_project': None}
-        for r in db_rows
-    ]
-    logger.info('P2 | loaded %d projects from DB', len(phase2_projects))
-
-# ── Ensure Phase-2 tables exist and get batch numbers ────────────────────────
-conn = _get_conn()
-_ensure_table(conn, TBL_DEPS,    DEPS_COLS)
-_ensure_table(conn, TBL_IMPORTS, IMPORTS_COLS)
-batch_deps    = _get_next_batch(conn, TBL_DEPS)
-batch_imports = _get_next_batch(conn, TBL_IMPORTS)
-conn.close()
-logger.info('DB   | deps batch=%d  imports batch=%d', batch_deps, batch_imports)
-
-print(f'\n  Scanning {len(phase2_projects)} projects ...')
-print(f'  Deps batch    : {batch_deps}')
-print(f'  Imports batch : {batch_imports}')
-print(f'  Flush every   : {INSERT_EVERY} projects\n')
-
-# Pre-register every project with zero counts so projects producing no rows
-# still appear in the XLSX with count=0 rather than being missing entirely.
-for _proj in phase2_projects:
-    _register_project(_proj['project_id'], _proj['name'], _proj['path'])
-
-# ── Parallel Phase-2 with streaming flush ────────────────────────────────────
-t_p2     = time.perf_counter()
-flusher  = _StreamingFlusher(batch_deps, batch_imports, run_ts)
-p2_done  = 0
-p2_total = len(phase2_projects)
-
-with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-    fmap = {pool.submit(scan_project, row): row for row in phase2_projects}
-    for future in as_completed(fmap):
-        p2_done += 1
-        row = fmap[future]
-        ns  = row.get('path_with_namespace', row.get('path', '?'))
+# ── Load project list (only if Phase 2 is running) ───────────────────────────
+if run_phase2:
+    if p1_rows:
+        phase2_projects = p1_rows
+        logger.info('P2 | using %d in-memory Phase-1 rows', len(phase2_projects))
+    else:
         try:
-            dep_rows, import_rows = future.result(timeout=FUTURE_TIMEOUT)
-        except FutureTimeout:
-            logger.warning('P2 | TIMEOUT | %s', ns)
-            _inc('p2_timeouts')
-            dep_rows, import_rows = [], []
+            db_rows = db_load_projects()
         except Exception as exc:
-            logger.error('P2 | ERROR | %s | %s', ns, exc)
-            _inc('p2_errors')
-            dep_rows, import_rows = [], []
+            logger.error('DB | failed to load projects: %s', exc, exc_info=True)
+            print(f'\n  ERROR: {exc}')
+            sys.exit(1)
+        if not db_rows:
+            print(f'\n  ERROR: {TBL_PROJECTS} is empty. Run Phase 1 first.')
+            sys.exit(1)
+        phase2_projects = [
+            {'project_id': int(r['project_id']), 'name': r['name'], 'path': r['path'],
+             'path_with_namespace': r.get('path_with_namespace', r['path']),
+             'web_url': r['web_url'], 'default_branch': r['default_branch'] or 'main',
+             '_project': None}
+            for r in db_rows
+        ]
+        logger.info('P2 | loaded %d projects from DB', len(phase2_projects))
 
-        flusher.add(dep_rows, import_rows,
-                    row['project_id'], row['name'], row['path'])
+    # ── Ensure Phase-2 tables exist and get batch numbers ────────────────────
+    conn = _get_conn()
+    _ensure_table(conn, TBL_DEPS,    DEPS_COLS)
+    _ensure_table(conn, TBL_IMPORTS, IMPORTS_COLS)
+    batch_deps    = _get_next_batch(conn, TBL_DEPS)
+    batch_imports = _get_next_batch(conn, TBL_IMPORTS)
+    conn.close()
+    logger.info('DB   | deps batch=%d  imports batch=%d', batch_deps, batch_imports)
 
-        if p2_done % 5 == 0 or p2_done == p2_total:
-            pct = 100 * p2_done // p2_total
-            print(f'\r  P2: {p2_done}/{p2_total} ({pct}%) '
-                  f'| deps_rows={flusher.total_deps} '
-                  f'imp_rows={flusher.total_imports} '
-                  f'err={run_stats["p2_errors"]} '
-                  f'timeout={run_stats["p2_timeouts"]}   ',
-                  end='', flush=True)
+    print(f'\n  Scanning {len(phase2_projects)} projects ...')
+    print(f'  Deps batch    : {batch_deps}')
+    print(f'  Imports batch : {batch_imports}')
+    print(f'  Flush every   : {INSERT_EVERY} projects\n')
 
-print()
-flusher.final_flush()   # flush any leftover rows
+    # Pre-register every project with zero counts
+    for _proj in phase2_projects:
+        _register_project(_proj['project_id'], _proj['name'], _proj['path'])
 
-t_p2_elapsed = time.perf_counter() - t_total - t_p1_elapsed
-t_elapsed    = time.perf_counter() - t_total
+    # ── Parallel Phase-2 with streaming flush ────────────────────────────────
+    t_p2     = time.perf_counter()
+    flusher  = _StreamingFlusher(batch_deps, batch_imports, run_ts)
+    p2_done  = 0
+    p2_total = len(phase2_projects)
 
-# ── Write progress XLSX ───────────────────────────────────────────────────────
-xlsx_path = f'phase2_progress_{run_ts_str}.xlsx'
-write_progress_xlsx(_progress, xlsx_path)
-print(f'\n  Progress file : {xlsx_path}')
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        fmap = {pool.submit(scan_project, row): row for row in phase2_projects}
+        for future in as_completed(fmap):
+            p2_done += 1
+            row = fmap[future]
+            ns  = row.get('path_with_namespace', row.get('path', '?'))
+            try:
+                dep_rows, import_rows = future.result(timeout=FUTURE_TIMEOUT)
+            except FutureTimeout:
+                logger.warning('P2 | TIMEOUT | %s', ns)
+                _inc('p2_timeouts')
+                dep_rows, import_rows = [], []
+            except Exception as exc:
+                logger.error('P2 | ERROR | %s | %s', ns, exc)
+                _inc('p2_errors')
+                dep_rows, import_rows = [], []
+
+            flusher.add(dep_rows, import_rows,
+                        row['project_id'], row['name'], row['path'])
+
+            if p2_done % 5 == 0 or p2_done == p2_total:
+                pct = 100 * p2_done // p2_total
+                print(f'\r  P2: {p2_done}/{p2_total} ({pct}%) '
+                      f'| deps_rows={flusher.total_deps} '
+                      f'imp_rows={flusher.total_imports} '
+                      f'err={run_stats["p2_errors"]} '
+                      f'timeout={run_stats["p2_timeouts"]}   ',
+                      end='', flush=True)
+
+    print()
+    flusher.final_flush()   # flush any leftover rows
+    t_p2_elapsed = time.perf_counter() - t_total - t_p1_elapsed
+
+    # ── Write progress XLSX ──────────────────────────────────────────────────
+    xlsx_path = f'phase2_progress_{run_ts_str}.xlsx'
+    write_progress_xlsx(_progress, xlsx_path)
+    print(f'\n  Progress file : {xlsx_path}')
 
 # ── Final summary ─────────────────────────────────────────────────────────────
+t_elapsed = time.perf_counter() - t_total
 print()
 print('=' * 70)
 print('  FINAL SUMMARY')
 print('=' * 70)
 if run_phase1:
-    print(f'  gwma_ui_projects rows       : {len(p1_rows)}  (batch={batch_projects})')
-print(f'  gwma_ui_dependencies rows   : {flusher.total_deps}  (batch={batch_deps})')
-print(f'  gwma_ui_imports rows        : {flusher.total_imports}  (batch={batch_imports})')
-print(f'  inserted_at                 : {run_ts.isoformat()}')
+    print(f'  Total projects in group               : {total_all}')
+    print(f'  Modified since {UPDATED_SINCE.date()}        : {len(recent_refs)}')
+    print(f'  UI projects (have package.json)       : {len(p1_rows)}')
+    print(f'  gwma_ui_projects rows (this run)      : {len(p1_rows)}  (batch={batch_projects})')
+if run_phase2:
+    print(f'  gwma_ui_dependencies rows             : {flusher.total_deps}  (batch={batch_deps})')
+    print(f'  gwma_ui_imports rows                  : {flusher.total_imports}  (batch={batch_imports})')
+print(f'  inserted_at                           : {run_ts.isoformat()}')
 print()
-projects_done     = sum(1 for v in _progress.values() if v['deps_inserted'] and v['imports_inserted'])
-projects_deps_ok  = sum(1 for v in _progress.values() if v['deps_inserted'])
-projects_imps_ok  = sum(1 for v in _progress.values() if v['imports_inserted'])
-print(f'  Projects: both tables done  : {projects_done}')
-print(f'  Projects: deps table done   : {projects_deps_ok}')
-print(f'  Projects: imports table done: {projects_imps_ok}')
-print()
-print(f'  Source files fetched        : {run_stats["source_files_fetched"]}')
-print(f'  P2 errors / timeouts        : {run_stats["p2_errors"]} / {run_stats["p2_timeouts"]}')
-print(f'  Phase 1 elapsed (s)         : {t_p1_elapsed:.1f}')
-print(f'  Phase 2 elapsed (s)         : {t_p2_elapsed:.1f}')
-print(f'  Total elapsed (s)           : {t_elapsed:.1f}')
+if run_phase2:
+    projects_done    = sum(1 for v in _progress.values() if v['deps_inserted'] and v['imports_inserted'])
+    projects_deps_ok = sum(1 for v in _progress.values() if v['deps_inserted'])
+    projects_imps_ok = sum(1 for v in _progress.values() if v['imports_inserted'])
+    print(f'  Projects: both tables done            : {projects_done}')
+    print(f'  Projects: deps table done             : {projects_deps_ok}')
+    print(f'  Projects: imports table done          : {projects_imps_ok}')
+    print()
+    print(f'  Source files fetched                  : {run_stats["source_files_fetched"]}')
+    print(f'  P2 errors / timeouts                  : {run_stats["p2_errors"]} / {run_stats["p2_timeouts"]}')
+print(f'  Phase 1 elapsed (s)                   : {t_p1_elapsed:.1f}')
+if run_phase2:
+    print(f'  Phase 2 elapsed (s)                   : {t_p2_elapsed:.1f}')
+print(f'  Total elapsed (s)                     : {t_elapsed:.1f}')
 print('=' * 70)
 print()
-print(f'  JOIN TABLES ON project_id + batch:')
+print(f'  JOIN TABLES ON project_id:')
 print(f'    {TBL_PROJECTS}')
 print(f'    {TBL_DEPS}')
 print(f'    {TBL_IMPORTS}')
-print(f'  Progress XLSX: {xlsx_path}')
+if run_phase2 and _progress:
+    print(f'  Progress XLSX: {xlsx_path}')
 
 # =============================================================================
 #  PHASE 3 — Enrich gwma_ui_imports with import_what + import_from columns
@@ -1353,52 +1379,129 @@ def run_phase3_enrich_imports() -> None:
     print(f'  Rows to enrich: {total_pending}')
     logger.info('PHASE 3 | rows to enrich: %d', total_pending)
 
-    # Step 3 + 4: fetch in batches, parse, update
+    # Step 3 + 4: fetch in batches, parse, UPDATE row-by-row
+    # We do NOT use ctid-based UPDATE FROM VALUES — Greenplum distributed tables
+    # can produce "multiple updates to a row by the same query" errors when the
+    # same ctid appears across segments.
+    # Instead we: (a) add a SERIAL surrogate key column, (b) do one UPDATE per
+    # row keyed on that surrogate, or fall back to parsing + re-inserting.
+    # Simplest Greenplum-safe approach: UPDATE with a unique indexed column.
+    # We use (project_id, import_statement) as the match key — not ctid.
+    # Since the same (project_id, import_statement) may appear multiple times
+    # (same import in multiple files), we add an auto-increment helper column
+    # _enrich_id for uniqueness, then drop it after enrichment.
+
     updated_total = 0
-    offset = 0
 
-    while True:
-        # Fetch a batch of rows needing enrichment
-        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            cur.execute(
-                f'SELECT ctid, import_statement FROM {TBL_IMPORTS} '
-                f'WHERE import_what IS NULL AND import_from IS NULL '
-                f'LIMIT %s OFFSET %s;',
-                (PHASE3_BATCH, offset)
-            )
-            batch = cur.fetchall()
+    # Add a temporary serial column to guarantee unique row identity
+    _has_tmp_col = False
+    if not _column_exists(conn, TBL_IMPORTS, '_enrich_id'):
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f'ALTER TABLE {TBL_IMPORTS} ADD COLUMN _enrich_id BIGSERIAL;'
+                )
+            conn.commit()
+            _has_tmp_col = True
+            logger.info('PHASE 3 | added temporary _enrich_id column')
+        except Exception as exc:
+            conn.rollback()
+            logger.warning('PHASE 3 | could not add _enrich_id, falling back to statement match: %s', exc)
+    else:
+        _has_tmp_col = True   # already exists from a previous interrupted run
 
-        if not batch:
-            break
+    if _has_tmp_col:
+        # Fast path: unique key = _enrich_id
+        offset = 0
+        while True:
+            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute(
+                    f'SELECT _enrich_id, import_statement FROM {TBL_IMPORTS} '
+                    f'WHERE import_what IS NULL AND import_from IS NULL '
+                    f'ORDER BY _enrich_id LIMIT %s OFFSET %s;',
+                    (PHASE3_BATCH, offset)
+                )
+                batch = cur.fetchall()
+            if not batch:
+                break
 
-        # Parse each statement
-        updates: List[Tuple[Optional[str], Optional[str], Any]] = []
-        for r in batch:
-            what, frm = _parse_import_statement(r['import_statement'] or '')
-            updates.append((what, frm, r['ctid']))
+            # Parse in Python
+            updates = []
+            for r in batch:
+                what, frm = _parse_import_statement(r['import_statement'] or '')
+                updates.append((what, frm, int(r['_enrich_id'])))
 
-        # Bulk update using a VALUES list
-        with conn.cursor() as cur:
-            psycopg2.extras.execute_values(
-                cur,
-                f'UPDATE {TBL_IMPORTS} AS t '
-                f'SET import_what = v.iw, import_from = v.ifr '
-                f'FROM (VALUES %s) AS v(iw, ifr, row_ctid) '
-                f'WHERE t.ctid = v.row_ctid::tid;',
-                updates,
-                template='(%s, %s, %s)',
-            )
-        conn.commit()
+            # UPDATE keyed on _enrich_id — each _enrich_id is unique so no
+            # "multiple updates to same row" problem
+            with conn.cursor() as cur:
+                cur.executemany(
+                    f'UPDATE {TBL_IMPORTS} '
+                    f'SET import_what = %s, import_from = %s '
+                    f'WHERE _enrich_id = %s;',
+                    updates
+                )
+            conn.commit()
 
-        updated_total += len(batch)
-        pct = 100 * updated_total // total_pending if total_pending else 100
-        print(f'\r  Enriched: {updated_total}/{total_pending} ({pct}%)   ',
-              end='', flush=True)
-        logger.info('PHASE 3 | enriched %d / %d', updated_total, total_pending)
+            updated_total += len(batch)
+            pct = 100 * updated_total // total_pending if total_pending else 100
+            print(f'\r  Enriched: {updated_total}/{total_pending} ({pct}%)   ',
+                  end='', flush=True)
+            logger.info('PHASE 3 | enriched %d / %d', updated_total, total_pending)
 
-        if len(batch) < PHASE3_BATCH:
-            break
-        offset += PHASE3_BATCH
+            if len(batch) < PHASE3_BATCH:
+                break
+            offset += PHASE3_BATCH
+
+        # Drop the temporary helper column
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f'ALTER TABLE {TBL_IMPORTS} DROP COLUMN _enrich_id;')
+            conn.commit()
+            logger.info('PHASE 3 | dropped temporary _enrich_id column')
+        except Exception as exc:
+            conn.rollback()
+            logger.warning('PHASE 3 | could not drop _enrich_id: %s', exc)
+
+    else:
+        # Fallback: match on import_statement text (may update multiple rows with
+        # same statement, but that is correct — they all get the same parsed values)
+        offset = 0
+        while True:
+            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute(
+                    f'SELECT DISTINCT import_statement FROM {TBL_IMPORTS} '
+                    f'WHERE import_what IS NULL AND import_from IS NULL '
+                    f'LIMIT %s OFFSET %s;',
+                    (PHASE3_BATCH, offset)
+                )
+                batch = cur.fetchall()
+            if not batch:
+                break
+
+            updates = []
+            for r in batch:
+                what, frm = _parse_import_statement(r['import_statement'] or '')
+                updates.append((what, frm, r['import_statement']))
+
+            with conn.cursor() as cur:
+                cur.executemany(
+                    f'UPDATE {TBL_IMPORTS} '
+                    f'SET import_what = %s, import_from = %s '
+                    f'WHERE import_statement = %s '
+                    f'  AND import_what IS NULL AND import_from IS NULL;',
+                    updates
+                )
+            conn.commit()
+
+            updated_total += len(batch)
+            pct = 100 * updated_total // total_pending if total_pending else 100
+            print(f'\r  Enriched: {updated_total}/{total_pending} ({pct}%)   ',
+                  end='', flush=True)
+            logger.info('PHASE 3 | enriched %d / %d', updated_total, total_pending)
+
+            if len(batch) < PHASE3_BATCH:
+                break
+            offset += PHASE3_BATCH
 
     print()
     conn.close()
