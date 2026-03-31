@@ -1279,63 +1279,134 @@ if run_phase2 and _progress:
 # =============================================================================
 #  PHASE 3 — Enrich gwma_ui_imports with import_what + import_from columns
 # =============================================================================
-# This runs independently of Phase 1 and Phase 2.
-# It adds two columns to the imports table (if they do not already exist) and
-# populates them by parsing the existing import_statement values in-place:
+# FAST STRATEGY (Greenplum-safe, no ctid):
 #
-#   import_statement : "import React, { useState } from 'react'"
-#   import_what      : "React, { useState }"        (everything between 'import' and 'from')
-#   import_from      : "react"                       (the quoted module specifier)
+#   1. Fetch ALL distinct import_statement values that still need enrichment.
+#      Parsing is done entirely in Python (regex, ~microseconds per row).
 #
-# For side-effect imports ("import './styles.css'") import_what is NULL and
-# import_from is the quoted path.
+#   2. Create a TEMP TABLE containing (import_statement, import_what, import_from).
+#      This is a small table — there are far fewer DISTINCT statement strings
+#      than total rows (many projects share the same imports).
 #
-# The UPDATE runs in batches of PHASE3_BATCH rows for safety.
+#   3. One single UPDATE ... FROM temp_table WHERE import_statement matches.
+#      Greenplum executes this as a distributed hash join — fast, parallel,
+#      no per-row round-trips, no ctid, no "multiple updates" error.
+#
+#   4. DROP the temp table.
+#
+# Result: 1 SELECT + 1 INSERT (temp) + 1 UPDATE — regardless of row count.
+# vs old approach: N/1000 SELECT + N individual UPDATE statements.
 
-PHASE3_BATCH = 1000   # rows per UPDATE batch
+PHASE3_FETCH  = 50_000   # rows per SELECT when reading distinct statements
+PHASE3_INSERT = 5_000    # rows per INSERT into temp table
+
+_RE_FROM = re.compile(
+    r'^import\s+(.+?)\s+from\s+[\'"]([^\'"]+)[\'"][\s;]*$',
+    re.DOTALL,
+)
+_RE_SIDE = re.compile(
+    r'^import\s+[\'"]([^\'"]+)[\'"][\s;]*$',
+)
 
 def _parse_import_statement(stmt: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    Parse a single import statement string into (import_what, import_from).
+    Parse one import statement into (import_what, import_from).
 
-    Handles all ES-module forms:
-      import React from 'react'                  → ('React', 'react')
-      import { useState } from 'react'           → ('{ useState }', 'react')
-      import React, { useState } from 'react'    → ('React, { useState }', 'react')
-      import * as Icons from '@uwr/icons'        → ('* as Icons', '@uwr/icons')
-      import './styles.css'                      → (None, './styles.css')
+    import React, { useState } from 'react'  → ('React, { useState }', 'react')
+    import * as Icons from '@uwr/icons'       → ('* as Icons', '@uwr/icons')
+    import './styles.css'                     → (None, './styles.css')
     """
     stmt = stmt.strip()
-    # Match: import <what> from '<from>'
-    m_from = re.match(
-        r'^import\s+(.+?)\s+from\s+[\'\"]([^\'\"]+)[\'\"](\s*;?)?$',
-        stmt, re.DOTALL
-    )
-    if m_from:
-        what = m_from.group(1).strip()
-        frm  = m_from.group(2).strip()
-        return what, frm
-    # Match: import '<from>'  (side-effect)
-    m_side = re.match(
-        r'^import\s+[\'\"]([^\'\"]+)[\'\"](\s*;?)?$',
-        stmt
-    )
-    if m_side:
-        return None, m_side.group(1).strip()
-    # Fallback: could not parse
+    m = _RE_FROM.match(stmt)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    m = _RE_SIDE.match(stmt)
+    if m:
+        return None, m.group(1).strip()
     return None, None
+
+
+def _parse_all_distinct(conn) -> Dict[str, Tuple[Optional[str], Optional[str]]]:
+    """
+    Fetch every DISTINCT import_statement that still needs enrichment,
+    parse them all in Python, return a dict:
+        {statement_text: (import_what, import_from)}
+    """
+    parsed: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+    offset = 0
+    total_fetched = 0
+    while True:
+        with conn.cursor() as cur:
+            cur.execute(
+                f'SELECT DISTINCT import_statement '
+                f'FROM {TBL_IMPORTS} '
+                f'WHERE import_what IS NULL AND import_from IS NULL '
+                f'AND import_statement IS NOT NULL '
+                f'LIMIT %s OFFSET %s;',
+                (PHASE3_FETCH, offset),
+            )
+            rows = cur.fetchall()
+        if not rows:
+            break
+        for (stmt,) in rows:
+            if stmt not in parsed:
+                parsed[stmt] = _parse_import_statement(stmt)
+        total_fetched += len(rows)
+        print(f'\r  Fetched {total_fetched} distinct statements ...   ', end='', flush=True)
+        if len(rows) < PHASE3_FETCH:
+            break
+        offset += PHASE3_FETCH
+    print()
+    logger.info('PHASE 3 | parsed %d distinct import statements', len(parsed))
+    return parsed
+
+
+def _bulk_insert_temp(conn, parsed: Dict) -> str:
+    """
+    INSERT all parsed (statement, what, from) rows into a TEMP TABLE.
+    Returns the temp table name.
+    """
+    tmp = '_p3_enrich_tmp'
+    with conn.cursor() as cur:
+        cur.execute(
+            f'CREATE TEMP TABLE {tmp} ('
+            f'  stmt TEXT, iw TEXT, ifr TEXT'
+            f') DISTRIBUTED BY (stmt);'
+        )
+    conn.commit()
+
+    items = list(parsed.items())            # [(stmt, (what, frm)), ...]
+    inserted = 0
+    with conn.cursor() as cur:
+        for start in range(0, len(items), PHASE3_INSERT):
+            chunk = items[start : start + PHASE3_INSERT]
+            rows  = [(stmt, what, frm) for stmt, (what, frm) in chunk]
+            psycopg2.extras.execute_values(
+                cur,
+                f'INSERT INTO {tmp} (stmt, iw, ifr) VALUES %s',
+                rows,
+                template='(%s, %s, %s)',
+            )
+            inserted += len(chunk)
+            print(f'\r  Loaded {inserted}/{len(items)} into temp table ...   ',
+                  end='', flush=True)
+    conn.commit()
+    print()
+    logger.info('PHASE 3 | temp table populated: %d rows', inserted)
+    return tmp
 
 
 def run_phase3_enrich_imports() -> None:
     """
-    Phase 3: add import_what + import_from columns to gwma_ui_imports and
-    populate them from the existing import_statement column.
+    Phase 3 — fast Greenplum-safe enrichment of import_what + import_from.
 
-    Steps:
-      1. Add columns if missing (via db_add_columns_if_missing variant).
-      2. SELECT rows where import_what IS NULL (unpopulated).
-      3. Parse each import_statement in Python.
-      4. UPDATE in batches of PHASE3_BATCH.
+    Strategy:
+      Step 1  Add import_what / import_from columns if missing.
+      Step 2  Count rows needing enrichment.
+      Step 3  Fetch DISTINCT import_statement values, parse in Python.
+      Step 4  INSERT parsed values into a TEMP TABLE.
+      Step 5  Single UPDATE ... FROM temp_table (one server-side hash join).
+      Step 6  DROP temp table.
     """
     print()
     print('=' * 70)
@@ -1352,7 +1423,9 @@ def run_phase3_enrich_imports() -> None:
         else:
             try:
                 with conn.cursor() as cur:
-                    cur.execute(f'ALTER TABLE {TBL_IMPORTS} ADD COLUMN "{col}" {dtype};')
+                    cur.execute(
+                        f'ALTER TABLE {TBL_IMPORTS} ADD COLUMN "{col}" {dtype};'
+                    )
                 conn.commit()
                 logger.info('PHASE 3 | added column "%s" %s', col, dtype)
                 print(f'  Added column: {col} ({dtype})')
@@ -1366,7 +1439,8 @@ def run_phase3_enrich_imports() -> None:
     # Step 2: count rows needing enrichment
     with conn.cursor() as cur:
         cur.execute(
-            f'SELECT COUNT(*) FROM {TBL_IMPORTS} WHERE import_what IS NULL AND import_from IS NULL;'
+            f'SELECT COUNT(*) FROM {TBL_IMPORTS} '
+            f'WHERE import_what IS NULL AND import_from IS NULL;'
         )
         total_pending = cur.fetchone()[0]
 
@@ -1376,138 +1450,66 @@ def run_phase3_enrich_imports() -> None:
         conn.close()
         return
 
-    print(f'  Rows to enrich: {total_pending}')
+    print(f'  Rows to enrich : {total_pending:,}')
     logger.info('PHASE 3 | rows to enrich: %d', total_pending)
 
-    # Step 3 + 4: fetch in batches, parse, UPDATE row-by-row
-    # We do NOT use ctid-based UPDATE FROM VALUES — Greenplum distributed tables
-    # can produce "multiple updates to a row by the same query" errors when the
-    # same ctid appears across segments.
-    # Instead we: (a) add a SERIAL surrogate key column, (b) do one UPDATE per
-    # row keyed on that surrogate, or fall back to parsing + re-inserting.
-    # Simplest Greenplum-safe approach: UPDATE with a unique indexed column.
-    # We use (project_id, import_statement) as the match key — not ctid.
-    # Since the same (project_id, import_statement) may appear multiple times
-    # (same import in multiple files), we add an auto-increment helper column
-    # _enrich_id for uniqueness, then drop it after enrichment.
+    t_p3 = time.perf_counter()
 
-    updated_total = 0
+    # Step 3: fetch distinct statements and parse in Python
+    print('  Step 1/3 — Parsing distinct import statements ...')
+    parsed = _parse_all_distinct(conn)
+    print(f'  Distinct statements parsed: {len(parsed):,}')
 
-    # Add a temporary serial column to guarantee unique row identity
-    _has_tmp_col = False
-    if not _column_exists(conn, TBL_IMPORTS, '_enrich_id'):
+    # Step 4: load into temp table
+    print('  Step 2/3 — Loading parsed values into temp table ...')
+    tmp = _bulk_insert_temp(conn, parsed)
+
+    # Step 5: single UPDATE join — one server-side operation
+    print('  Step 3/3 — Running UPDATE ... FROM temp table (single query) ...')
+    logger.info('PHASE 3 | running UPDATE ... FROM %s', tmp)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f'UPDATE {TBL_IMPORTS} AS t '
+                f'SET import_what = tmp.iw, '
+                f'    import_from = tmp.ifr '
+                f'FROM {tmp} AS tmp '
+                f'WHERE t.import_statement = tmp.stmt '
+                f'  AND t.import_what IS NULL '
+                f'  AND t.import_from IS NULL;'
+            )
+            updated = cur.rowcount
+        conn.commit()
+        logger.info('PHASE 3 | UPDATE complete — %d rows updated', updated)
+        print(f'  Updated: {updated:,} rows')
+    except Exception as exc:
+        conn.rollback()
+        logger.error('PHASE 3 | UPDATE failed: %s', exc)
+        print(f'  ERROR during UPDATE: {exc}')
+        # Clean up temp table before raising
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    f'ALTER TABLE {TBL_IMPORTS} ADD COLUMN _enrich_id BIGSERIAL;'
-                )
+                cur.execute(f'DROP TABLE IF EXISTS {tmp};')
             conn.commit()
-            _has_tmp_col = True
-            logger.info('PHASE 3 | added temporary _enrich_id column')
-        except Exception as exc:
-            conn.rollback()
-            logger.warning('PHASE 3 | could not add _enrich_id, falling back to statement match: %s', exc)
-    else:
-        _has_tmp_col = True   # already exists from a previous interrupted run
+        except Exception:
+            pass
+        conn.close()
+        return
 
-    if _has_tmp_col:
-        # Fast path: unique key = _enrich_id
-        offset = 0
-        while True:
-            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                cur.execute(
-                    f'SELECT _enrich_id, import_statement FROM {TBL_IMPORTS} '
-                    f'WHERE import_what IS NULL AND import_from IS NULL '
-                    f'ORDER BY _enrich_id LIMIT %s OFFSET %s;',
-                    (PHASE3_BATCH, offset)
-                )
-                batch = cur.fetchall()
-            if not batch:
-                break
+    # Step 6: drop temp table
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f'DROP TABLE IF EXISTS {tmp};')
+        conn.commit()
+        logger.info('PHASE 3 | temp table dropped')
+    except Exception as exc:
+        logger.warning('PHASE 3 | could not drop temp table: %s', exc)
 
-            # Parse in Python
-            updates = []
-            for r in batch:
-                what, frm = _parse_import_statement(r['import_statement'] or '')
-                updates.append((what, frm, int(r['_enrich_id'])))
-
-            # UPDATE keyed on _enrich_id — each _enrich_id is unique so no
-            # "multiple updates to same row" problem
-            with conn.cursor() as cur:
-                cur.executemany(
-                    f'UPDATE {TBL_IMPORTS} '
-                    f'SET import_what = %s, import_from = %s '
-                    f'WHERE _enrich_id = %s;',
-                    updates
-                )
-            conn.commit()
-
-            updated_total += len(batch)
-            pct = 100 * updated_total // total_pending if total_pending else 100
-            print(f'\r  Enriched: {updated_total}/{total_pending} ({pct}%)   ',
-                  end='', flush=True)
-            logger.info('PHASE 3 | enriched %d / %d', updated_total, total_pending)
-
-            if len(batch) < PHASE3_BATCH:
-                break
-            offset += PHASE3_BATCH
-
-        # Drop the temporary helper column
-        try:
-            with conn.cursor() as cur:
-                cur.execute(f'ALTER TABLE {TBL_IMPORTS} DROP COLUMN _enrich_id;')
-            conn.commit()
-            logger.info('PHASE 3 | dropped temporary _enrich_id column')
-        except Exception as exc:
-            conn.rollback()
-            logger.warning('PHASE 3 | could not drop _enrich_id: %s', exc)
-
-    else:
-        # Fallback: match on import_statement text (may update multiple rows with
-        # same statement, but that is correct — they all get the same parsed values)
-        offset = 0
-        while True:
-            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                cur.execute(
-                    f'SELECT DISTINCT import_statement FROM {TBL_IMPORTS} '
-                    f'WHERE import_what IS NULL AND import_from IS NULL '
-                    f'LIMIT %s OFFSET %s;',
-                    (PHASE3_BATCH, offset)
-                )
-                batch = cur.fetchall()
-            if not batch:
-                break
-
-            updates = []
-            for r in batch:
-                what, frm = _parse_import_statement(r['import_statement'] or '')
-                updates.append((what, frm, r['import_statement']))
-
-            with conn.cursor() as cur:
-                cur.executemany(
-                    f'UPDATE {TBL_IMPORTS} '
-                    f'SET import_what = %s, import_from = %s '
-                    f'WHERE import_statement = %s '
-                    f'  AND import_what IS NULL AND import_from IS NULL;',
-                    updates
-                )
-            conn.commit()
-
-            updated_total += len(batch)
-            pct = 100 * updated_total // total_pending if total_pending else 100
-            print(f'\r  Enriched: {updated_total}/{total_pending} ({pct}%)   ',
-                  end='', flush=True)
-            logger.info('PHASE 3 | enriched %d / %d', updated_total, total_pending)
-
-            if len(batch) < PHASE3_BATCH:
-                break
-            offset += PHASE3_BATCH
-
-    print()
+    elapsed = time.perf_counter() - t_p3
     conn.close()
-    print(f'  Phase 3 complete — {updated_total} rows enriched in {TBL_IMPORTS}')
-    logger.info('PHASE 3 | done — %d rows enriched', updated_total)
-
+    print()
+    print(f'  Phase 3 complete — {total_pending:,} rows enriched in {elapsed:.1f}s')
+    logger.info('PHASE 3 | done in %.1fs', elapsed)
 
 # ── Ask user whether to run Phase 3 ──────────────────────────────────────────
 print()
