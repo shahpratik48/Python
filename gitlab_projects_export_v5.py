@@ -305,76 +305,93 @@ def extract_team_name(web_url: str) -> str:
         return ''
 
 
-# Cache of group_id → ancestor name list so we don't re-fetch for every project
-_group_ancestor_cache: Dict[int, List[str]] = {}
+# Cache of group_path → display name so we don't re-fetch the same group twice
+_group_name_cache: Dict[str, str] = {}
 _group_cache_lock = threading.Lock()
 
-def _get_ancestor_names(namespace: Dict[str, Any]) -> List[str]:
+def _group_display_name(group_path: str) -> str:
     """
-    Return the list of ancestor group *display names* (not slugs) for a project,
-    ordered from top-level down.
-
-    GitLab stores the full slug path in namespace['full_path'], e.g.:
-      ubs/gwma/global-wealth-mgmt/digital-client/client-onboarding/overdrive/assisted-mock-ui
-
-    We strip the fixed GROUP_PATH prefix ('ubs/gwma'), split the remainder,
-    then resolve each slug to its display name by fetching the group object.
-    Results are cached by namespace id to avoid repeated API calls.
-
-    Returns a list that may have 0-N entries depending on nesting depth.
+    Return the display name of a GitLab group given its full slug path.
+    Result is cached so each group is fetched at most once.
+    Falls back to title-casing the last path segment on error.
     """
-    ns_id   = namespace.get('id')
-    ns_path = namespace.get('full_path', '')
-
-    # Try cache first
     with _group_cache_lock:
-        if ns_id and ns_id in _group_ancestor_cache:
-            return _group_ancestor_cache[ns_id]
+        if group_path in _group_name_cache:
+            return _group_name_cache[group_path]
 
-    # Strip the root GROUP_PATH prefix from the full path
-    prefix  = GROUP_PATH.rstrip('/')            # e.g. 'ubs/gwma'
-    if ns_path.startswith(prefix + '/'):
-        rel = ns_path[len(prefix) + 1:]         # everything after 'ubs/gwma/'
-    elif ns_path == prefix:
-        rel = ''
+    with _gitlab_sem:
+        try:
+            grp = client.groups.get(group_path)
+            name = grp.name
+        except Exception:
+            # Fallback: title-case the last slug segment
+            name = group_path.rstrip('/').split('/')[-1].replace('-', ' ').title()
+
+    with _group_cache_lock:
+        _group_name_cache[group_path] = name
+
+    return name
+
+
+def extract_division_stream_crew(
+    project_path_with_namespace: str,
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Derive division, stream, and crew from the project's full path.
+
+    Source:  project.path_with_namespace
+    Example: ubs/gwma/be-a-client-of-ubs-gwma/client-onboarding-lifecyl-mgmt/
+             banking-self-onboarding/overdrive-client-onboarding-platform/assisted-mock-ui
+
+    After stripping the GROUP_PATH root ('ubs/gwma') AND the project name (last segment),
+    the remaining path segments are the intermediate group slugs in hierarchy order:
+
+      [0] be-a-client-of-ubs-gwma        → division  ("Global Wealth Management Americas")
+      [1] client-onboarding-lifecyl-mgmt → stream    ("Digital Client and Marketing Platforms")
+      [2] banking-self-onboarding         → crew      ("Client Onboarding")
+      [3+] deeper groups                  → ignored
+
+    Each slug is resolved to its display name via the GitLab Groups API (cached).
+
+    Why project.path_with_namespace instead of namespace['full_path']:
+      namespace['full_path'] is the *immediate parent group* path — it is already
+      several levels deep and silently omits the top-level division group, causing
+      the values to be shifted by one position (stream lands in division column, etc.).
+      path_with_namespace always contains the full path from root to project,
+      so stripping the root prefix and the project name gives the complete
+      and correct intermediate group hierarchy.
+
+    Returns (division, stream, crew); any missing level is None.
+    """
+    prefix = GROUP_PATH.rstrip('/')
+
+    # Strip the root GROUP_PATH prefix
+    if project_path_with_namespace.startswith(prefix + '/'):
+        rel = project_path_with_namespace[len(prefix) + 1:]
     else:
-        rel = ns_path                            # unexpected structure — use as-is
+        rel = project_path_with_namespace   # unexpected — use as-is
 
-    slugs = [s for s in rel.split('/') if s]    # intermediate group slugs
+    parts = [p for p in rel.split('/') if p]
 
-    # Resolve each slug to its display name by fetching its group object
-    ancestor_names: List[str] = []
+    # Drop the last segment — that is the project name, not a group
+    group_slugs = parts[:-1]   # [div_slug, stream_slug, crew_slug, ...]
+
+    if not group_slugs:
+        return None, None, None
+
+    # Resolve only the first three levels (we only need div/stream/crew)
+    names: List[str] = []
     current_path = prefix
-    for slug in slugs:
+    for slug in group_slugs[:3]:
         current_path = f'{current_path}/{slug}'
-        with _gitlab_sem:
-            try:
-                grp = client.groups.get(current_path)
-                ancestor_names.append(grp.name)
-            except Exception:
-                # Fallback: use the slug itself (converted to title case)
-                ancestor_names.append(slug.replace('-', ' ').title())
+        names.append(_group_display_name(current_path))
 
-    # Store in cache
-    with _group_cache_lock:
-        if ns_id:
-            _group_ancestor_cache[ns_id] = ancestor_names
-
-    return ancestor_names
-
-
-def extract_division_stream_crew(namespace: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """
-    Return (division, stream, crew) from the group ancestor name list.
-      division = ancestor[0]  (1st group below ubs/gwma root)
-      stream   = ancestor[1]  (2nd group)
-      crew     = ancestor[2]  (3rd group)
-    Any missing level is returned as None.
-    """
-    names = _get_ancestor_names(namespace)
     division = names[0] if len(names) > 0 else None
     stream   = names[1] if len(names) > 1 else None
     crew     = names[2] if len(names) > 2 else None
+
+    logger.debug('HIER | %s → div=%s | stream=%s | crew=%s',
+                 project_path_with_namespace, division, stream, crew)
     return division, stream, crew
 
 def _raw_file(project: Any, path: str, ref: str) -> Optional[str]:
@@ -697,7 +714,7 @@ def fetch_project_with_pkg(proj_ref: Any) -> Optional[Dict[str, Any]]:
     logger.info('P1 | YES pkg | %s', project.path_with_namespace)
     _inc('has_package_json')
 
-    division, stream, crew = extract_division_stream_crew(ns_d)
+    division, stream, crew = extract_division_stream_crew(project.path_with_namespace)
     logger.info('P1 | hierarchy | div=%s  stream=%s  crew=%s | %s',
                 division, stream, crew, project.path_with_namespace)
 
