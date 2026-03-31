@@ -552,9 +552,9 @@ def build_sigma_html(summary: dict) -> str:
     data_json  = json.dumps(graph_data, separators=(',', ':'))
 
     # Count for badges
-    ikg_count = len([n for n in sigma_nodes if n['type'] in ('ikg','final')])
-    tmp_count = len([n for n in sigma_nodes if n['type'] == 'tmp'])
-    ext_count = len([n for n in sigma_nodes if n['type'] == 'ext'])
+    ikg_count = len([n for n in sigma_nodes if n['ntype'] in ('ikg','final')])
+    tmp_count = len([n for n in sigma_nodes if n['ntype'] == 'tmp'])
+    ext_count = len([n for n in sigma_nodes if n['ntype'] == 'ext'])
     rel_count = len(sigma_edges)
 
     html = f"""<!DOCTYPE html>
