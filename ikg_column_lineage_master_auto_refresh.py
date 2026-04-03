@@ -1,0 +1,1898 @@
+"""
+IKG Column Lineage Master Auto Refresh
+=======================================
+Parses all SQL files from the IKG GitLab repository (develop branch),
+extracts column-level lineage, and writes results to:
+  - Greenplum: <schema>.ikg_column_lineage_master_auto_refresh  (DROP/RECREATE)
+  - Excel:     ikg_column_lineage_master_auto_refresh_<YYYYMMDD_HHMMSS>.xlsx
+"""
+
+import os
+import re
+import getpass
+import logging
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, List, Dict, Any, Tuple, Set
+
+import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+GITLAB_URL         = "https://devcloud.ubs.net"
+IKG_PROJECT_PATH   = "ubs/gwma/smart-technology-and-analytics/staat-data-science/staat-ds-genesis/genesis-platform/ikg-dags"
+DEFAULT_BASE_BRANCH = "develop"
+SQL_FOLDER_IN_REPO  = "dags/ikg/scripts/sql"
+
+GREENPLUM_HOST = "greenplum-rdsp.zur.swissbank.com"
+GREENPLUM_PORT = 5432
+GREENPLUM_DB   = "gprdsp"
+GREENPLUM_USER = "ds_rdsp_dev"
+GREENPLUM_SCHEMA: Optional[str] = None
+
+OUTPUT_TABLE     = "ikg_column_lineage_master_auto_refresh"
+GITLAB_TOKEN_VAR = "GENESIS_DDLC_IKG_GIT_SECRET"
+POSTGRES_CONN_ID_VAR = "IKG_POSTGRES_CONN_ID"
+
+# Folders to skip entirely (req 18)
+EXCLUDED_PROCESSES = {
+    "current", "ikg_pre_validation_new", "ikg_create_profiles_history",
+    "ikg_postvalidation", "ikg_drop_backup_tables", "ikg_datasets_validation",
+}
+
+# Cache for information_schema column lookups: {(schema, table): [col1, col2, ...]}
+_INFO_SCHEMA_CACHE: Dict[Tuple[str, str], List[str]] = {}
+# Global DB engine for information_schema lookups (set during run)
+_DB_ENGINE = None
+
+COLUMN_ORDER = [
+    "file", "path", "target_table", "target_schema", "process",
+    "current_date_time", "sub_target_table", "sub_target_schema",
+    "target_column", "source_table", "source_schema", "source_column",
+    "logic", "sql_process",
+]
+
+# SQL reserved words that can NEVER be column / table names
+SQL_KEYWORDS: Set[str] = {
+    "SELECT","FROM","WHERE","AND","OR","NOT","IN","IS","NULL","CASE","WHEN",
+    "THEN","ELSE","END","AS","ON","JOIN","LEFT","RIGHT","INNER","OUTER","FULL",
+    "CROSS","GROUP","BY","ORDER","HAVING","LIMIT","OFFSET","DISTINCT","ALL",
+    "UNION","INTERSECT","EXCEPT","WITH","RECURSIVE","INSERT","INTO","UPDATE",
+    "SET","DELETE","CREATE","TABLE","TEMP","TEMPORARY","DROP","IF","EXISTS",
+    "PARTITION","OVER","TRUE","FALSE","LIKE","ILIKE","BETWEEN","ASC","DESC",
+    "DISTRIBUTED","GRANT","ALTER","OWNER","TO","INDEX","BIGINT","INTEGER",
+    "VARCHAR","CHARACTER","VARYING","NUMERIC","DOUBLE","PRECISION","BOOLEAN",
+    "TEXT","SERIAL","APPENDONLY","COMPRESSLEVEL","USING","VALUES","RETURNING",
+    "FILTER","NULLS","LAST","FIRST","ROWS","RANGE","PRECEDING","FOLLOWING",
+    "UNBOUNDED","CURRENT","ROW","WINDOW","WITHIN","GROUPS","EXCLUDE","TIES",
+    "NATURAL","LATERAL","STRAIGHT","NO","CYCLE","RECURSIVE","MATERIALIZED",
+    "VIEW","TRUNCATE","VACUUM","ANALYZE","REINDEX","REFRESH","EXPLAIN",
+    "PERFORM","RAISE","NOTICE","EXCEPTION","BEGIN","COMMIT","ROLLBACK",
+    "SAVEPOINT","RELEASE","PRIMARY","KEY","UNIQUE","REFERENCES","CHECK",
+    "DEFAULT","GENERATED","ALWAYS","STORED","VIRTUAL","IDENTITY","SEQUENCE",
+    "OWNED","INCREMENT","START","MINVALUE","MAXVALUE","CACHE","INHERIT",
+    "TABLESPACE","FILLFACTOR","RELOPTIONS","WITHOUT","OIDS","INHERITS",
+    "INCLUDING","EXCLUDING","DEFAULTS","INDEXES","CONSTRAINTS","STORAGE",
+    "COMMENTS","STATISTICS","NOTHING","COLUMN","TYPE","RENAME","ADD","DISABLE",
+    "ENABLE","REPLICA","TRIGGER","RULE","PROCEDURE","FUNCTION","AGGREGATE",
+    "OPERATOR","CLASS","FAMILY","DOMAIN","CONVERSION","ENCODING","SCHEMA",
+    "DATABASE","ROLE","USER","PUBLICATION","SUBSCRIPTION","SERVER","EXTENSION",
+    "POLICY","TRANSFORM","CAST","FOREIGN","DATA","WRAPPER","IMPORT","EXPORT",
+    "COPY","LOCK","NOTIFY","LISTEN","UNLISTEN","LOAD","RESET","SHOW","DISCARD",
+    "DEALLOCATE","FETCH","MOVE","CLOSE","DECLARE","OPEN","RETURN","NEXT",
+    "PRIOR","ABSOLUTE","RELATIVE","FORWARD","BACKWARD","SCROLL","HOLD",
+    "BINARY","INSENSITIVE","ASENSITIVE","SENSITIVE","READ","WRITE",
+    "REPEATABLE","UNCOMMITTED","COMMITTED","SERIALIZABLE","SNAPSHOT",
+    "INTERVAL","EPOCH","TIMEZONE","DOW","DOY","HOUR","MINUTE","SECOND",
+    "MILLISECOND","MICROSECOND","QUARTER","WEEK","MONTH","YEAR","DECADE",
+    "CENTURY","MILLENNIUM","INFINITY","NAN","DEFERRABLE","INITIALLY",
+    "DEFERRED","IMMEDIATE","CONSTRAINT","AT","TIME","ZONE","SIMILAR","ESCAPE",
+    "COLLATE","ARRAY","SPECIFIC","CALLED","INPUT","LANGUAGE","IMMUTABLE",
+    "STABLE","VOLATILE","STRICT","SECURITY","DEFINER","INVOKER","LOOP",
+    "EXECUTE","BOTH","LEADING","TRAILING","OVERLAY","PLACING","POSITION",
+    "FOR","ONLY","ENUM","RANGE","MULTIRANGE","GENERATED","IMPLICIT","EXPLICIT",
+}
+
+# SQL built-in functions — these appear in expressions but are NOT columns
+SQL_FUNCTIONS: Set[str] = {
+    "COALESCE","NULLIF","GREATEST","LEAST","NVL","IIF",
+    "COUNT","SUM","AVG","AVERAGE","MAX","MIN","STDDEV","VARIANCE",
+    "ROW_NUMBER","RANK","DENSE_RANK","PERCENT_RANK","CUME_DIST","NTILE",
+    "LAG","LEAD","FIRST_VALUE","LAST_VALUE","NTH_VALUE",
+    "CAST","CONVERT","TRY_CAST",
+    "EXTRACT","DATE_PART","DATE_TRUNC","DATE","NOW","CURRENT_DATE",
+    "CURRENT_TIMESTAMP","CURRENT_TIME","LOCALTIMESTAMP","LOCALTIME",
+    "TO_DATE","TO_TIMESTAMP","TO_CHAR","TO_NUMBER","TO_HEX",
+    "DATEADD","DATEDIFF","MONTHS_BETWEEN","ADD_MONTHS","NEXT_DAY","LAST_DAY",
+    "AGE","MAKE_DATE","MAKE_INTERVAL","MAKE_TIME","MAKE_TIMESTAMP",
+    "ISFINITE","CLOCK_TIMESTAMP","STATEMENT_TIMESTAMP","TRANSACTION_TIMESTAMP",
+    "UPPER","LOWER","INITCAP","LENGTH","CHAR_LENGTH","OCTET_LENGTH",
+    "TRIM","LTRIM","RTRIM","BTRIM","LPAD","RPAD",
+    "SUBSTRING","SUBSTR","LEFT","RIGHT","MID",
+    "REPLACE","REGEXP_REPLACE","REGEXP_MATCH","REGEXP_MATCHES","REGEXP_SPLIT_TO_ARRAY",
+    "CONCAT","CONCAT_WS","FORMAT","SPLIT_PART","STRING_TO_ARRAY",
+    "ARRAY_TO_STRING","STRING_AGG","ARRAY_AGG","LISTAGG","ARRAY_LENGTH",
+    "CARDINALITY","ARRAY_UPPER","ARRAY_LOWER",
+    "POSITION","STRPOS","CHARINDEX",
+    "REVERSE","REPEAT","QUOTE_LITERAL","QUOTE_IDENT","CHR","ASCII",
+    "MD5","SHA256","ENCODE","DECODE",
+    "ROUND","FLOOR","CEIL","CEILING","TRUNC","ABS","SIGN","MOD","POWER",
+    "SQRT","LOG","LN","EXP","RANDOM","SETSEED","DIV",
+    "GREATEST","LEAST",
+    "UNNEST","GENERATE_SERIES","GENERATE_SUBSCRIPTS",
+    "JSONB_AGG","JSON_AGG","JSONB_BUILD_OBJECT","JSON_BUILD_OBJECT",
+    "JSONB_OBJECT_KEYS","JSON_OBJECT_KEYS","JSONB_EACH","JSON_EACH",
+    "JSONB_EXTRACT_PATH","JSON_EXTRACT_PATH","JSONB_ARRAY_ELEMENTS",
+    "ROW","COMPOSITE",
+    "LEVENSHTEIN","METAPHONE","SOUNDEX","SIMILARITY","WORD_SIMILARITY",
+    "DIFFERENCE","DMETAPHONE","DMETAPHONE_ALT",
+    "BOOL_AND","BOOL_OR","EVERY","BIT_AND","BIT_OR","XOR",
+    "PERCENTILE_CONT","PERCENTILE_DISC","MODE",
+    "REGR_SLOPE","REGR_INTERCEPT","REGR_R2","CORR","COVAR_POP","COVAR_SAMP",
+    "ST_ASTEXT","ST_GEOMFROMTEXT","ST_DISTANCE","ST_CONTAINS",
+    "ISNULL","IFNULL","ZAP","IFFULL",
+    # JSON functions
+    "ROW_TO_JSON","TO_JSON","JSON_BUILD_ARRAY","JSONB_BUILD_ARRAY",
+    "JSON_TYPEOF","JSONB_TYPEOF","JSON_STRIP_NULLS","JSONB_STRIP_NULLS",
+    "JSON_POPULATE_RECORD","JSONB_POPULATE_RECORD","JSON_TO_RECORD","JSONB_TO_RECORD",
+    # Misc
+    "MD5","SHA256","ENCODE","DECODE","PG_TYPEOF","OID",
+    "GENERATE_SERIES","GENERATE_SUBSCRIPTS","UNNEST",
+    "WIDTH_BUCKET","SETSEED","RANDOM",
+}
+
+# ---------------------------------------------------------------------------
+# Airflow helpers
+# ---------------------------------------------------------------------------
+try:
+    from airflow.models import Variable  # type: ignore
+    _HAS_AIRFLOW = True
+except Exception:
+    Variable = None  # type: ignore
+    _HAS_AIRFLOW = False
+
+
+def is_running_in_airflow() -> bool:
+    return _HAS_AIRFLOW and bool(os.environ.get("AIRFLOW_CTX_DAG_ID"))
+
+
+def get_private_token(allow_prompt: bool = True) -> str:
+    if is_running_in_airflow():
+        return Variable.get(GITLAB_TOKEN_VAR)
+    token = os.environ.get(GITLAB_TOKEN_VAR)
+    if token:
+        return token
+    if allow_prompt:
+        return getpass.getpass("Enter your GitLab private token: ")
+    raise RuntimeError("GitLab token not found.")
+
+
+def ensure_greenplum_schema() -> str:
+    global GREENPLUM_SCHEMA
+    if GREENPLUM_SCHEMA:
+        return GREENPLUM_SCHEMA
+    if is_running_in_airflow():
+        try:
+            from ikg.scripts.python import props as ikg_props  # type: ignore
+            GREENPLUM_SCHEMA = ikg_props.get_airflow_variables().get("IKG_SCHEMA", "sandbox_prj_smart_insights")
+        except Exception:
+            GREENPLUM_SCHEMA = "sandbox_prj_smart_insights"
+    else:
+        GREENPLUM_SCHEMA = "sandbox_prj_smart_insights"
+    return GREENPLUM_SCHEMA
+
+
+def get_greenplum_credentials() -> Optional[dict]:
+    if not is_running_in_airflow():
+        return None
+    try:
+        from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
+        conn_id = Variable.get(POSTGRES_CONN_ID_VAR)
+        hook = PostgresHook(postgres_conn_id=conn_id)
+        conn = hook.get_connection(conn_id)
+        return {"host": conn.host, "port": int(conn.port or GREENPLUM_PORT),
+                "db": conn.schema or GREENPLUM_DB,
+                "user": conn.login or GREENPLUM_USER, "password": conn.password}
+    except Exception as e:
+        logger.warning(f"Could not resolve Greenplum credentials: {e}")
+        return None
+
+
+# ===========================================================================
+#  TEXT UTILITIES
+# ===========================================================================
+
+def _strip_comments(sql: str) -> str:
+    sql = re.sub(r'/\*.*?\*/', ' ', sql, flags=re.DOTALL)
+    sql = re.sub(r'--[^\n]*', ' ', sql)
+    return sql
+
+
+def _normalize(sql: str) -> str:
+    sql = _strip_comments(sql)
+    sql = sql.replace('\r\n', '\n').replace('\r', '\n')
+    return re.sub(r'[ \t]+', ' ', sql).strip()
+
+
+def _jinja_label(token: str) -> str:
+    """{{params.IKG_SCHEMA}} → 'IKG_SCHEMA'"""
+    m = re.search(r'params\.([^}]+)', token)
+    return m.group(1).strip() if m else token.strip()
+
+
+def _parse_table_token(raw: str) -> Tuple[str, str]:
+    """
+    '{{params.X}}.tablename'  → ('X', 'tablename')
+    'schema.tablename'        → ('schema', 'tablename')
+    'tablename'               → ('', 'tablename')
+    """
+    raw = raw.strip().rstrip(';').strip()
+    jm = re.match(r'(\{\{[^}]+\}\})\.(.*)', raw)
+    if jm:
+        return _jinja_label(jm.group(1)), jm.group(2).strip()
+    if '.' in raw:
+        p = raw.rsplit('.', 1)
+        schema = p[0].strip()
+        if re.match(r'\{\{', schema):
+            return _jinja_label(schema), p[1].strip()
+        return schema, p[1].strip()
+    return '', raw.strip()
+
+
+def _find_paren_end(text: str, start: int) -> int:
+    """Return index of ')' closing '(' at start."""
+    depth, i, n = 0, start, len(text)
+    while i < n:
+        c = text[i]
+        if c == "'":
+            i += 1
+            while i < n and text[i] != "'":
+                if text[i] == '\\': i += 1
+                i += 1
+        elif c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return n - 1
+
+
+def _split_comma(text: str) -> List[str]:
+    """Split by top-level commas (not inside parentheses/quotes)."""
+    parts, cur, depth = [], [], 0
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == "'":
+            cur.append(c); i += 1
+            while i < n and text[i] != "'":
+                if text[i] == '\\': cur.append(text[i]); i += 1
+                cur.append(text[i]); i += 1
+            if i < n: cur.append(text[i])
+        elif c == '"':
+            cur.append(c); i += 1
+            while i < n and text[i] != '"':
+                cur.append(text[i]); i += 1
+            if i < n: cur.append(text[i])
+        elif c == '(':
+            depth += 1; cur.append(c)
+        elif c == ')':
+            depth -= 1; cur.append(c)
+        elif c == ',' and depth == 0:
+            parts.append(''.join(cur).strip()); cur = []
+        else:
+            cur.append(c)
+        i += 1
+    if cur:
+        parts.append(''.join(cur).strip())
+    return parts
+
+
+def _split_stmts(sql: str) -> List[str]:
+    """Split on top-level semicolons."""
+    stmts, cur, depth = [], [], 0
+    i, n = 0, len(sql)
+    while i < n:
+        c = sql[i]
+        if c == "'":
+            cur.append(c); i += 1
+            while i < n and sql[i] != "'":
+                if sql[i] == '\\': cur.append(sql[i]); i += 1
+                cur.append(sql[i]); i += 1
+            if i < n: cur.append(sql[i])
+        elif c == '(':
+            depth += 1; cur.append(c)
+        elif c == ')':
+            depth -= 1; cur.append(c)
+        elif c == ';' and depth == 0:
+            s = ''.join(cur).strip()
+            if s: stmts.append(s)
+            cur = []
+        else:
+            cur.append(c)
+        i += 1
+    s = ''.join(cur).strip()
+    if s: stmts.append(s)
+    return stmts
+
+
+# ===========================================================================
+#  VALUE / LITERAL DETECTION
+# ===========================================================================
+
+_LITERAL_PATTERNS = [
+    re.compile(r"^'[^']*'(?:::\w[\w\s]*)?$"),          # 'string'[::type]
+    re.compile(r"^\{\{[^}]+\}\}(?:::\w[\w\s]*)?$"),     # {{params.X}}[::type]
+    re.compile(r"^-?\d+(\.\d+)?(?:::\w[\w\s]*)?$"),     # number[::type]
+    re.compile(r"^(true|false|null)(?:::\w[\w\s]*)?$", re.IGNORECASE),
+]
+# NOTE: double-quoted "strings" are COLUMN IDENTIFIERS in Postgres/Greenplum, NOT literals.
+# They must NOT appear in _LITERAL_PATTERNS.
+
+
+def _is_literal(expr: str) -> bool:
+    """Return True if expr is a plain literal value (string, number, bool, null, jinja param)."""
+    e = expr.strip()
+    for pat in _LITERAL_PATTERNS:
+        if pat.match(e):
+            return True
+    return False
+
+
+def _extract_literal_src(expr: str) -> str:
+    """Extract the readable source label from a literal expression."""
+    e = re.sub(r'::\s*\w[\w\s,()]*$', '', expr.strip()).strip()
+    jm = re.match(r'\{\{([^}]+)\}\}', e)
+    if jm:
+        return '{{' + jm.group(1) + '}}'
+    if e.startswith("'") and e.endswith("'"):
+        return e[1:-1]
+    return e
+
+
+def _strip_cast(expr: str) -> str:
+    """Remove trailing ::typename (possibly with spaces) from expression."""
+    return re.sub(r'::\s*\w[\w\s,()]*$', '', expr).strip()
+
+
+def _dequote(name: str) -> str:
+    """Strip surrounding double-quotes from a quoted identifier: \"col\" → col."""
+    name = name.strip()
+    if name.startswith('"') and name.endswith('"'):
+        return name[1:-1]
+    return name
+
+
+def _is_double_quoted_ident(token: str) -> bool:
+    """Return True if token is a double-quoted identifier like \"RepCRD\"."""
+    t = token.strip()
+    return t.startswith('"') and t.endswith('"') and len(t) > 2
+
+
+# ===========================================================================
+#  EXPRESSION PARSER
+#  Returns: (target_col, [(source_table_alias, source_col)], logic, sql_process)
+# ===========================================================================
+
+def _is_function_name(word: str) -> bool:
+    return word.upper() in SQL_FUNCTIONS
+
+
+def _extract_col_refs_from_expr(logic: str) -> List[Tuple[str, str]]:
+    """
+    Extract (table_alias_or_empty, column_name) from an expression.
+    Handles:
+      - alias.col, alias."quoted_col"
+      - plain bare word col
+      - "quoted_col" standalone (no alias)
+    Returns list of (alias, col).
+    """
+    refs: List[Tuple[str, str]] = []
+
+    # ── Keywords never valid as column names in expressions ───────────────
+    HARD_KW = {
+        'SELECT','FROM','WHERE','AND','OR','NOT','IN','IS','CASE','WHEN',
+        'THEN','ELSE','END','AS','ON','JOIN','LEFT','RIGHT','INNER','OUTER',
+        'FULL','CROSS','GROUP','BY','ORDER','HAVING','LIMIT','OFFSET',
+        'DISTINCT','ALL','UNION','INTERSECT','EXCEPT','WITH','RECURSIVE',
+        'INSERT','INTO','UPDATE','SET','DELETE','CREATE','TABLE','TEMP',
+        'TEMPORARY','DROP','IF','EXISTS','PARTITION','OVER','TRUE','FALSE',
+        'DISTRIBUTED','GRANT','ALTER','OWNER','TO','RETURNING','VALUES',
+        'FILTER','NULLS','LAST','FIRST','ROWS','RANGE','PRECEDING',
+        'FOLLOWING','UNBOUNDED','CURRENT','ROW','WINDOW','WITHIN',
+        'NATURAL','LATERAL','NO','CYCLE','BETWEEN','LIKE','ILIKE',
+        'ASC','DESC','NULL','ARRAY',
+        # Greenplum/PG trigger row references — never table aliases
+        'NEW','OLD',
+        # EXTRACT datetime fields
+        'YEAR','MONTH','DAY','HOUR','MINUTE','SECOND','MILLISECOND',
+        'MICROSECOND','QUARTER','WEEK','DOW','DOY','EPOCH','DECADE',
+        'CENTURY','MILLENNIUM','TIMEZONE','TIMEZONE_HOUR','TIMEZONE_MINUTE',
+        'INTERVAL','AT','TIME','ZONE',
+    }
+
+    # ── 1. alias."QuotedCol"  or  alias.plain_col ─────────────────────────
+    # Match: word . "quoted" or word . word
+    for m in re.finditer(r'\b(\w+)\s*\.\s*("(?:[^"]+)"|(\w+))', logic):
+        pfx = m.group(1)
+        col_raw = m.group(2)
+        if pfx.upper() in SQL_FUNCTIONS or pfx.upper() in HARD_KW:
+            continue
+        if re.match(r'^\d', pfx):
+            continue
+        col = _dequote(col_raw) if col_raw.startswith('"') else col_raw
+        refs.append((pfx.lower(), col))
+
+    if refs:
+        return refs
+
+    # ── 2. Standalone "QuotedCol" (double-quoted identifier, no alias prefix) ─
+    dq_refs = []
+    for m in re.finditer(r'(?<!\w)"([^"]+)"', logic):
+        col = m.group(1)
+        # Not a string inside a function call — trust it's a column identifier
+        dq_refs.append(('', col))
+
+    if dq_refs:
+        return dq_refs
+
+    # ── 3. No alias.col, no quoted — look for plain identifiers ─────────────
+    cleaned = re.sub(r"'[^']*'", ' ', logic)
+    cleaned = re.sub(r'"[^"]*"', ' __QUOTED__ ', cleaned)
+    cleaned = re.sub(r'\{\{[^}]+\}\}', ' __JINJA__ ', cleaned)
+    cleaned = re.sub(r'::\s*\w+', ' ', cleaned)
+    cleaned = re.sub(r'\b\d+\.?\d*\b', ' ', cleaned)
+
+    for m in re.finditer(r'\b([a-zA-Z_]\w*)\b', cleaned):
+        w = m.group(1)
+        if w.upper() in HARD_KW or w.upper() in SQL_FUNCTIONS:
+            continue
+        if w in ('__JINJA__', '__QUOTED__'):
+            continue
+        refs.append(('', w))
+
+    return refs
+
+
+def _parse_over_clause(logic: str) -> List[Tuple[str, str]]:
+    """
+    Extract column refs from OVER ( PARTITION BY ... ORDER BY ... ) and FILTER (WHERE ...).
+    Returns [(alias_prefix, col), ...]. Never returns bare alias names as standalone cols.
+    """
+    refs: List[Tuple[str, str]] = []
+    _HARD = {
+        'SELECT','FROM','WHERE','AND','OR','NOT','IN','IS','CASE','WHEN','THEN',
+        'ELSE','END','AS','ON','JOIN','LEFT','RIGHT','INNER','OUTER','FULL','CROSS',
+        'GROUP','BY','ORDER','HAVING','LIMIT','DISTINCT','ALL','UNION','NULLS',
+        'LAST','FIRST','ASC','DESC','NULL','TRUE','FALSE','ROWS','RANGE','GROUPS',
+        'PARTITION','OVER','FILTER','BETWEEN','LIKE','ILIKE','UNBOUNDED',
+        'PRECEDING','FOLLOWING','CURRENT','ROW','WINDOW','WITHIN','EXCLUDE',
+    }
+
+    # OVER ( PARTITION BY / ORDER BY )
+    over_m = re.search(r'\bOVER\s*\(', logic, re.IGNORECASE)
+    if over_m:
+        start = over_m.end() - 1
+        end = _find_paren_end(logic, start)
+        inner = logic[start+1:end]
+        for kw in ['PARTITION BY', 'ORDER BY']:
+            kb_m = re.search(r'\b' + kw + r'\b', inner, re.IGNORECASE)
+            if kb_m:
+                rest = inner[kb_m.end():]
+                stop = re.search(r'\b(PARTITION BY|ORDER BY|ROWS|RANGE|GROUPS|EXCLUDE|FILTER)\b',
+                                 rest, re.IGNORECASE)
+                clause = rest[:stop.start()] if stop else rest
+                # Prefixed: alias.col
+                for ref_m in re.finditer(r'\b(\w+)\.(\w+)\b', clause):
+                    pfx, col = ref_m.group(1), ref_m.group(2)
+                    if pfx.upper() not in _HARD and pfx.upper() not in SQL_FUNCTIONS:
+                        refs.append((pfx.lower(), col))
+                # Plain words only if no prefixed refs found yet for this clause
+                cleaned = re.sub(r'\b\w+\.\w+\b', ' ', clause)
+                cleaned = re.sub(r"'[^']*'", ' ', cleaned)
+                cleaned = re.sub(r'\b\d+\.?\d*\b', ' ', cleaned)
+                for word_m in re.finditer(r'\b([a-zA-Z_]\w*)\b', cleaned):
+                    w = word_m.group(1)
+                    if w.upper() not in _HARD and w.upper() not in SQL_FUNCTIONS:
+                        if not any(r[1] == w for r in refs):
+                            refs.append(('', w))
+
+    # FILTER (WHERE ...)
+    filter_m = re.search(r'\bFILTER\s*\(\s*WHERE\s+', logic, re.IGNORECASE)
+    if filter_m:
+        start = logic.index('(', filter_m.start())
+        end = _find_paren_end(logic, start)
+        inner = logic[start+1:end]
+        # Prefixed: alias.col
+        for ref_m in re.finditer(r'\b(\w+)\.(\w+)\b', inner):
+            pfx, col = ref_m.group(1), ref_m.group(2)
+            if pfx.upper() not in _HARD and pfx.upper() not in SQL_FUNCTIONS:
+                refs.append((pfx.lower(), col))
+        # Plain words
+        cleaned = re.sub(r'\b\w+\.\w+\b', ' ', inner)
+        cleaned = re.sub(r"'[^']*'", ' ', cleaned)
+        cleaned = re.sub(r'\b\d+\.?\d*\b', ' ', cleaned)
+        for word_m in re.finditer(r'\b([a-zA-Z_]\w*)\b', cleaned):
+            w = word_m.group(1)
+            if w.upper() not in _HARD and w.upper() not in SQL_FUNCTIONS:
+                if not any(r[1] == w for r in refs):
+                    refs.append(('', w))
+
+    return refs
+
+
+def _determine_sql_process(logic: str, refs: List[Tuple[str, str]]) -> str:
+    """
+    Decide sql_process:
+      'select'       — normal column reference
+      'select-value' — literal / computed value (no real column source)
+    """
+    if not refs:
+        return 'select-value'
+    # If every ref is a literal/value, return select-value
+    if all(alias == '' and col == '' for alias, col in refs):
+        return 'select-value'
+    return 'select'
+
+
+# ===========================================================================
+#  TABLE ALIAS EXTRACTION
+# ===========================================================================
+
+_TBL_TOK = r'((?:\{\{[^}]+\}\}|\w+)(?:\.(?:\{\{[^}]+\}\}|\w+))?)'
+
+
+def _extract_aliases(query: str) -> Dict[str, Tuple[str, str]]:
+    """
+    Scan FROM / JOIN for table references.
+    Returns {alias_lower: (schema, tablename)}.
+    """
+    aliases: Dict[str, Tuple[str, str]] = {}
+
+    pattern = re.compile(
+        r'\b(FROM|JOIN)\s+' + _TBL_TOK + r'(?:\s+(?:AS\s+)?(\w+))?',
+        re.IGNORECASE
+    )
+    for m in pattern.finditer(query):
+        tbl_raw = m.group(2).strip()
+        alias_raw = (m.group(3) or '').strip()
+
+        if tbl_raw.upper() in SQL_KEYWORDS or tbl_raw.upper() in SQL_FUNCTIONS:
+            continue
+        if tbl_raw.startswith('('):
+            continue
+
+        schema, tbl = _parse_table_token(tbl_raw)
+        tbl_lower = tbl.lower()
+
+        if alias_raw and alias_raw.upper() not in SQL_KEYWORDS:
+            alias = alias_raw.lower()
+        else:
+            alias = tbl_lower
+
+        aliases[alias] = (schema, tbl)
+        aliases[tbl_lower] = (schema, tbl)
+
+    return aliases
+
+
+def _from_tables(query: str) -> List[Tuple[str, str]]:
+    """Return unique (schema, table) from FROM/JOIN clauses."""
+    seen, result = set(), []
+    for s, t in _extract_aliases(query).values():
+        if t and (s, t) not in seen:
+            seen.add((s, t)); result.append((s, t))
+    return result
+
+
+# ===========================================================================
+#  CTE PARSING
+# ===========================================================================
+
+def _extract_ctes(sql: str) -> Tuple[Dict[str, str], str]:
+    """Extract WITH CTEs. Returns ({name: body}, remainder)."""
+    ctes: Dict[str, str] = {}
+    text = sql.lstrip()
+    m = re.match(r'\bWITH\b\s*', text, re.IGNORECASE)
+    if not m:
+        return ctes, sql
+    tail = text[m.end():]
+    while True:
+        nm = re.match(r'(\w+)\s+AS\s*\(', tail, re.IGNORECASE)
+        if not nm:
+            break
+        cte_name = nm.group(1).lower()
+        open_p = nm.end() - 1
+        close_p = _find_paren_end(tail, open_p)
+        ctes[cte_name] = tail[open_p+1:close_p].strip()
+        tail = tail[close_p+1:].lstrip()
+        if tail.startswith(','):
+            tail = tail[1:].lstrip()
+        else:
+            break
+    return ctes, tail
+
+
+# ===========================================================================
+#  SELECT LIST EXTRACTION
+# ===========================================================================
+
+def _extract_select_list(query: str) -> str:
+    """Return column list between SELECT [DISTINCT [ON (...)]] and top-level FROM."""
+    sel_m = re.search(r'\bSELECT\b\s*', query, re.IGNORECASE)
+    if not sel_m:
+        return ''
+    start = sel_m.end()
+    # Skip DISTINCT ON (...), DISTINCT, or ALL
+    rest = query[start:]
+    skip_m = re.match(
+        r'(?:DISTINCT\s*(?:ON\s*\((?:[^()]*|\([^()]*\))*\)\s*)?|ALL\s+)',
+        rest, re.IGNORECASE
+    )
+    if skip_m:
+        start += skip_m.end()
+    depth, i, n = 0, start, len(query)
+    while i < n:
+        c = query[i]
+        if c == "'":
+            i += 1
+            while i < n and query[i] != "'":
+                if query[i] == '\\': i += 1
+                i += 1
+        elif c == '"':
+            i += 1
+            while i < n and query[i] != '"': i += 1
+        elif c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+            if depth < 0:
+                return query[start:i].strip()
+        elif depth == 0:
+            if re.match(r'FROM\b', query[i:], re.IGNORECASE) and (i == 0 or not query[i-1:i].isalpha()):
+                return query[start:i].strip()
+        i += 1
+    return query[start:].strip()
+
+
+# ===========================================================================
+#  CORE EXPRESSION ANALYSIS
+# ===========================================================================
+
+def _analyse_expr(
+    expr: str,
+    aliases: Dict[str, Tuple[str, str]],
+    all_ctes: Dict[str, str],
+    cte_col_maps: Dict[str, Dict[str, List[Tuple[str, str, str]]]],
+    all_from_tables: List[Tuple[str, str]],
+) -> List[Dict[str, Any]]:
+    """
+    Parse one SELECT expression. Returns list of partial row dicts with:
+      target_column, source_table, source_schema, source_column, logic, sql_process
+    """
+    expr = expr.strip()
+    if not expr:
+        return []
+
+    # ── Skip DISTINCT ON (...) ─────────────────────────────────────────────
+    if re.match(r'^DISTINCT\s+ON\s*\(', expr, re.IGNORECASE):
+        return []
+
+    # ── Handle subquery expression: (SELECT ...) alias ────────────────────
+    # If the whole logic (before alias) is a parenthesised subquery
+    subq_m = re.match(r'^\((.+)\)\s*(?:AS\s+)?(\w+)\s*$', expr, re.IGNORECASE | re.DOTALL)
+    if subq_m and expr.startswith('('):
+        inner_sql = subq_m.group(1).strip()
+        sub_alias = subq_m.group(2)
+        # Only treat as subquery if it contains SELECT
+        if re.search(r'\bSELECT\b', inner_sql, re.IGNORECASE):
+            # Extract source columns from the inner SELECT
+            inner_sel = _extract_select_list(inner_sql)
+            inner_from_tables = _from_tables(inner_sql)
+            inner_aliases = _extract_aliases(inner_sql)
+            sub_rows = []
+            if inner_sel:
+                for inner_expr in _split_comma(inner_sel):
+                    inner_expr = inner_expr.strip()
+                    if not inner_expr or inner_expr == '*':
+                        continue
+                    _, inner_logic = _split_alias(inner_expr)
+                    inner_refs = _extract_col_refs_from_expr(inner_logic or inner_expr)
+                    for r_alias, r_col in inner_refs:
+                        res_list = _resolve_col_ref(
+                            r_alias, r_col, inner_aliases, all_ctes, cte_col_maps, inner_from_tables
+                        )
+                        for res_schema, res_tbl, res_col in res_list:
+                            sub_rows.append(dict(
+                                target_column=sub_alias,
+                                source_table=res_tbl, source_schema=res_schema,
+                                source_column=res_col,
+                                logic=expr, sql_process='select',
+                            ))
+            if sub_rows:
+                return sub_rows
+            return [dict(target_column=sub_alias, source_table='', source_schema='',
+                         source_column='', logic=expr, sql_process='select')]
+
+    # ── Step 1: determine alias (target_column) and logic ─────────────────
+    target_col, logic = _split_alias(expr)
+
+    # If entire expr is a double-quoted identifier (standalone "col"): self-ref
+    if not target_col and _is_double_quoted_ident(expr.strip()):
+        col_name = _dequote(expr.strip())
+        return [dict(target_column=col_name, source_table='', source_schema='',
+                     source_column=col_name, logic=expr, sql_process='select')]
+
+    # alias.double_quoted_col with no explicit alias → self-ref target=col
+    if not target_col:
+        dqcol_m = re.match(r'^(\w+)\."([^"]+)"(?:::\w+)?$', expr.strip())
+        if dqcol_m:
+            pfx, col = dqcol_m.group(1), dqcol_m.group(2)
+            schema_r, tbl_r = aliases.get(pfx.lower(), ('', pfx))
+            if schema_r == '__CTE__': schema_r = ''
+            return [dict(target_column=col, source_table=tbl_r, source_schema=schema_r,
+                         source_column=col, logic=expr, sql_process='select')]
+
+    if not target_col:
+        # Infer from simple forms
+        dm = re.match(r'^(\w+)\.(\w+)(?:::\w+)?$', (logic or expr).strip())
+        if dm:
+            target_col = dm.group(2)
+        elif re.match(r'^(\w+)(?:::\w+)?$', (logic or expr).strip()):
+            target_col = re.match(r'^(\w+)', (logic or expr).strip()).group(1)
+        if not target_col:
+            target_col = ''
+
+    use_logic = logic if logic else expr
+
+    # ── Step 2: literal / select-value? ───────────────────────────────────
+    logic_stripped = _strip_cast(use_logic)
+
+    if _is_literal(logic_stripped):
+        src = _extract_literal_src(logic_stripped)
+        return [dict(target_column=target_col, source_table='', source_schema='',
+                     source_column=src, logic=expr, sql_process='select-value')]
+
+    # ── Step 2b: single double-quoted token as logic: "col" ───────────────
+    if _is_double_quoted_ident(use_logic.strip()):
+        col_name = _dequote(use_logic.strip())
+        return [dict(target_column=target_col or col_name, source_table='', source_schema='',
+                     source_column=col_name, logic=expr, sql_process='select')]
+
+    # ── Step 2c: infer target_col for bare-word logic ─────────────────────
+    if not target_col and use_logic:
+        bm = re.match(r'^(\w+)(?:::\w+)?$', use_logic.strip())
+        if bm:
+            target_col = bm.group(1)
+
+    # ── Step 3: window function detection ─────────────────────────────────
+    has_over = bool(re.search(r'\bOVER\s*\(', use_logic, re.IGNORECASE))
+
+    # Strip OVER(...) from body for main refs
+    main_logic = use_logic
+    if has_over:
+        ov_m = re.search(r'\bOVER\s*\(', main_logic, re.IGNORECASE)
+        if ov_m:
+            ov_start = main_logic.index('(', ov_m.start())
+            ov_end = _find_paren_end(main_logic, ov_start)
+            main_logic = main_logic[:ov_m.start()] + main_logic[ov_end+1:]
+
+    # Strip FILTER(...) from body
+    fl_m = re.search(r'\bFILTER\s*\(', main_logic, re.IGNORECASE)
+    if fl_m:
+        fl_start = main_logic.index('(', fl_m.start())
+        fl_end = _find_paren_end(main_logic, fl_start)
+        main_logic = main_logic[:fl_m.start()] + main_logic[fl_end+1:]
+
+    body_refs = _extract_col_refs_from_expr(main_logic)
+    window_refs = _parse_over_clause(use_logic)
+
+    # Deduplicate refs
+    seen_refs: Set[Tuple[str, str]] = set()
+    unique_refs: List[Tuple[str, str]] = []
+    for r in body_refs + window_refs:
+        if r not in seen_refs:
+            seen_refs.add(r); unique_refs.append(r)
+
+    # ── Step 4: no refs → select-value or pure window function ────────────
+    if not unique_refs:
+        # row_number() over() with empty OVER: no real source column
+        return [dict(target_column=target_col, source_table='', source_schema='',
+                     source_column='', logic=expr,
+                     sql_process='select-value' if has_over else 'select-value')]
+
+    # ── Step 5: COALESCE/function with no alias → target=source=first col ─
+    # If target_col is empty after all attempts, use the first column ref as target
+    if not target_col and unique_refs:
+        _, first_col = unique_refs[0]
+        target_col = first_col
+
+    # ── Step 6: resolve each ref ──────────────────────────────────────────
+    rows = []
+    for alias_pfx, col in unique_refs:
+        resolved = _resolve_col_ref(
+            alias_pfx, col, aliases, all_ctes, cte_col_maps, all_from_tables
+        )
+        for res_schema, res_tbl, res_col in resolved:
+            rows.append(dict(
+                target_column=target_col,
+                source_table=res_tbl, source_schema=res_schema, source_column=res_col,
+                logic=expr, sql_process='select',
+            ))
+
+    return rows if rows else [dict(
+        target_column=target_col, source_table='', source_schema='', source_column='',
+        logic=expr, sql_process='select',
+    )]
+
+
+def _split_alias(expr: str) -> Tuple[str, str]:
+    """
+    Split 'logic [AS] alias' into (alias, logic).
+    Handles:
+      b.col AS col2                  → ('col2', 'b.col')
+      'Adobe'::text AS "source"      → ('source', "'Adobe'::text")
+      1::bigint AS "Custom Field 1"  → ('Custom Field 1', '1::bigint')
+      "quarter" as quarter           → ('quarter', '"quarter"')
+      "quarter" quarter              → ('quarter', '"quarter"')  implicit
+      "Company ID"                   → ('Company ID', '"Company ID"')  self-ref
+      curr."RepCRD"                  → ('RepCRD', 'curr."RepCRD"')  no alias; self-ref
+      b.comp_srch_lst::text array    → ('array', 'b.comp_srch_lst::text')
+      row_number() over() as index   → ('index', 'row_number() over()')
+      CASE...END already_engaged     → ('already_engaged', 'CASE...END')
+      optimus_first_name first_name  → ('first_name', 'optimus_first_name')
+      null sub_parameter             → ('sub_parameter', 'null')
+    """
+    expr = expr.strip()
+    if not expr:
+        return '', ''
+
+    # ── Explicit AS at top level ───────────────────────────────────────────
+    as_result = _find_top_level_as(expr)
+    if as_result is not None:
+        as_start, as_end = as_result
+        raw_alias = expr[as_end:].strip()
+        logic = expr[:as_start].strip()
+        # Alias may itself be double-quoted: AS "source"
+        alias = _dequote(raw_alias) if _is_double_quoted_ident(raw_alias) else raw_alias
+        if alias and alias.upper() not in {'SELECT','FROM','WHERE','AND','OR','ON',
+                                            'JOIN','LEFT','RIGHT','INNER','OUTER',
+                                            'FULL','CROSS','GROUP','HAVING','ORDER'}:
+            return alias, logic
+
+    # ── No explicit AS — try implicit trailing alias ──────────────────────
+    alias, logic = _find_implicit_alias(expr)
+    return alias, logic
+
+
+def _find_top_level_as(expr: str) -> Optional[Tuple[int, int]]:
+    """Return (start_of_AS, end_of_AS) if there is a top-level AS keyword, else None."""
+    depth, i, n = 0, 0, len(expr)
+    last_as = None
+    while i < n:
+        c = expr[i]
+        if c == "'":
+            i += 1
+            while i < n and expr[i] != "'":
+                if expr[i] == '\\': i += 1
+                i += 1
+        elif c == '"':
+            i += 1
+            while i < n and expr[i] != '"': i += 1
+        elif c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+        elif depth == 0:
+            m = re.match(r'\bAS\b', expr[i:], re.IGNORECASE)
+            if m:
+                before = expr[i-1] if i > 0 else ' '
+                after = expr[i+len(m.group()):i+len(m.group())+1] if i+len(m.group()) < n else ' '
+                if not before.isalnum() and before != '_' and not after.isalnum() and after != '_':
+                    last_as = (i, i + len(m.group()) + 1)  # include trailing space
+        i += 1
+    return last_as
+
+
+def _find_implicit_alias(expr: str) -> Tuple[str, str]:
+    """
+    Detect implicit alias — the last top-level token that looks like an alias.
+    Returns (alias, logic) or ('', expr).
+    """
+    # ── Simple alias.col: NEVER split these — whole expr is logic ─────────
+    # e.g. 'a.col1', 'b.acc_mhh_n', 's.profile_date::text'
+    if re.match(r'^\w+\.\w+(?:::\w[\w\s,()]*)?$', expr.strip()):
+        return '', expr
+    if re.match(r'^\w+\."[^"]+"(?:::\w+)?$', expr.strip()):
+        return '', expr
+
+    # ── Trailing double-quoted alias: expr "Quoted Alias" ─────────────────
+    dq_trail = re.search(r'\s("(?:[^"]+)")\s*$', expr)
+    if dq_trail:
+        alias = _dequote(dq_trail.group(1))
+        logic = expr[:dq_trail.start()].strip()
+        if logic:
+            return alias, logic
+
+    # ── Special case: (paren_expr)[::type] alias_word ─────────────────────
+    if expr.lstrip().startswith('('):
+        stripped = expr.lstrip()
+        close = _find_paren_end(stripped, 0)
+        after_paren = stripped[close+1:].strip()
+        after_paren = re.sub(r'^::\s*\w[\w\s]*', '', after_paren).strip()
+        trail_m = re.match(r'^([a-zA-Z_]\w*)\s*$', after_paren)
+        _NEVER = {
+            'FROM','BY','PARTITION','ORDER','ROWS','RANGE','PRECEDING','FOLLOWING',
+            'UNBOUNDED','BETWEEN','AND','OR','NOT','WHEN','THEN',
+            'ON','USING','INTO','SET','WHERE','HAVING','IS','IN',
+            'LIKE','ILIKE','WITHIN','GROUPS',
+        }
+        if trail_m and trail_m.group(1).upper() not in _NEVER:
+            alias_word = trail_m.group(1)
+            logic_part = stripped[:close+1].strip()
+            try:
+                cast_part = stripped[close+1:stripped.index(alias_word, close+1)].strip()
+            except ValueError:
+                cast_part = ''
+            if cast_part:
+                logic_part = logic_part + cast_part
+            return alias_word, logic_part
+
+    tokens = _top_level_tokens(expr)
+
+    if len(tokens) == 1 and _is_double_quoted_ident(tokens[0]):
+        return _dequote(tokens[0]), expr
+
+    if len(tokens) < 2:
+        return '', expr
+
+    last_tok = tokens[-1]
+    if not re.match(r'^[a-zA-Z_]\w*$', last_tok):
+        return '', expr
+
+    _NEVER = {
+        'FROM','BY','PARTITION','ORDER','ROWS','RANGE','PRECEDING','FOLLOWING',
+        'UNBOUNDED','BETWEEN','AND','OR','NOT','WHEN','THEN',
+        'ON','USING','INTO','SET','WHERE','HAVING','IS','IN',
+        'LIKE','ILIKE','WITHIN','GROUPS',
+    }
+    if last_tok.upper() in _NEVER:
+        return '', expr
+
+    prev_tok = tokens[-2] if len(tokens) >= 2 else ''
+    if prev_tok.upper() in _NEVER:
+        return '', expr
+
+    pos = _find_last_top_level_word_pos(expr, last_tok)
+    if pos is None:
+        return '', expr
+
+    logic = expr[:pos].strip()
+    if not logic:
+        return '', expr
+    if logic.upper() in {'SELECT','FROM','WHERE','AND','OR','ON',
+                         'JOIN','LEFT','RIGHT','INNER','GROUP','HAVING','ORDER'}:
+        return '', expr
+
+    return last_tok, logic
+def _top_level_tokens(expr: str) -> List[str]:
+    """Extract all top-level tokens from expr: words, numbers, quoted strings."""
+    tokens = []
+    depth, i, n = 0, 0, len(expr)
+    while i < n:
+        c = expr[i]
+        if c == "'":
+            if depth == 0:
+                start = i; i += 1
+                while i < n and expr[i] != "'":
+                    if expr[i] == '\\': i += 1
+                    i += 1
+                tokens.append(expr[start:i+1] if i < n else expr[start:])
+            else:
+                i += 1
+                while i < n and expr[i] != "'": i += 1
+        elif c == '"':
+            if depth == 0:
+                start = i; i += 1
+                while i < n and expr[i] != '"': i += 1
+                tokens.append(expr[start:i+1] if i < n else expr[start:])
+            else:
+                i += 1
+                while i < n and expr[i] != '"': i += 1
+        elif c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+        elif depth == 0 and (c.isalpha() or c == '_'):
+            # Word token
+            start = i
+            while i < n and (expr[i].isalnum() or expr[i] == '_'):
+                i += 1
+            tokens.append(expr[start:i])
+            continue
+        elif depth == 0 and (c.isdigit() or (c == '-' and i + 1 < n and expr[i+1].isdigit())):
+            # Numeric token
+            start = i
+            if c == '-': i += 1
+            while i < n and (expr[i].isdigit() or expr[i] == '.'):
+                i += 1
+            tokens.append(expr[start:i])
+            continue
+        i += 1
+    return tokens
+
+
+def _find_last_top_level_word_pos(expr: str, word: str) -> Optional[int]:
+    """Return start position of last occurrence of `word` at top-level depth."""
+    depth, i, n, last_pos = 0, 0, len(expr), None
+    while i < n:
+        c = expr[i]
+        if c == "'":
+            i += 1
+            while i < n and expr[i] != "'":
+                if expr[i] == '\\': i += 1
+                i += 1
+        elif c == '"':
+            i += 1
+            while i < n and expr[i] != '"': i += 1
+        elif c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+        elif depth == 0:
+            if expr[i:i+len(word)] == word:
+                # Check word boundaries
+                before = expr[i-1] if i > 0 else ' '
+                after = expr[i+len(word)] if i+len(word) < n else ' '
+                if not (before.isalnum() or before == '_') and not (after.isalnum() or after == '_'):
+                    last_pos = i
+        i += 1
+    return last_pos
+
+
+# ===========================================================================
+#  CTE COLUMN MAP
+# ===========================================================================
+
+def _build_cte_col_map(
+    cte_name: str, cte_body: str, all_ctes: Dict[str, str]
+) -> Dict[str, List[Tuple[str, str, str]]]:
+    """
+    Returns {output_col_lower: [(schema, real_table, real_col), ...]}.
+    """
+    col_map: Dict[str, List[Tuple[str, str, str]]] = {}
+
+    inner_ctes, inner_body = _extract_ctes(cte_body)
+    merged = {**all_ctes, **inner_ctes}
+
+    aliases = _extract_aliases(cte_body)
+    for cn in merged:
+        aliases[cn] = ('__CTE__', cn)
+
+    sel = _extract_select_list(inner_body)
+    if not sel:
+        return col_map
+
+    all_tbls = _from_tables(cte_body)
+
+    for expr in _split_comma(sel):
+        expr = expr.strip()
+        if not expr:
+            continue
+        tgt, logic = _split_alias(expr)
+        if not tgt:
+            dm = re.match(r'^(?:\w+\.)?(\w+)(?:::\w+)?$', logic.strip())
+            if dm:
+                tgt = dm.group(1)
+        if not tgt or tgt == '*':
+            continue
+
+        refs = _extract_col_refs_from_expr(logic)
+        resolved: List[Tuple[str, str, str]] = []
+
+        for alias_pfx, col in refs:
+            resolved.extend(_resolve_col_ref(alias_pfx, col, aliases, merged, {}, all_tbls))
+
+        col_map[tgt.lower()] = resolved if resolved else [('', '', logic[:80])]
+
+    return col_map
+
+
+# ===========================================================================
+#  RESOLVE COLUMN REFERENCE
+# ===========================================================================
+
+def _resolve_col_ref(
+    alias: str, col: str,
+    aliases: Dict[str, Tuple[str, str]],
+    all_ctes: Dict[str, str],
+    cte_col_maps: Dict[str, Dict[str, List[Tuple[str, str, str]]]],
+    all_from_tables: List[Tuple[str, str]],
+) -> List[Tuple[str, str, str]]:
+    """
+    Return [(schema, table, col), ...].
+    Handles CTE lookup and single-table inference.
+    """
+    # Guard: skip anything that looks like a schema/param reference
+    if alias and (alias.upper() in SQL_KEYWORDS or alias.upper() in SQL_FUNCTIONS):
+        alias = ''
+
+    if alias:
+        schema, tbl = aliases.get(alias, ('', alias))
+        if schema == '__CTE__':
+            cte_map = cte_col_maps.get(tbl, {})
+            r = cte_map.get(col.lower())
+            if r:
+                return r
+            # Try to resolve from the CTE body directly
+            if tbl in all_ctes:
+                inline_map = _build_cte_col_map(tbl, all_ctes[tbl], all_ctes)
+                r2 = inline_map.get(col.lower())
+                if r2:
+                    return r2
+            return [('', tbl, col)]
+        # Return resolved
+        return [(schema, tbl, col)]
+    else:
+        # No alias — single-table inference
+        real_tbls = [(s, t) for s, t in all_from_tables if t.lower() not in all_ctes]
+        if len(real_tbls) == 1:
+            return [(real_tbls[0][0], real_tbls[0][1], col)]
+        return [('', '', col)]
+
+
+# ===========================================================================
+#  STATEMENT CLASSIFIER
+# ===========================================================================
+
+def _classify(stmt: str) -> str:
+    s = stmt.lstrip().upper()
+    if re.match(r'CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE', s):
+        if re.search(r'\bAS\s*(?:\bWITH\b|\bSELECT\b|\()', stmt, re.IGNORECASE):
+            return 'CTA'   # CREATE TABLE AS
+        return 'CTD'       # CREATE TABLE DDL
+    if re.match(r'INSERT\s+INTO', s):
+        return 'INSERT'
+    return 'OTHER'
+
+
+# ===========================================================================
+#  FINAL TABLE DETECTION
+# ===========================================================================
+
+def _find_final_table(stmts: List[str], file_stem: str) -> Tuple[str, str]:
+    creates, inserts = [], []
+    for stmt in stmts:
+        kind = _classify(stmt)
+        is_temp = bool(re.search(r'\bTEMP(?:ORARY)?\b', stmt[:80], re.IGNORECASE))
+        m = re.search(r'(?:CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?|INSERT\s+INTO\s+)' + _TBL_TOK,
+                      stmt, re.IGNORECASE)
+        if not m:
+            continue
+        schema, tbl = _parse_table_token(m.group(1))
+        if kind in ('CTA', 'CTD'):
+            creates.append((is_temp, schema, tbl))
+        elif kind == 'INSERT':
+            inserts.append((schema, tbl))
+
+    for it, s, t in creates:
+        if not it and t.lower() == file_stem.lower():
+            return s, t
+    for s, t in inserts:
+        if t.lower() == file_stem.lower():
+            return s, t
+    non_temp = [(s, t) for it, s, t in creates if not it]
+    if non_temp:
+        return non_temp[-1]
+    if inserts:
+        return inserts[-1]
+    if creates:
+        return creates[-1][1], creates[-1][2]
+    return '', file_stem
+
+
+# ===========================================================================
+#  WHERE / HAVING / JOIN EXTRACTION
+# ===========================================================================
+
+def _find_top_level_where(query: str) -> int:
+    """Return index of top-level WHERE keyword, skipping FILTER(WHERE ...) subforms."""
+    depth, i, n = 0, 0, len(query)
+    while i < n:
+        c = query[i]
+        if c == chr(39):
+            i += 1
+            while i < n and query[i] != chr(39):
+                if query[i] == chr(92): i += 1
+                i += 1
+        elif c == chr(34):
+            i += 1
+            while i < n and query[i] != chr(34): i += 1
+        elif c == chr(40):
+            depth += 1
+        elif c == chr(41):
+            depth -= 1
+        elif depth == 0:
+            m = re.match(r'\bWHERE\b', query[i:], re.IGNORECASE)
+            if m:
+                before = query[i-1] if i > 0 else chr(32)
+                after = query[i+5:i+6] if i+5 < n else chr(32)
+                if not (before.isalnum() or before == chr(95)) and not (after.isalnum() or after == chr(95)):
+                    return i
+        i += 1
+    return -1
+
+
+def _find_top_level_kw_pos(query: str, kw: str) -> int:
+    """Return index of top-level keyword occurrence, or -1."""
+    depth, i, n = 0, 0, len(query)
+    pat = re.compile(r'\b' + re.escape(kw.split()[0]) + r'\b', re.IGNORECASE)
+    while i < n:
+        c = query[i]
+        if c == chr(39):
+            i += 1
+            while i < n and query[i] != chr(39):
+                if query[i] == chr(92): i += 1
+                i += 1
+        elif c == chr(34):
+            i += 1
+            while i < n and query[i] != chr(34): i += 1
+        elif c == chr(40):
+            depth += 1
+        elif c == chr(41):
+            depth -= 1
+        elif depth == 0:
+            m = pat.match(query[i:])
+            if m:
+                full_kw = kw.replace(' ', r'\s+')
+                if re.match(r'\b' + full_kw + r'\b', query[i:], re.IGNORECASE):
+                    before = query[i-1] if i > 0 else chr(32)
+                    if not (before.isalnum() or before == chr(95)):
+                        return i
+        i += 1
+    return -1
+
+
+def _where_text(query: str) -> str:
+    pos = _find_top_level_where(query)
+    if pos == -1:
+        return ''
+    start = pos + 5  # len("WHERE")
+    # Find end of WHERE clause at top level
+    stop_kws = ['GROUP BY', 'HAVING', 'ORDER BY', 'LIMIT', 'DISTRIBUTED', 'UNION', 'INTERSECT', 'EXCEPT']
+    stop_pos = len(query)
+    for kw in stop_kws:
+        p = _find_top_level_kw_pos(query[start:], kw)
+        if p != -1 and start + p < stop_pos:
+            stop_pos = start + p
+    body = query[start:stop_pos].strip()
+    return ('WHERE ' + body) if body else ''
+
+
+def _having_text(query: str) -> str:
+    pos = _find_top_level_kw_pos(query, 'HAVING')
+    if pos == -1:
+        return ''
+    start = pos + 6  # len("HAVING")
+    stop_kws = ['ORDER BY', 'LIMIT', 'DISTRIBUTED', 'UNION', 'INTERSECT', 'EXCEPT']
+    stop_pos = len(query)
+    for kw in stop_kws:
+        p = _find_top_level_kw_pos(query[start:], kw)
+        if p != -1 and start + p < stop_pos:
+            stop_pos = start + p
+    body = query[start:stop_pos].strip()
+    return ('HAVING ' + body) if body else ''
+
+
+
+def _extract_joins(query: str) -> List[Tuple[str, str, str, str, str]]:
+    """Returns [(keyword, tbl_raw, alias, on_clause, full_text), ...]."""
+    pat = re.compile(
+        r'((?:LEFT|RIGHT|FULL|INNER|CROSS)?\s*(?:OUTER\s+)?JOIN)\s+'
+        r'(' + _TBL_TOK[1:-1] + r')'
+        r'(?:\s+(?:AS\s+)?(\w+))?'
+        r'(?:\s+ON\s+(.*?))?'
+        r'(?=\s*(?:LEFT|RIGHT|FULL|INNER|CROSS|WHERE|GROUP|HAVING|ORDER|LIMIT|DISTRIBUTED|UNION|;|$))',
+        re.IGNORECASE | re.DOTALL
+    )
+    results = []
+    for m in pat.finditer(query):
+        results.append((
+            m.group(1).strip(), m.group(2).strip(),
+            (m.group(3) or '').strip(), (m.group(4) or '').strip(),
+            m.group(0).strip()
+        ))
+    return results
+
+
+def _clause_col_rows(clause_text: str, sql_proc: str,
+                     aliases: Dict[str, Tuple[str, str]],
+                     sub_tbl: str, sub_schema: str,
+                     final_tbl: str, final_schema: str,
+                     file: str, path: str, process: str, now_ts: datetime
+                     ) -> List[Dict[str, Any]]:
+    """Extract column-level rows from a WHERE / HAVING / ON clause.
+    Emits one row per alias.col reference with resolved source_table/schema.
+    Skips numeric literals, keywords, function names, and bare alias names.
+    Also emits rows for plain (unaliased) column references in WHERE/HAVING.
+    """
+    rows = []
+    seen = set()
+
+    # ── 1. Prefixed: alias.col ─────────────────────────────────────────────
+    for m in re.finditer(r'\b(\w+)\.(\w+)\b', clause_text):
+        pfx, col = m.group(1).lower(), m.group(2)
+        if pfx.upper() in SQL_KEYWORDS or pfx.upper() in SQL_FUNCTIONS:
+            continue
+        # Skip numeric-only column names
+        if re.match(r'^\d+$', col):
+            continue
+        if col.upper() in SQL_KEYWORDS or col.upper() in SQL_FUNCTIONS:
+            continue
+        schema, tbl = aliases.get(pfx, ('', pfx))
+        if schema == '__CTE__':
+            schema = ''
+        if not tbl or tbl.upper() in SQL_KEYWORDS:
+            continue
+        key = (tbl, col)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(_make_row(
+            file, path, final_tbl, final_schema, process, now_ts,
+            sub_tbl, sub_schema, '', tbl, schema, col,
+            clause_text[:500], sql_proc,
+        ))
+
+    # ── 2. Plain (unaliased) column references ─────────────────────────────
+    # Remove string literals, numbers, jinja params, and aliased refs first
+    cleaned = re.sub(r"'[^']*'", ' ', clause_text)
+    cleaned = re.sub(r'\{\{[^}]+\}\}', ' ', cleaned)
+    cleaned = re.sub(r'::\s*\w+', ' ', cleaned)
+    # Remove already-handled alias.col patterns
+    cleaned = re.sub(r'\b\w+\.\w+\b', ' ', cleaned)
+    # Remove numbers
+    cleaned = re.sub(r'\b\d+\.?\d*\b', ' ', cleaned)
+
+    # Collect real tables (non-CTE)
+    real_tbls = [(s, t) for t, (s, _t) in aliases.items()
+                 if s not in ('__CTE__', '') and t == _t]
+
+    for m in re.finditer(r'\b([a-zA-Z_]\w*)\b', cleaned):
+        w = m.group(1)
+        _HARD_KW = {
+            'SELECT','FROM','WHERE','AND','OR','NOT','IN','IS','CASE','WHEN',
+            'THEN','ELSE','END','AS','ON','JOIN','LEFT','RIGHT','INNER','OUTER',
+            'FULL','CROSS','GROUP','BY','ORDER','HAVING','LIMIT','OFFSET',
+            'DISTINCT','ALL','UNION','INTERSECT','EXCEPT','WITH','NULL',
+            'TRUE','FALSE','BETWEEN','LIKE','ILIKE','FILTER','OVER','PARTITION',
+            'NULLS','LAST','FIRST','ASC','DESC','DISTRIBUTED','ARRAY',
+        }
+        if w.upper() in _HARD_KW or w.upper() in SQL_FUNCTIONS:
+            continue
+        # Skip if it's a known alias (table alias names are not column names)
+        if w.lower() in aliases and aliases[w.lower()][0] != '__CTE__':
+            continue
+        key = ('', w)
+        if key in seen:
+            continue
+        seen.add(key)
+        # Single-table inference
+        if len(real_tbls) == 1:
+            tbl_s, tbl_t = real_tbls[0]
+        else:
+            tbl_s, tbl_t = '', ''
+        rows.append(_make_row(
+            file, path, final_tbl, final_schema, process, now_ts,
+            sub_tbl, sub_schema, '', tbl_t, tbl_s, w,
+            clause_text[:500], sql_proc,
+        ))
+
+    return rows
+
+
+def _make_row(file, path, target_table, target_schema, process, now_ts,
+              sub_tbl, sub_schema, target_col, src_tbl, src_schema, src_col,
+              logic, sql_process) -> Dict[str, Any]:
+    return {
+        'file': file, 'path': path,
+        'target_table': target_table, 'target_schema': target_schema,
+        'process': process, 'current_date_time': now_ts,
+        'sub_target_table': sub_tbl, 'sub_target_schema': sub_schema,
+        'target_column': target_col,
+        'source_table': src_tbl, 'source_schema': src_schema, 'source_column': src_col,
+        'logic': logic, 'sql_process': sql_process,
+    }
+
+
+# ===========================================================================
+#  MAIN PER-FILE EXTRACTOR
+# ===========================================================================
+
+def _get_table_columns(schema: str, table: str) -> List[str]:
+    """
+    Fetch column names for a table from information_schema (Greenplum/Postgres).
+    Uses _DB_ENGINE if available; otherwise returns empty list (offline mode).
+    Results are cached in _INFO_SCHEMA_CACHE.
+    """
+    key = (schema.lower() if schema else '', table.lower())
+    if key in _INFO_SCHEMA_CACHE:
+        return _INFO_SCHEMA_CACHE[key]
+
+    if _DB_ENGINE is None:
+        _INFO_SCHEMA_CACHE[key] = []
+        return []
+
+    try:
+        import pandas as _pd
+        # Resolve Jinja param schema names to actual schema at runtime
+        actual_schema = schema if schema and '{{' not in schema else None
+        if actual_schema:
+            q = f"""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = '{actual_schema}'
+                  AND table_name   = '{table}'
+                ORDER BY ordinal_position
+            """
+        else:
+            q = f"""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = '{table}'
+                ORDER BY ordinal_position
+                LIMIT 200
+            """
+        df = _pd.read_sql(q, _DB_ENGINE)
+        cols = df['column_name'].tolist()
+        _INFO_SCHEMA_CACHE[key] = cols
+        return cols
+    except Exception as e:
+        logger.debug(f"info_schema lookup failed for {schema}.{table}: {e}")
+        _INFO_SCHEMA_CACHE[key] = []
+        return []
+
+
+def extract_lineage_from_sql(
+    sql_content: str,
+    file_name_with_ext: str,
+    file_path: str,
+    process: str,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    now_ts = datetime.now()
+    file_stem = Path(file_name_with_ext).stem
+
+    normalized = _normalize(sql_content)
+    stmts = _split_stmts(normalized)
+
+    final_schema, final_table = _find_final_table(stmts, file_stem)
+
+    def make(sub_tbl='', sub_schema='', target_col='', src_tbl='', src_schema='',
+             src_col='', logic='', sql_proc='select') -> Dict[str, Any]:
+        return _make_row(file_name_with_ext, file_path, final_table, final_schema,
+                        process, now_ts, sub_tbl, sub_schema, target_col,
+                        src_tbl, src_schema, src_col, logic, sql_proc)
+
+    for stmt in stmts:
+        kind = _classify(stmt)
+        if kind not in ('CTA', 'INSERT'):
+            continue
+
+        # ── Identify sub_target and get select body ───────────────────
+        if kind == 'CTA':
+            m = re.search(
+                r'CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?' + _TBL_TOK + r'\s+AS\s*',
+                stmt, re.IGNORECASE
+            )
+            if not m:
+                continue
+            sub_schema, sub_tbl = _parse_table_token(m.group(1))
+            select_body = stmt[m.end():]
+
+        else:  # INSERT
+            m = re.search(r'INSERT\s+INTO\s+' + _TBL_TOK, stmt, re.IGNORECASE)
+            if not m:
+                continue
+            sub_schema, sub_tbl = _parse_table_token(m.group(1))
+            select_body = stmt[m.end():].lstrip()
+            if select_body.startswith('('):
+                ce = _find_paren_end(select_body, 0)
+                select_body = select_body[ce+1:].lstrip()
+
+        # ── CTEs from select body ─────────────────────────────────────
+        ctes, outer_sel = _extract_ctes(select_body)
+
+        outer_aliases = _extract_aliases(outer_sel)
+        for cn in ctes:
+            outer_aliases[cn] = ('__CTE__', cn)
+
+        all_ctes = dict(ctes)
+        cte_col_maps: Dict[str, Dict[str, List[Tuple[str, str, str]]]] = {}
+        for cn, cb in ctes.items():
+            cte_col_maps[cn] = _build_cte_col_map(cn, cb, all_ctes)
+
+        all_from_tables = _from_tables(outer_sel)
+
+        # ── Emit CTE sub-target rows ──────────────────────────────────
+        for cte_name, cte_body in ctes.items():
+            _emit_cte_rows(
+                cte_name, cte_body, all_ctes,
+                file_name_with_ext, file_path, final_table, final_schema,
+                process, now_ts, rows
+            )
+
+        # ── SELECT list of outer query ────────────────────────────────
+        sel_list = _extract_select_list(outer_sel)
+        if sel_list:
+            for expr in _split_comma(sel_list):
+                expr = expr.strip()
+                if not expr:
+                    continue
+                # Handle SELECT * or a.*
+                if re.match(r'^(\w+\.)?\*$', expr.strip()):
+                    # Determine source table
+                    star_pfx_m = re.match(r'^(\w+)\.\*$', expr.strip())
+                    if star_pfx_m:
+                        pfx = star_pfx_m.group(1).lower()
+                        s_schema, s_tbl = outer_aliases.get(pfx, ('', pfx))
+                        if s_schema == '__CTE__': s_schema = ''
+                    elif len(all_from_tables) == 1:
+                        s_schema, s_tbl = all_from_tables[0]
+                    else:
+                        s_schema, s_tbl = '', ''
+
+                    # Try to expand via information_schema
+                    cols_from_db = _get_table_columns(s_schema, s_tbl) if s_tbl else []
+                    if cols_from_db:
+                        for col in cols_from_db:
+                            rows.append(make(sub_tbl, sub_schema, col, s_tbl, s_schema,
+                                             col, expr, 'select*'))
+                    else:
+                        # No DB connection or unknown table — emit one placeholder row
+                        rows.append(make(sub_tbl, sub_schema, '*', s_tbl, s_schema,
+                                         '*', expr, 'select*'))
+                    continue
+
+                partial_rows = _analyse_expr(
+                    expr, outer_aliases, all_ctes, cte_col_maps, all_from_tables
+                )
+                for pr in partial_rows:
+                    rows.append(make(
+                        sub_tbl, sub_schema,
+                        pr['target_column'], pr['source_table'], pr['source_schema'],
+                        pr['source_column'], pr['logic'], pr['sql_process'],
+                    ))
+
+        # ── WHERE ─────────────────────────────────────────────────────
+        wh = _where_text(outer_sel)
+        if wh:
+            rows.append(make(sub_tbl, sub_schema, '', '', '', '', wh[:2000], 'where'))
+            rows.extend(_clause_col_rows(wh, 'where', outer_aliases, sub_tbl, sub_schema,
+                                         final_table, final_schema,
+                                         file_name_with_ext, file_path, process, now_ts))
+
+        # ── JOIN ──────────────────────────────────────────────────────
+        for jkw, tbl_raw, j_alias, on_clause, full_text in _extract_joins(outer_sel):
+            j_schema, j_tbl = _parse_table_token(tbl_raw)
+            rows.append(make(sub_tbl, sub_schema, '', j_tbl, j_schema, '', full_text[:2000], 'join'))
+            if on_clause:
+                rows.extend(_clause_col_rows('ON ' + on_clause, 'join', outer_aliases,
+                                             sub_tbl, sub_schema, final_table, final_schema,
+                                             file_name_with_ext, file_path, process, now_ts))
+
+        # ── HAVING ────────────────────────────────────────────────────
+        hv = _having_text(outer_sel)
+        if hv:
+            rows.append(make(sub_tbl, sub_schema, '', '', '', '', hv[:2000], 'having'))
+            rows.extend(_clause_col_rows(hv, 'having', outer_aliases, sub_tbl, sub_schema,
+                                         final_table, final_schema,
+                                         file_name_with_ext, file_path, process, now_ts))
+
+    return rows
+
+
+def _emit_cte_rows(
+    cte_name: str, cte_body: str, all_ctes: Dict[str, str],
+    file: str, path: str, final_tbl: str, final_schema: str,
+    process: str, now_ts: datetime, rows: List[Dict[str, Any]]
+):
+    """Parse one CTE body and emit rows with sub_target_table = cte_name."""
+    inner_ctes, inner_body = _extract_ctes(cte_body)
+    merged = {**all_ctes, **inner_ctes}
+
+    aliases = _extract_aliases(cte_body)
+    for cn in merged:
+        aliases[cn] = ('__CTE__', cn)
+
+    cte_col_maps_inner: Dict[str, Dict] = {
+        cn: _build_cte_col_map(cn, cb, merged) for cn, cb in inner_ctes.items()
+    }
+    all_tbls = _from_tables(cte_body)
+
+    sel = _extract_select_list(inner_body)
+    if sel:
+        for expr in _split_comma(sel):
+            expr = expr.strip()
+            if not expr:
+                continue
+            if re.match(r'^(\w+\.)?\*$', expr.strip()):
+                    star_pfx_m = re.match(r'^(\w+)\.\*$', expr.strip())
+                    if star_pfx_m:
+                        pfx = star_pfx_m.group(1).lower()
+                        s_schema, s_tbl = aliases.get(pfx, ('', pfx))
+                        if s_schema == '__CTE__': s_schema = ''
+                    elif len(all_tbls) == 1:
+                        s_schema, s_tbl = all_tbls[0]
+                    else:
+                        s_schema, s_tbl = '', ''
+                    cols_from_db = _get_table_columns(s_schema, s_tbl) if s_tbl else []
+                    if cols_from_db:
+                        for col in cols_from_db:
+                            rows.append(_make_row(file, path, final_tbl, final_schema, process, now_ts,
+                                                  cte_name, '', col, s_tbl, s_schema, col, expr, 'select*'))
+                    else:
+                        rows.append(_make_row(file, path, final_tbl, final_schema, process, now_ts,
+                                              cte_name, '', '*', s_tbl, s_schema, '*', expr, 'select*'))
+                    continue
+            partial = _analyse_expr(expr, aliases, merged, cte_col_maps_inner, all_tbls)
+            for pr in partial:
+                rows.append(_make_row(file, path, final_tbl, final_schema, process, now_ts,
+                                      cte_name, '',
+                                      pr['target_column'], pr['source_table'], pr['source_schema'],
+                                      pr['source_column'], pr['logic'], pr['sql_process']))
+
+    wh = _where_text(inner_body)
+    if wh:
+        rows.append(_make_row(file, path, final_tbl, final_schema, process, now_ts,
+                              cte_name, '', '', '', '', '', wh[:2000], 'where'))
+        rows.extend(_clause_col_rows(wh, 'where', aliases, cte_name, '',
+                                     final_tbl, final_schema, file, path, process, now_ts))
+
+
+# ===========================================================================
+#  FILE LOADERS
+# ===========================================================================
+
+def _fetch_sql_files_from_gitlab(token: str) -> Dict[str, str]:
+    import urllib.request, urllib.parse, json
+
+    base = GITLAB_URL.rstrip('/')
+    proj = urllib.parse.quote(IKG_PROJECT_PATH, safe='')
+    hdrs = {"PRIVATE-TOKEN": token}
+    all_items: List[dict] = []
+    url: Optional[str] = (
+        f"{base}/api/v4/projects/{proj}/repository/tree"
+        f"?path={urllib.parse.quote(SQL_FOLDER_IN_REPO)}"
+        f"&ref={DEFAULT_BASE_BRANCH}&recursive=true&per_page=1000"
+    )
+    while url:
+        req = urllib.request.Request(url, headers=hdrs)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            all_items.extend(json.loads(resp.read().decode()))
+            link = resp.headers.get('Link', '')
+            url = None
+            if 'rel="next"' in link:
+                for part in link.split(','):
+                    if 'rel="next"' in part:
+                        url = part.split(';')[0].strip().strip('<>')
+
+    sql_files = [x for x in all_items if x['type'] == 'blob' and x['path'].endswith('.sql')]
+    logger.info(f"Found {len(sql_files)} SQL files on GitLab.")
+
+    file_contents: Dict[str, str] = {}
+    for item in sql_files:
+        fpath = item['path']
+        process = Path(fpath).parent.name
+        if process in EXCLUDED_PROCESSES:
+            continue
+        raw_url = (f"{base}/api/v4/projects/{proj}/repository/files"
+                   f"/{urllib.parse.quote(fpath, safe='')}/raw?ref={DEFAULT_BASE_BRANCH}")
+        try:
+            req = urllib.request.Request(raw_url, headers=hdrs)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                file_contents[fpath] = resp.read().decode('utf-8', errors='replace')
+        except Exception as e:
+            logger.warning(f"Could not fetch {fpath}: {e}")
+    logger.info(f"Fetched {len(file_contents)} SQL files.")
+    return file_contents
+
+
+def _load_local_sql_files(sql_root: str) -> Dict[str, str]:
+    files: Dict[str, str] = {}
+    root = Path(sql_root)
+    for p in root.rglob('*.sql'):
+        process = p.parent.name
+        if process in EXCLUDED_PROCESSES:
+            continue
+        try:
+            try:
+                rel = str(p.relative_to(root.parent.parent.parent))
+            except ValueError:
+                rel = str(p)
+            files[rel] = p.read_text(encoding='utf-8', errors='replace')
+        except Exception as e:
+            logger.warning(f"Could not read {p}: {e}")
+    logger.info(f"Loaded {len(files)} SQL files (after exclusions) from '{sql_root}'.")
+    return files
+
+
+# ===========================================================================
+#  GREENPLUM WRITER
+# ===========================================================================
+
+def save_to_greenplum(df: pd.DataFrame, schema: str, password: str,
+                      host=GREENPLUM_HOST, port=GREENPLUM_PORT,
+                      db=GREENPLUM_DB, user=GREENPLUM_USER) -> bool:
+    try:
+        from sqlalchemy import create_engine
+        from psycopg2 import sql as pgsql
+    except ImportError:
+        logger.error("sqlalchemy/psycopg2 not installed."); return False
+
+    engine = create_engine(f"postgresql://{user}:{password}@{host}:{port}/{db}")
+    try:
+        raw = engine.raw_connection()
+        with raw.cursor() as cur:
+            cur.execute(pgsql.SQL("DROP TABLE IF EXISTS {}.{}").format(
+                pgsql.Identifier(schema), pgsql.Identifier(OUTPUT_TABLE)))
+        raw.commit(); raw.close()
+    except Exception as e:
+        logger.warning(f"Drop: {e}")
+
+    df.to_sql(OUTPUT_TABLE, engine, schema=schema, if_exists='replace', index=False, method='multi')
+
+    try:
+        raw = engine.raw_connection()
+        with raw.cursor() as cur:
+            cur.execute(pgsql.SQL("ALTER TABLE {}.{} OWNER TO erd_gpdb_prj_smart_insights").format(
+                pgsql.Identifier(schema), pgsql.Identifier(OUTPUT_TABLE)))
+            cur.execute(pgsql.SQL("GRANT SELECT ON {}.{} TO erd_gpdb_prj_smart_insights_ro").format(
+                pgsql.Identifier(schema), pgsql.Identifier(OUTPUT_TABLE)))
+        raw.commit(); raw.close()
+    except Exception as e:
+        logger.warning(f"Grant: {e}")
+
+    engine.dispose()
+    logger.info(f"✅ Saved {len(df)} rows to {schema}.{OUTPUT_TABLE}")
+    return True
+
+
+# ===========================================================================
+#  EXCEL WRITER
+# ===========================================================================
+
+def save_to_excel(df: pd.DataFrame, output_path: str):
+    logger.info(f"Writing Excel → {output_path}")
+    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name='Column_Lineage', index=False)
+
+    wb = load_workbook(output_path)
+    ws = wb['Column_Lineage']
+    hdr_fill = PatternFill(start_color='1F4E79', end_color='1F4E79', fill_type='solid')
+    hdr_font = Font(name='Arial', bold=True, color='FFFFFF', size=10)
+    for cell in ws[1]:
+        cell.fill = hdr_fill; cell.font = hdr_font
+        cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+
+    light = PatternFill(start_color='DCE6F1', end_color='DCE6F1', fill_type='solid')
+    dfont = Font(name='Arial', size=9)
+    for ri, row in enumerate(ws.iter_rows(min_row=2, max_row=ws.max_row), 2):
+        for cell in row:
+            cell.font = dfont
+            if ri % 2 == 0: cell.fill = light
+
+    for col_letter, width in zip('ABCDEFGHIJKLMN', [38,60,38,30,28,22,38,28,38,35,38,35,80,15]):
+        ws.column_dimensions[col_letter].width = width
+
+    ws.freeze_panes = 'A2'
+    ws.auto_filter.ref = ws.dimensions
+    wb.save(output_path)
+    logger.info(f"✅ Excel saved: {output_path}")
+
+
+# ===========================================================================
+#  MAIN
+# ===========================================================================
+
+def run(private_token=None, pg_password=None, use_local_sql=False,
+        local_sql_path=None, allow_prompt=True, **kwargs):
+    global _DB_ENGINE
+    logger.info("=" * 60)
+    logger.info("IKG Column Lineage Master Auto Refresh")
+    logger.info("=" * 60)
+
+    schema = ensure_greenplum_schema()
+
+    # Resolve DB password early so information_schema lookups work during parsing
+    if pg_password is None and is_running_in_airflow():
+        creds = get_greenplum_credentials()
+        if creds:
+            pg_password = creds.get('password')
+            try:
+                from sqlalchemy import create_engine as _ce
+                _DB_ENGINE = _ce(
+                    f"postgresql://{creds.get('user', GREENPLUM_USER)}:{pg_password}"
+                    f"@{creds.get('host', GREENPLUM_HOST)}:{creds.get('port', GREENPLUM_PORT)}"
+                    f"/{creds.get('db', GREENPLUM_DB)}"
+                )
+                logger.info("DB engine ready for information_schema lookups.")
+            except Exception as e:
+                logger.warning(f"Could not create DB engine for info_schema: {e}")
+    elif pg_password:
+        try:
+            from sqlalchemy import create_engine as _ce
+            _DB_ENGINE = _ce(
+                f"postgresql://{GREENPLUM_USER}:{pg_password}"
+                f"@{GREENPLUM_HOST}:{GREENPLUM_PORT}/{GREENPLUM_DB}"
+            )
+            logger.info("DB engine ready for information_schema lookups.")
+        except Exception as e:
+            logger.warning(f"Could not create DB engine: {e}")
+
+    if use_local_sql:
+        sql_path = local_sql_path or str(Path(__file__).parent / 'dags/ikg/scripts/sql')
+        file_dict = _load_local_sql_files(sql_path)
+    else:
+        if private_token is None:
+            private_token = get_private_token(allow_prompt=allow_prompt)
+        file_dict = _fetch_sql_files_from_gitlab(private_token)
+
+    all_rows, errors = [], []
+    for fpath, content in file_dict.items():
+        fname_ext = Path(fpath).name
+        proc = Path(fpath).parent.name
+        try:
+            all_rows.extend(extract_lineage_from_sql(content, fname_ext, fpath, proc))
+        except Exception as e:
+            errors.append((fpath, str(e)))
+            logger.warning(f"Error parsing {fpath}: {e}")
+
+    logger.info(f"Total records: {len(all_rows)}, Errors: {len(errors)}")
+    if errors:
+        for f, e in errors[:10]:
+            logger.warning(f"  {f}: {e}")
+
+    if not all_rows:
+        logger.warning("No records found."); return None
+
+    df = pd.DataFrame(all_rows, columns=COLUMN_ORDER).drop_duplicates()
+    df['current_date_time'] = pd.to_datetime(df['current_date_time'])
+
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    out = f"ikg_column_lineage_master_auto_refresh_{ts}.xlsx"
+    save_to_excel(df, out)
+
+    if pg_password or is_running_in_airflow():
+        if not pg_password:
+            creds = get_greenplum_credentials()
+            if creds: pg_password = creds.get('password')
+        if pg_password:
+            save_to_greenplum(df, schema, pg_password)
+    elif allow_prompt:
+        if input("Save to Greenplum? (yes/no): ").strip().lower() in ('yes', 'y'):
+            pg_password = getpass.getpass("Password: ")
+            save_to_greenplum(df, schema, pg_password)
+
+    logger.info(f"✅ Done → {out}")
+    return out
+
+
+def generate_column_lineage(private_token=None, **kwargs):
+    if private_token is None and is_running_in_airflow():
+        private_token = get_private_token(allow_prompt=False)
+    return run(private_token=private_token, allow_prompt=False)
+
+
+if __name__ == "__main__":
+    run(use_local_sql=True,
+        local_sql_path=str(Path(__file__).parent / "dags/ikg/scripts/sql"),
+        allow_prompt=True)
