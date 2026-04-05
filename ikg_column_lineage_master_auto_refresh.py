@@ -51,6 +51,60 @@ _INFO_SCHEMA_CACHE: Dict[Tuple[str, str], List[str]] = {}
 # Global DB engine for information_schema lookups (set during run)
 _DB_ENGINE = None
 
+# ── Schema parameter → actual schema name mapping ─────────────────────────────
+# These are the local defaults. When running in Airflow the actual values come
+# from Airflow Variables / props. Override below for local runs.
+JINJA_SCHEMA_MAP: Dict[str, str] = {
+    "IKG_SCHEMA":           "core_ikg",
+    "EDW_INPUT_SCHEMA":     "core_wma_shared",
+    "EDW_VIEW_INPUT_SCHEMA":"core_wma_shared",
+    "IKG_VENDOR_SCHEMA":    "core_wma_shared",
+    "MODEL_SCHEMA":         "core_model",
+    "NLG_SCHEMA":           "core_nlg",
+    "IKG_WEALTHX_SCHEMA":   "sandbox_prj_smart_relationship",
+}
+
+def _resolve_schema(jinja_param_name: str) -> str:
+    """
+    Resolve a Jinja parameter name like 'IKG_SCHEMA' to an actual schema.
+    In Airflow, attempts to read from Airflow Variables/props first.
+    Falls back to JINJA_SCHEMA_MAP for local runs.
+    """
+    if is_running_in_airflow():
+        try:
+            from ikg.scripts.python import props as ikg_props  # type: ignore
+            airflow_vars = ikg_props.get_airflow_variables()
+            val = airflow_vars.get(jinja_param_name)
+            if val:
+                return val
+        except Exception:
+            pass
+        try:
+            if Variable is not None:
+                val = Variable.get(jinja_param_name, default_var=None)
+                if val:
+                    return val
+        except Exception:
+            pass
+    return JINJA_SCHEMA_MAP.get(jinja_param_name, jinja_param_name)
+
+
+def _resolve_schema_label(schema_label: str) -> str:
+    """
+    Convert a schema label (either a real schema name or a Jinja param name
+    like 'IKG_SCHEMA') to an actual schema name for information_schema queries.
+    """
+    if not schema_label:
+        return ''
+    # Already a real schema name (contains no uppercase-only identifier pattern)
+    if schema_label in JINJA_SCHEMA_MAP:
+        return _resolve_schema(schema_label)
+    # Try stripping {{params.X}} to get X
+    jm = re.search(r'params\.([^}]+)', schema_label)
+    if jm:
+        return _resolve_schema(jm.group(1).strip())
+    return schema_label
+
 COLUMN_ORDER = [
     "file", "path", "target_table", "target_schema", "process",
     "current_date_time", "sub_target_table", "sub_target_schema",
@@ -106,7 +160,7 @@ SQL_FUNCTIONS: Set[str] = {
     "ROW_NUMBER","RANK","DENSE_RANK","PERCENT_RANK","CUME_DIST","NTILE",
     "LAG","LEAD","FIRST_VALUE","LAST_VALUE","NTH_VALUE",
     "CAST","CONVERT","TRY_CAST",
-    "EXTRACT","DATE_PART","DATE_TRUNC","DATE","NOW","CURRENT_DATE",
+    "EXTRACT","DATE_PART","DATE_TRUNC","NOW","CURRENT_DATE",
     "CURRENT_TIMESTAMP","CURRENT_TIME","LOCALTIMESTAMP","LOCALTIME",
     "TO_DATE","TO_TIMESTAMP","TO_CHAR","TO_NUMBER","TO_HEX",
     "DATEADD","DATEDIFF","MONTHS_BETWEEN","ADD_MONTHS","NEXT_DAY","LAST_DAY",
@@ -335,7 +389,26 @@ _LITERAL_PATTERNS = [
     re.compile(r"^(true|false|null)(?:::\w[\w\s]*)?$", re.IGNORECASE),
 ]
 # NOTE: double-quoted "strings" are COLUMN IDENTIFIERS in Postgres/Greenplum, NOT literals.
-# They must NOT appear in _LITERAL_PATTERNS.
+
+# System-value pseudo-columns: these have no source table/column —
+# the function itself IS the source.  Source_column = function name/call.
+_SYSTEM_VALUE_TOKENS = {
+    'CURRENT_DATE', 'CURRENT_TIMESTAMP', 'CURRENT_TIME',
+    'LOCALTIMESTAMP', 'LOCALTIME', 'NOW', 'CLOCK_TIMESTAMP',
+    'TRANSACTION_TIMESTAMP', 'STATEMENT_TIMESTAMP',
+}
+
+def _is_system_value(expr: str) -> bool:
+    """Return True if expr is a system pseudo-column (CURRENT_DATE, NOW(), etc.)."""
+    e = _strip_cast(expr).strip().upper()
+    # bare: CURRENT_DATE
+    if e in _SYSTEM_VALUE_TOKENS:
+        return True
+    # function call: NOW() or NOW(...)
+    fn_m = re.match(r'^(\w+)\s*\(', e)
+    if fn_m and fn_m.group(1) in _SYSTEM_VALUE_TOKENS:
+        return True
+    return False
 
 
 def _is_literal(expr: str) -> bool:
@@ -675,8 +748,7 @@ def _analyse_expr(
     all_from_tables: List[Tuple[str, str]],
 ) -> List[Dict[str, Any]]:
     """
-    Parse one SELECT expression. Returns list of partial row dicts with:
-      target_column, source_table, source_schema, source_column, logic, sql_process
+    Parse one SELECT expression. Returns list of partial row dicts.
     """
     expr = expr.strip()
     if not expr:
@@ -686,52 +758,51 @@ def _analyse_expr(
     if re.match(r'^DISTINCT\s+ON\s*\(', expr, re.IGNORECASE):
         return []
 
-    # ── Handle subquery expression: (SELECT ...) alias ────────────────────
-    # If the whole logic (before alias) is a parenthesised subquery
-    subq_m = re.match(r'^\((.+)\)\s*(?:AS\s+)?(\w+)\s*$', expr, re.IGNORECASE | re.DOTALL)
-    if subq_m and expr.startswith('('):
-        inner_sql = subq_m.group(1).strip()
-        sub_alias = subq_m.group(2)
-        # Only treat as subquery if it contains SELECT
-        if re.search(r'\bSELECT\b', inner_sql, re.IGNORECASE):
-            # Extract source columns from the inner SELECT
-            inner_sel = _extract_select_list(inner_sql)
-            inner_from_tables = _from_tables(inner_sql)
-            inner_aliases = _extract_aliases(inner_sql)
-            sub_rows = []
-            if inner_sel:
-                for inner_expr in _split_comma(inner_sel):
-                    inner_expr = inner_expr.strip()
-                    if not inner_expr or inner_expr == '*':
-                        continue
-                    _, inner_logic = _split_alias(inner_expr)
-                    inner_refs = _extract_col_refs_from_expr(inner_logic or inner_expr)
-                    for r_alias, r_col in inner_refs:
-                        res_list = _resolve_col_ref(
-                            r_alias, r_col, inner_aliases, all_ctes, cte_col_maps, inner_from_tables
-                        )
-                        for res_schema, res_tbl, res_col in res_list:
-                            sub_rows.append(dict(
-                                target_column=sub_alias,
-                                source_table=res_tbl, source_schema=res_schema,
-                                source_column=res_col,
-                                logic=expr, sql_process='select',
-                            ))
-            if sub_rows:
-                return sub_rows
-            return [dict(target_column=sub_alias, source_table='', source_schema='',
-                         source_column='', logic=expr, sql_process='select')]
+    # ── Subquery expression: (SELECT ...) alias ───────────────────────────
+    if expr.startswith('('):
+        subq_m = re.match(r'^\((.+)\)\s*(?:AS\s+)?(\w+)\s*$', expr, re.IGNORECASE | re.DOTALL)
+        if subq_m:
+            inner_sql = subq_m.group(1).strip()
+            sub_alias = subq_m.group(2)
+            if re.search(r'\bSELECT\b', inner_sql, re.IGNORECASE):
+                inner_sel = _extract_select_list(inner_sql)
+                inner_from_tables = _from_tables(inner_sql)
+                inner_aliases = _extract_aliases(inner_sql)
+                sub_rows = []
+                if inner_sel:
+                    for inner_expr in _split_comma(inner_sel):
+                        inner_expr = inner_expr.strip()
+                        if not inner_expr or inner_expr == '*':
+                            continue
+                        _, inner_logic = _split_alias(inner_expr)
+                        inner_refs = _extract_col_refs_from_expr(inner_logic or inner_expr)
+                        for r_alias, r_col in inner_refs:
+                            res_list = _resolve_col_ref(
+                                r_alias, r_col, inner_aliases, all_ctes, cte_col_maps, inner_from_tables
+                            )
+                            for res_schema, res_tbl, res_col in res_list:
+                                if not res_tbl and inner_from_tables:
+                                    res_schema2, res_tbl2 = _find_column_in_tables(res_col, inner_from_tables)
+                                    if res_tbl2:
+                                        res_schema, res_tbl = res_schema2, res_tbl2
+                                sub_rows.append(dict(
+                                    target_column=sub_alias,
+                                    source_table=res_tbl, source_schema=res_schema,
+                                    source_column=res_col, logic=expr, sql_process='select',
+                                ))
+                if sub_rows:
+                    return sub_rows
+                return [dict(target_column=sub_alias, source_table='', source_schema='',
+                             source_column='', logic=expr, sql_process='select')]
 
-    # ── Step 1: determine alias (target_column) and logic ─────────────────
+    # ── Step 1: split alias ────────────────────────────────────────────────
     target_col, logic = _split_alias(expr)
 
-    # If entire expr is a double-quoted identifier (standalone "col"): self-ref
     if not target_col and _is_double_quoted_ident(expr.strip()):
         col_name = _dequote(expr.strip())
         return [dict(target_column=col_name, source_table='', source_schema='',
                      source_column=col_name, logic=expr, sql_process='select')]
 
-    # alias.double_quoted_col with no explicit alias → self-ref target=col
     if not target_col:
         dqcol_m = re.match(r'^(\w+)\."([^"]+)"(?:::\w+)?$', expr.strip())
         if dqcol_m:
@@ -742,7 +813,6 @@ def _analyse_expr(
                          source_column=col, logic=expr, sql_process='select')]
 
     if not target_col:
-        # Infer from simple forms
         dm = re.match(r'^(\w+)\.(\w+)(?:::\w+)?$', (logic or expr).strip())
         if dm:
             target_col = dm.group(2)
@@ -753,15 +823,90 @@ def _analyse_expr(
 
     use_logic = logic if logic else expr
 
-    # ── Step 2: literal / select-value? ───────────────────────────────────
+    # ── Step 2: literal / system-value / select-value detection ───────────
     logic_stripped = _strip_cast(use_logic)
 
+    # (a) Plain string / number / null / jinja param → select-value
     if _is_literal(logic_stripped):
         src = _extract_literal_src(logic_stripped)
         return [dict(target_column=target_col, source_table='', source_schema='',
                      source_column=src, logic=expr, sql_process='select-value')]
 
-    # ── Step 2b: single double-quoted token as logic: "col" ───────────────
+    # (b) System pseudo-columns: CURRENT_DATE, CURRENT_TIMESTAMP, NOW() etc.
+    #     These appear anywhere in an expression referencing only system state.
+    #     If the ENTIRE logic (stripped) is a system value → select-value.
+    #     If system value appears INSIDE a larger expression (concat, extract),
+    #     the system pseudo-column itself becomes the source_column.
+    if _is_system_value(logic_stripped):
+        # Whole expression is a system function — no real table source
+        src_col = _strip_cast(logic_stripped).upper()
+        # Normalise: CURRENT_DATE or NOW() → keep as-is for readability
+        src_col = re.sub(r'\(\s*\)', '()', src_col)
+        return [dict(target_column=target_col or src_col.lower(),
+                     source_table='', source_schema='', source_column=src_col,
+                     logic=expr, sql_process='select-value')]
+
+    # (c) Expression uses ONLY system pseudo-cols / pure functions → select-value
+    logic_no_literals = re.sub(r"'[^']*'", ' ', use_logic)
+    logic_no_literals = re.sub(r'\b\d+\.?\d*\b', ' ', logic_no_literals)
+    logic_no_literals = re.sub(r'::\s*\w+', ' ', logic_no_literals)
+    logic_no_literals = re.sub(r'\{\{[^}]+\}\}', ' ', logic_no_literals)
+    word_tokens = re.findall(r'\b([a-zA-Z_]\w*)\b', logic_no_literals)
+    _SYSTEM_ONLY_KW = _SYSTEM_VALUE_TOKENS | SQL_FUNCTIONS | {
+        'SELECT','FROM','WHERE','AND','OR','NOT','IN','IS','AS','ON',
+        'JOIN','GROUP','BY','ORDER','HAVING','LIMIT','CASE','WHEN','THEN',
+        'ELSE','END','NULL','TRUE','FALSE','BETWEEN','LIKE','ILIKE',
+        'PARTITION','OVER','FILTER','INTERVAL','EXTRACT','EPOCH','DOW',
+        'CONCAT','SUBSTRING','TEXT','INT','INTEGER','NUMERIC',
+        'BIGINT','VARCHAR','TIMESTAMP','DAYS','COALESCE',
+    }
+    real_word_tokens = [w for w in word_tokens if w.upper() not in _SYSTEM_ONLY_KW]
+    sys_val_tokens = [w.upper() for w in word_tokens if w.upper() in _SYSTEM_VALUE_TOKENS]
+
+    if not real_word_tokens:
+        if sys_val_tokens:
+            # Only system pseudo-columns (CURRENT_DATE, NOW, etc.) — no real table column
+            return [dict(target_column=target_col, source_table='', source_schema='',
+                         source_column=sys_val_tokens[0],
+                         logic=expr, sql_process='select-value')]
+        elif word_tokens:
+            # No real column tokens found with strict filter. Try looser filter:
+            # Remove only hard control-flow keywords + known SQL functions.
+            # This catches real col names that share names with datetime fields
+            # like 'date', 'year', 'quarter' — and hidden cols like 'range' inside
+            # split_part(range, '-', 1).
+            _LOOSE_HARD = {
+                'SELECT','FROM','WHERE','AND','OR','NOT','IN','IS','AS','ON',
+                'JOIN','GROUP','BY','ORDER','HAVING','LIMIT','CASE','WHEN','THEN',
+                'ELSE','END','NULL','TRUE','FALSE','BETWEEN','LIKE','ILIKE',
+                'PARTITION','OVER','FILTER','INTERVAL','EXTRACT','EPOCH','DOW',
+                'CONCAT','SUBSTRING','TEXT','INT','INTEGER','NUMERIC',
+                'BIGINT','VARCHAR','TIMESTAMP','DAYS','COALESCE',
+            }
+            loose_real = [w for w in word_tokens
+                          if w.upper() not in _LOOSE_HARD
+                          and w.upper() not in SQL_FUNCTIONS
+                          and w.upper() not in _SYSTEM_VALUE_TOKENS]
+            if loose_real:
+                # Found hidden real column refs → inject them as refs and fall through
+                # to normal resolution (Step 5+)
+                pass  # word_tokens handled via body_refs below
+            else:
+                # Pure function, truly no real col refs (COUNT(*), row_number() etc.)
+                src_col = use_logic.strip()[:120]
+                return [dict(target_column=target_col, source_table='', source_schema='',
+                             source_column=src_col, logic=expr, sql_process='select-value')]
+
+    # (d) COUNT(*) / COUNT(DISTINCT *) without OVER → select-value
+    count_star_m = re.match(r'^(COUNT\s*\(\s*(?:DISTINCT\s+)?\*?\s*\))',
+                            use_logic.strip(), re.IGNORECASE)
+    if count_star_m and not re.search(r'\bOVER\s*\(', use_logic, re.IGNORECASE):
+        return [dict(target_column=target_col, source_table='', source_schema='',
+                     source_column=count_star_m.group(1),
+                     logic=expr, sql_process='select-value')]
+
+    # (e) Double-quoted identifier as logic: "col" 
+    # (d) Expression references ONLY system pseudo-columns
     if _is_double_quoted_ident(use_logic.strip()):
         col_name = _dequote(use_logic.strip())
         return [dict(target_column=target_col or col_name, source_table='', source_schema='',
@@ -776,7 +921,6 @@ def _analyse_expr(
     # ── Step 3: window function detection ─────────────────────────────────
     has_over = bool(re.search(r'\bOVER\s*\(', use_logic, re.IGNORECASE))
 
-    # Strip OVER(...) from body for main refs
     main_logic = use_logic
     if has_over:
         ov_m = re.search(r'\bOVER\s*\(', main_logic, re.IGNORECASE)
@@ -785,7 +929,6 @@ def _analyse_expr(
             ov_end = _find_paren_end(main_logic, ov_start)
             main_logic = main_logic[:ov_m.start()] + main_logic[ov_end+1:]
 
-    # Strip FILTER(...) from body
     fl_m = re.search(r'\bFILTER\s*\(', main_logic, re.IGNORECASE)
     if fl_m:
         fl_start = main_logic.index('(', fl_m.start())
@@ -795,33 +938,40 @@ def _analyse_expr(
     body_refs = _extract_col_refs_from_expr(main_logic)
     window_refs = _parse_over_clause(use_logic)
 
-    # Deduplicate refs
     seen_refs: Set[Tuple[str, str]] = set()
     unique_refs: List[Tuple[str, str]] = []
     for r in body_refs + window_refs:
         if r not in seen_refs:
             seen_refs.add(r); unique_refs.append(r)
 
-    # ── Step 4: no refs → select-value or pure window function ────────────
+    # ── Step 4: no refs → select-value ────────────────────────────────────
     if not unique_refs:
-        # row_number() over() with empty OVER: no real source column
+        # row_number() over() or other pure function with no column input
+        src_col = ''
+        if has_over:
+            # Extract the aggregate function call itself as source
+            fn_m = re.match(r'^(\w+\s*\(.*?\))', use_logic.strip(), re.DOTALL)
+            src_col = fn_m.group(1)[:80] if fn_m else use_logic[:80]
         return [dict(target_column=target_col, source_table='', source_schema='',
-                     source_column='', logic=expr,
-                     sql_process='select-value' if has_over else 'select-value')]
+                     source_column=src_col, logic=expr, sql_process='select-value')]
 
-    # ── Step 5: COALESCE/function with no alias → target=source=first col ─
-    # If target_col is empty after all attempts, use the first column ref as target
+    # ── Step 5: infer target_col from first ref if still blank ────────────
     if not target_col and unique_refs:
         _, first_col = unique_refs[0]
         target_col = first_col
 
-    # ── Step 6: resolve each ref ──────────────────────────────────────────
+    # ── Step 6: resolve each ref, fall back to information_schema ─────────
     rows = []
     for alias_pfx, col in unique_refs:
         resolved = _resolve_col_ref(
             alias_pfx, col, aliases, all_ctes, cte_col_maps, all_from_tables
         )
         for res_schema, res_tbl, res_col in resolved:
+            # If no table resolved and we have a DB, try information_schema
+            if not res_tbl and all_from_tables:
+                is2, it2 = _find_column_in_tables(res_col, all_from_tables)
+                if it2:
+                    res_schema, res_tbl = is2, it2
             rows.append(dict(
                 target_column=target_col,
                 source_table=res_tbl, source_schema=res_schema, source_column=res_col,
@@ -1419,46 +1569,60 @@ def _make_row(file, path, target_table, target_schema, process, now_ts,
 
 def _get_table_columns(schema: str, table: str) -> List[str]:
     """
-    Fetch column names for a table from information_schema (Greenplum/Postgres).
-    Uses _DB_ENGINE if available; otherwise returns empty list (offline mode).
-    Results are cached in _INFO_SCHEMA_CACHE.
+    Fetch column names for a table from information_schema.
+    Resolves Jinja schema params (IKG_SCHEMA -> core_ikg) automatically.
     """
-    key = (schema.lower() if schema else '', table.lower())
+    actual_schema = _resolve_schema_label(schema) if schema else ''
+    key = (actual_schema.lower(), table.lower())
     if key in _INFO_SCHEMA_CACHE:
         return _INFO_SCHEMA_CACHE[key]
-
     if _DB_ENGINE is None:
         _INFO_SCHEMA_CACHE[key] = []
         return []
-
     try:
         import pandas as _pd
-        # Resolve Jinja param schema names to actual schema at runtime
-        actual_schema = schema if schema and '{{' not in schema else None
         if actual_schema:
-            q = f"""
-                SELECT column_name
-                FROM information_schema.columns
-                WHERE table_schema = '{actual_schema}'
-                  AND table_name   = '{table}'
-                ORDER BY ordinal_position
-            """
+            q = (f"SELECT column_name FROM information_schema.columns "
+                 f"WHERE table_schema = '{actual_schema}' AND table_name = '{table}' "
+                 f"ORDER BY ordinal_position")
         else:
-            q = f"""
-                SELECT column_name
-                FROM information_schema.columns
-                WHERE table_name = '{table}'
-                ORDER BY ordinal_position
-                LIMIT 200
-            """
-        df = _pd.read_sql(q, _DB_ENGINE)
-        cols = df['column_name'].tolist()
+            q = (f"SELECT column_name FROM information_schema.columns "
+                 f"WHERE table_name = '{table}' ORDER BY ordinal_position LIMIT 200")
+        result = _pd.read_sql(q, _DB_ENGINE)
+        cols = result['column_name'].tolist()
         _INFO_SCHEMA_CACHE[key] = cols
         return cols
     except Exception as e:
-        logger.debug(f"info_schema lookup failed for {schema}.{table}: {e}")
+        logger.debug(f"info_schema lookup failed for {actual_schema}.{table}: {e}")
         _INFO_SCHEMA_CACHE[key] = []
         return []
+
+
+def _find_column_in_tables(col_name: str,
+                           candidate_tables: List[Tuple[str, str]]) -> Tuple[str, str]:
+    """
+    Query information_schema to find which table among candidates owns col_name.
+    Returns (schema, table) of the first match, or ('', '') if not found / no DB.
+    """
+    if not candidate_tables or _DB_ENGINE is None:
+        return '', ''
+    try:
+        import pandas as _pd
+        tbl_list = list({t for s, t in candidate_tables
+                         if t and t.upper() not in {'SELECT','FROM','WHERE','JOIN','ON'}})
+        if not tbl_list:
+            return '', ''
+        tbl_in = ', '.join(f"'{t}'" for t in tbl_list)
+        q = (f"SELECT table_schema AS source_schema, table_name AS source_table "
+             f"FROM information_schema.columns "
+             f"WHERE column_name = '{col_name}' AND table_name IN ({tbl_in}) "
+             f"LIMIT 1")
+        result = _pd.read_sql(q, _DB_ENGINE)
+        if not result.empty:
+            return result['source_schema'].iloc[0], result['source_table'].iloc[0]
+    except Exception as e:
+        logger.debug(f"Column lookup failed for {col_name}: {e}")
+    return '', ''
 
 
 def extract_lineage_from_sql(
@@ -1537,29 +1701,73 @@ def extract_lineage_from_sql(
                 expr = expr.strip()
                 if not expr:
                     continue
-                # Handle SELECT * or a.*
+                # ── Handle SELECT * or a.* ─────────────────────────────────
                 if re.match(r'^(\w+\.)?\*$', expr.strip()):
-                    # Determine source table
                     star_pfx_m = re.match(r'^(\w+)\.\*$', expr.strip())
                     if star_pfx_m:
                         pfx = star_pfx_m.group(1).lower()
                         s_schema, s_tbl = outer_aliases.get(pfx, ('', pfx))
                         if s_schema == '__CTE__': s_schema = ''
-                    elif len(all_from_tables) == 1:
-                        s_schema, s_tbl = all_from_tables[0]
+                        source_tbls = [(s_schema, s_tbl)] if s_tbl else []
                     else:
-                        s_schema, s_tbl = '', ''
+                        source_tbls = [(s, t) for s, t in all_from_tables
+                                       if t and t.lower() not in all_ctes]
+                        s_schema, s_tbl = source_tbls[0] if len(source_tbls) == 1 else ('', '')
 
-                    # Try to expand via information_schema
-                    cols_from_db = _get_table_columns(s_schema, s_tbl) if s_tbl else []
-                    if cols_from_db:
-                        for col in cols_from_db:
-                            rows.append(make(sub_tbl, sub_schema, col, s_tbl, s_schema,
-                                             col, expr, 'select*'))
-                    else:
-                        # No DB connection or unknown table — emit one placeholder row
-                        rows.append(make(sub_tbl, sub_schema, '*', s_tbl, s_schema,
-                                         '*', expr, 'select*'))
+                    # Case A: source is a subquery (FROM (...) alias) — unfold inline
+                    # Detect if outer_sel's FROM is a subquery
+                    from_subq_m = re.search(
+                        r'\bFROM\s*\((.+?)\)\s*(?:AS\s+)?(\w+)\s*(?:;|$|\bWHERE\b|\bJOIN\b)',
+                        outer_sel, re.IGNORECASE | re.DOTALL
+                    )
+                    if from_subq_m and not source_tbls:
+                        inner_sql = from_subq_m.group(1).strip()
+                        inner_alias = (from_subq_m.group(2) or '').lower()
+                        inner_from_tables = _from_tables(inner_sql)
+                        inner_aliases = _extract_aliases(inner_sql)
+                        inner_ctes2, inner_body2 = _extract_ctes(inner_sql)
+                        merged2 = {**all_ctes, **inner_ctes2}
+                        for cn in merged2: inner_aliases[cn] = ('__CTE__', cn)
+                        inner_sel2 = _extract_select_list(inner_body2)
+                        # Emit one row per column from the inner SELECT
+                        if inner_sel2:
+                            for ie in _split_comma(inner_sel2):
+                                ie = ie.strip()
+                                if not ie: continue
+                                i_alias, i_logic = _split_alias(ie)
+                                i_tgt = i_alias or (re.match(r'^(?:\w+\.)?(\w+)(?:::\w+)?$', (i_logic or ie).strip()) or re.match(r'^(\w+)', (i_logic or ie).strip()) or type('', (), {'group': lambda self, x: ''})()).group(1) or ''
+                                i_refs = _extract_col_refs_from_expr(i_logic or ie)
+                                if i_refs:
+                                    for ra, rc in i_refs:
+                                        rl = _resolve_col_ref(ra, rc, inner_aliases, merged2, {}, inner_from_tables)
+                                        for rs, rt, rcol in rl:
+                                            if not rt and inner_from_tables:
+                                                rs2, rt2 = _find_column_in_tables(rcol, inner_from_tables)
+                                                if rt2: rs, rt = rs2, rt2
+                                            rows.append(make(sub_tbl, sub_schema, i_tgt, rt, rs, rcol, ie, 'select*'))
+                                else:
+                                    rows.append(make(sub_tbl, sub_schema, i_tgt, '', '', i_tgt, ie, 'select*'))
+                        # Also emit WHERE of subquery as where-subquery
+                        inner_wh = _where_text(inner_body2)
+                        if inner_wh:
+                            rows.append(make(sub_tbl, sub_schema, '', '', '', '', inner_wh[:2000], 'where-subquery'))
+                            rows.extend(_clause_col_rows(inner_wh, 'where-subquery', inner_aliases,
+                                                         sub_tbl, sub_schema, final_table, final_schema,
+                                                         file_name_with_ext, file_path, process, now_ts))
+                        continue
+
+                    # Case B: source is a real table → expand via information_schema
+                    expanded = False
+                    for ts_schema, ts_tbl in (source_tbls if source_tbls else [(s_schema, s_tbl)]):
+                        cols_from_db = _get_table_columns(ts_schema, ts_tbl) if ts_tbl else []
+                        if cols_from_db:
+                            for col in cols_from_db:
+                                rows.append(make(sub_tbl, sub_schema, col, ts_tbl,
+                                                 _resolve_schema_label(ts_schema), col, col, 'select*'))
+                            expanded = True
+                    if not expanded:
+                        rows.append(make(sub_tbl, sub_schema, '*', s_tbl,
+                                         _resolve_schema_label(s_schema), '*', expr, 'select*'))
                     continue
 
                 partial_rows = _analyse_expr(
