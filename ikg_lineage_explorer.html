@@ -1,0 +1,693 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>IKG Column Lineage Explorer</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/sigma.js/2.4.0/sigma.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/graphology/0.25.4/graphology.umd.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', Arial, sans-serif; background: #f0f4f8; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+
+  /* ── Header ── */
+  #header {
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+    color: #fff; padding: 12px 20px; display: flex; align-items: center; gap: 16px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3); flex-shrink: 0; z-index: 10;
+  }
+  #header h1 { font-size: 18px; font-weight: 600; letter-spacing: 0.5px; white-space: nowrap; }
+  #header h1 span { color: #e94560; }
+  #search-row { display: flex; gap: 8px; flex: 1; align-items: center; }
+  #col-input {
+    flex: 1; padding: 8px 14px; border-radius: 6px; border: 2px solid rgba(255,255,255,0.2);
+    background: rgba(255,255,255,0.1); color: #fff; font-size: 14px; outline: none;
+    transition: border-color 0.2s;
+  }
+  #col-input::placeholder { color: rgba(255,255,255,0.5); }
+  #col-input:focus { border-color: #e94560; }
+  #btn-trace {
+    padding: 8px 20px; background: #e94560; color: #fff; border: none; border-radius: 6px;
+    font-size: 14px; font-weight: 600; cursor: pointer; white-space: nowrap;
+    transition: background 0.2s; box-shadow: 0 2px 6px rgba(233,69,96,0.4);
+  }
+  #btn-trace:hover { background: #c73652; }
+  #btn-trace:disabled { background: #666; cursor: default; box-shadow: none; }
+  #status { font-size: 13px; color: rgba(255,255,255,0.7); white-space: nowrap; min-width: 120px; }
+
+  /* ── Main layout ── */
+  #main { display: flex; flex: 1; overflow: hidden; }
+
+  /* ── Graph panel ── */
+  #graph-panel { flex: 1; position: relative; background: #0a0a1a; }
+  #sigma-container { width: 100%; height: 100%; }
+  #graph-hint {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+    text-align: center; color: rgba(255,255,255,0.3); pointer-events: none;
+  }
+  #graph-hint .big { font-size: 48px; margin-bottom: 10px; }
+  #graph-hint p { font-size: 16px; }
+
+  /* ── Side panel ── */
+  #side-panel {
+    width: 360px; background: #fff; border-left: 1px solid #e0e6ed;
+    display: flex; flex-direction: column; overflow: hidden; flex-shrink: 0;
+  }
+  #side-header {
+    background: #1a1a2e; color: #fff; padding: 14px 16px; font-size: 14px;
+    font-weight: 600; letter-spacing: 0.3px; flex-shrink: 0;
+  }
+  #side-content { flex: 1; overflow-y: auto; padding: 12px; }
+  #side-content .placeholder {
+    color: #aaa; font-size: 14px; text-align: center; padding: 40px 20px;
+    line-height: 1.6;
+  }
+  #side-content .placeholder .icon { font-size: 36px; margin-bottom: 10px; }
+
+  /* ── Detail card ── */
+  .detail-card { border: 1px solid #e0e6ed; border-radius: 8px; overflow: hidden; margin-bottom: 10px; }
+  .detail-card .card-header {
+    background: #f5f7fa; padding: 8px 12px; font-size: 12px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.5px; color: #555; border-bottom: 1px solid #e0e6ed;
+  }
+  .detail-row { display: flex; padding: 6px 12px; border-bottom: 1px solid #f0f2f5; font-size: 13px; }
+  .detail-row:last-child { border-bottom: none; }
+  .detail-label { color: #888; width: 130px; flex-shrink: 0; font-size: 12px; }
+  .detail-value { color: #222; word-break: break-word; font-weight: 500; }
+  .detail-value.mono { font-family: 'Courier New', monospace; font-size: 11px; background: #f5f7fa; padding: 2px 5px; border-radius: 3px; }
+  .detail-value.empty { color: #bbb; font-style: italic; font-weight: 400; }
+  .badge { display: inline-block; padding: 2px 7px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+  .badge-select { background: #e8f5e9; color: #2e7d32; }
+  .badge-join   { background: #e3f2fd; color: #1565c0; }
+  .badge-where  { background: #fff3e0; color: #e65100; }
+  .badge-having { background: #fce4ec; color: #c62828; }
+  .badge-value  { background: #f3e5f5; color: #6a1b9a; }
+  .badge-star   { background: #e0f7fa; color: #00695c; }
+
+  /* ── Legend ── */
+  #legend {
+    position: absolute; bottom: 16px; left: 16px; background: rgba(20,20,40,0.85);
+    border-radius: 8px; padding: 10px 14px; backdrop-filter: blur(4px);
+  }
+  #legend h4 { color: #fff; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+  .legend-item { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; font-size: 12px; color: rgba(255,255,255,0.8); }
+  .legend-dot { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }
+
+  /* ── Controls ── */
+  #controls {
+    position: absolute; top: 14px; right: 14px; display: flex; gap: 6px;
+  }
+  .ctrl-btn {
+    background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.2);
+    color: #fff; width: 32px; height: 32px; border-radius: 6px; cursor: pointer;
+    font-size: 16px; display: flex; align-items: center; justify-content: center;
+    transition: background 0.15s;
+  }
+  .ctrl-btn:hover { background: rgba(255,255,255,0.2); }
+
+  /* ── Scrollbar ── */
+  #side-content::-webkit-scrollbar { width: 6px; }
+  #side-content::-webkit-scrollbar-track { background: #f5f7fa; }
+  #side-content::-webkit-scrollbar-thumb { background: #ccc; border-radius: 3px; }
+
+  /* ── Loading ── */
+  #loading-overlay {
+    position: absolute; inset: 0; background: rgba(10,10,26,0.7);
+    display: none; align-items: center; justify-content: center; z-index: 100;
+  }
+  #loading-overlay.active { display: flex; }
+  .spinner { width: 40px; height: 40px; border: 3px solid rgba(255,255,255,0.2); border-top-color: #e94560; border-radius: 50%; animation: spin 0.7s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── Node tooltip ── */
+  #node-tooltip {
+    position: absolute; background: rgba(20,20,40,0.9); color: #fff; padding: 6px 10px;
+    border-radius: 5px; font-size: 12px; pointer-events: none; display: none;
+    white-space: nowrap; z-index: 50;
+  }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div id="header">
+  <h1>IKG Lineage <span>Explorer</span></h1>
+  <div id="search-row">
+    <input id="col-input" type="text" placeholder="Enter column name (e.g. acc_mhh_n, household_plus)…" />
+    <button id="btn-trace" onclick="traceLineage()">▶ Trace</button>
+    <span id="status">Load CSV first →</span>
+  </div>
+  <label style="cursor:pointer; background:rgba(255,255,255,0.1); padding:7px 14px; border-radius:6px; font-size:13px; border:1px solid rgba(255,255,255,0.2);">
+    📂 Load CSV
+    <input id="csv-file" type="file" accept=".csv" style="display:none" onchange="loadCSV(this)" />
+  </label>
+</div>
+
+<!-- Main -->
+<div id="main">
+  <div id="graph-panel">
+    <div id="sigma-container"></div>
+    <div id="graph-hint">
+      <div class="big">🔍</div>
+      <p>Load your lineage CSV, then enter a<br>column name and click Trace.</p>
+    </div>
+    <div id="loading-overlay"><div class="spinner"></div></div>
+    <div id="legend" style="display:none">
+      <h4>Schema Colors</h4>
+      <div id="legend-items"></div>
+    </div>
+    <div id="controls">
+      <button class="ctrl-btn" title="Zoom in"  onclick="sigmaZoom(1.3)">+</button>
+      <button class="ctrl-btn" title="Zoom out" onclick="sigmaZoom(0.77)">−</button>
+      <button class="ctrl-btn" title="Fit graph" onclick="sigmaFit()">⊡</button>
+    </div>
+    <div id="node-tooltip"></div>
+  </div>
+
+  <div id="side-panel">
+    <div id="side-header">Node Details</div>
+    <div id="side-content">
+      <div class="placeholder">
+        <div class="icon">💡</div>
+        Click any node in the graph to see<br>its full lineage details here.
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════════════
+// DATA STORE
+// ═══════════════════════════════════════════════════════════════════════════
+
+let lineageData = [];   // all rows from CSV
+let sigmaInst  = null;
+let graph      = null;
+
+// Schema → color palette
+const SCHEMA_COLORS = {
+  'core_ikg':                           '#e94560',
+  'core_wma_shared':                    '#0f9b8e',
+  'core_model':                         '#f5a623',
+  'core_nlg':                           '#7b68ee',
+  'sandbox_prj_smart_relationship':     '#20c997',
+  'sandbox_prj_smart_insights':         '#fd7e14',
+  'edw_input_schema':                   '#4dabf7',
+  'edw_view_input_schema':              '#51cf66',
+  '':                                   '#adb5bd',
+};
+const DEFAULT_COLOR = '#74b9ff';
+function schemaColor(schema) {
+  const s = (schema || '').toLowerCase().trim();
+  // fuzzy match
+  for (const [k, v] of Object.entries(SCHEMA_COLORS)) {
+    if (s === k || s.includes(k) || k.includes(s)) return v;
+  }
+  return DEFAULT_COLOR;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CSV LOADING
+// ═══════════════════════════════════════════════════════════════════════════
+
+function loadCSV(input) {
+  const file = input.files[0];
+  if (!file) return;
+  setStatus('Loading…');
+  const reader = new FileReader();
+  reader.onload = e => {
+    lineageData = parseCSV(e.target.result);
+    setStatus(`✓ ${lineageData.length.toLocaleString()} rows loaded`);
+    document.getElementById('btn-trace').disabled = false;
+    document.getElementById('col-input').focus();
+  };
+  reader.readAsText(file);
+}
+
+function parseCSV(text) {
+  const lines = text.split(/\r?\n/);
+  if (!lines.length) return [];
+  const headers = splitCSVLine(lines[0]);
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    if (!lines[i].trim()) continue;
+    const vals = splitCSVLine(lines[i]);
+    const obj = {};
+    headers.forEach((h, idx) => { obj[h.trim()] = (vals[idx] || '').trim(); });
+    rows.push(obj);
+  }
+  return rows;
+}
+
+function splitCSVLine(line) {
+  const result = [];
+  let cur = '', inQ = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '"') {
+      if (inQ && line[i+1] === '"') { cur += '"'; i++; }
+      else inQ = !inQ;
+    } else if (c === ',' && !inQ) {
+      result.push(cur); cur = '';
+    } else {
+      cur += c;
+    }
+  }
+  result.push(cur);
+  return result;
+}
+
+function setStatus(msg) {
+  document.getElementById('status').textContent = msg;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LINEAGE TRAVERSAL
+// ═══════════════════════════════════════════════════════════════════════════
+
+function traceLineage() {
+  const colName = document.getElementById('col-input').value.trim().toLowerCase();
+  if (!colName) return;
+  if (!lineageData.length) { setStatus('Load CSV first'); return; }
+
+  document.getElementById('loading-overlay').classList.add('active');
+  document.getElementById('graph-hint').style.display = 'none';
+
+  setTimeout(() => {
+    try {
+      const result = buildLineageGraph(colName);
+      renderGraph(result.nodes, result.edges, result.nodeData);
+      setStatus(`${result.nodes.length} nodes, ${result.edges.length} edges`);
+    } catch(err) {
+      setStatus('Error: ' + err.message);
+      console.error(err);
+    }
+    document.getElementById('loading-overlay').classList.remove('active');
+  }, 30);
+}
+
+function buildLineageGraph(colName) {
+  const nodes = [];
+  const edges = [];
+  const nodeData = {};   // nodeId -> {rows: [...], label, schema, table, column}
+  const addedNodes = new Set();
+  const addedEdges = new Set();
+
+  function nodeId(table, column) {
+    return `${(table||'?').toLowerCase()}::${(column||'?').toLowerCase()}`;
+  }
+
+  function ensureNode(table, column, schema, isTarget) {
+    const id = nodeId(table, column);
+    if (addedNodes.has(id)) return id;
+    addedNodes.add(id);
+    nodes.push({ id, table: table || '', column: column || '', schema: schema || '', isTarget });
+    nodeData[id] = { table, column, schema, rows: [], isTarget };
+    return id;
+  }
+
+  function ensureEdge(srcId, tgtId, label) {
+    const eid = `${srcId}->${tgtId}`;
+    if (addedEdges.has(eid)) return;
+    addedEdges.add(eid);
+    edges.push({ from: srcId, to: tgtId, label });
+  }
+
+  // Find all profile tables where target_column = colName and target_table = sub_target_table
+  const profileRows = lineageData.filter(r =>
+    r.target_column && r.target_column.toLowerCase() === colName &&
+    r.target_table && r.sub_target_table &&
+    r.target_table.toLowerCase() === r.sub_target_table.toLowerCase()
+  );
+
+  // Build set of start (table, column) pairs
+  const queue = [];   // [{table, column, schema}]
+  const visited = new Set();
+
+  // Seed from profile tables
+  profileRows.forEach(r => {
+    const key = `${r.target_table}::${colName}`;
+    if (!visited.has(key)) {
+      visited.add(key);
+      queue.push({ table: r.target_table, column: colName, schema: r.target_schema || '' });
+    }
+  });
+
+  // If nothing found via profile filter, just search all records with target_column = colName
+  if (queue.length === 0) {
+    const allRows = lineageData.filter(r =>
+      r.target_column && r.target_column.toLowerCase() === colName
+    );
+    const seen = new Set();
+    allRows.forEach(r => {
+      const tbl = r.sub_target_table || r.target_table || '';
+      if (tbl && !seen.has(tbl.toLowerCase())) {
+        seen.add(tbl.toLowerCase());
+        queue.push({ table: tbl, column: colName, schema: r.target_schema || r.sub_target_schema || '' });
+      }
+    });
+  }
+
+  // BFS traversal
+  const MAX_DEPTH = 20;
+  let depth = 0;
+  const toProcess = [...queue];
+
+  while (toProcess.length && depth < MAX_DEPTH) {
+    const { table, column, schema } = toProcess.shift();
+    depth++;
+
+    const tNodeId = ensureNode(table, column, schema, depth === 1);
+
+    // Find rows in lineage where sub_target_table=table AND target_column=column
+    const rows = lineageData.filter(r =>
+      r.sub_target_table && r.sub_target_table.toLowerCase() === table.toLowerCase() &&
+      r.target_column && r.target_column.toLowerCase() === column.toLowerCase()
+    );
+
+    if (nodeData[tNodeId]) {
+      nodeData[tNodeId].rows.push(...rows);
+    }
+
+    rows.forEach(r => {
+      const srcTbl = r.source_table || '';
+      const srcCol = r.source_column || '';
+      const srcSchema = r.source_schema || '';
+
+      if (!srcTbl && !srcCol) return;
+
+      // If source_table is blank, look up source_column as a target_column
+      if (!srcTbl && srcCol) {
+        const upRows = lineageData.filter(rr =>
+          rr.target_column && rr.target_column.toLowerCase() === srcCol.toLowerCase() &&
+          rr.target_table && rr.sub_target_table &&
+          rr.target_table.toLowerCase() === rr.sub_target_table.toLowerCase()
+        );
+        upRows.forEach(ur => {
+          const sNodeId = ensureNode(ur.target_table, srcCol, ur.target_schema || '', false);
+          ensureEdge(sNodeId, tNodeId, r.sql_process || '');
+          const key = `${ur.target_table}::${srcCol}`;
+          if (!visited.has(key)) {
+            visited.add(key);
+            toProcess.push({ table: ur.target_table, column: srcCol, schema: ur.target_schema || '' });
+          }
+        });
+        return;
+      }
+
+      const sNodeId = ensureNode(srcTbl, srcCol, srcSchema, false);
+      ensureEdge(sNodeId, tNodeId, r.sql_process || '');
+
+      // Check if source_table has its own lineage (it's an intermediate table)
+      const key = `${srcTbl}::${srcCol}`;
+      if (!visited.has(key)) {
+        visited.add(key);
+        const hasLineage = lineageData.some(rr =>
+          rr.sub_target_table && rr.sub_target_table.toLowerCase() === srcTbl.toLowerCase() &&
+          rr.target_column && rr.target_column.toLowerCase() === srcCol.toLowerCase()
+        );
+        if (hasLineage) {
+          toProcess.push({ table: srcTbl, column: srcCol, schema: srcSchema });
+        }
+      }
+    });
+  }
+
+  return { nodes, edges, nodeData };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GRAPH RENDERING
+// ═══════════════════════════════════════════════════════════════════════════
+
+function renderGraph(nodes, edges, nodeData) {
+  // Tear down previous instance
+  if (sigmaInst) { sigmaInst.kill(); sigmaInst = null; }
+
+  if (!nodes.length) {
+    setStatus('No lineage found for that column.');
+    document.getElementById('graph-hint').style.display = 'flex';
+    return;
+  }
+
+  graph = new graphology.Graph({ type: 'directed', multi: false });
+
+  // Layout: layered by depth (Sugiyama-like, simple approach)
+  // Group nodes by table, arrange tables in columns
+  const tableOrder = [];
+  const tableMap = {};
+  nodes.forEach(n => {
+    if (!tableMap[n.table]) {
+      tableMap[n.table] = [];
+      tableOrder.push(n.table);
+    }
+    tableMap[n.table].push(n);
+  });
+
+  // Assign x positions: spread tables across width
+  const W = 900, H = 600;
+  const cols = tableOrder.length;
+  const colW = cols > 1 ? W / (cols - 1) : W / 2;
+
+  let nodePositions = {};
+  tableOrder.forEach((tbl, ti) => {
+    const nodesInTbl = tableMap[tbl];
+    const x = ti * colW;
+    nodesInTbl.forEach((n, ni) => {
+      const y = (ni + 1) * (H / (nodesInTbl.length + 1));
+      nodePositions[n.id] = { x, y };
+    });
+  });
+
+  // Add nodes
+  const schemas = new Set();
+  nodes.forEach(n => {
+    const pos = nodePositions[n.id] || { x: Math.random()*W, y: Math.random()*H };
+    const color = schemaColor(n.schema);
+    schemas.add((n.schema||'').toLowerCase().trim() || '(unknown)');
+    graph.addNode(n.id, {
+      x: pos.x, y: pos.y,
+      size: n.isTarget ? 16 : 10,
+      color,
+      label: `${n.table}\n${n.column}`,
+      _table: n.table, _column: n.column, _schema: n.schema,
+      borderColor: n.isTarget ? '#fff' : color,
+    });
+  });
+
+  // Add edges
+  edges.forEach((e, i) => {
+    if (graph.hasNode(e.from) && graph.hasNode(e.to)) {
+      const eid = `e${i}`;
+      if (!graph.hasEdge(eid)) {
+        graph.addEdge(e.from, e.to, {
+          label: e.label || '',
+          size: 2,
+          color: 'rgba(150,180,255,0.45)',
+          type: 'arrow',
+        });
+      }
+    }
+  });
+
+  // Render
+  const container = document.getElementById('sigma-container');
+  sigmaInst = new Sigma(graph, container, {
+    renderEdgeLabels: false,
+    defaultEdgeType: 'arrow',
+    labelFont: 'Segoe UI, Arial',
+    labelSize: 11,
+    labelColor: { color: '#fff' },
+    edgeLabelSize: 10,
+    minCameraRatio: 0.05,
+    maxCameraRatio: 10,
+    nodeProgramClasses: {},
+    nodeReducer: (node, data) => ({
+      ...data,
+      highlighted: false,
+    }),
+    edgeReducer: (edge, data) => ({
+      ...data,
+    }),
+  });
+
+  // Click handler
+  sigmaInst.on('clickNode', ({ node }) => {
+    showNodeDetail(node, nodeData);
+    // Highlight node
+    graph.setNodeAttribute(node, 'highlighted', true);
+    sigmaInst.refresh();
+  });
+
+  // Hover tooltip
+  const tooltip = document.getElementById('node-tooltip');
+  sigmaInst.on('enterNode', ({ node, event }) => {
+    const attrs = graph.getNodeAttributes(node);
+    tooltip.textContent = `${attrs._table} · ${attrs._column}`;
+    tooltip.style.display = 'block';
+    moveTip(event.original);
+  });
+  sigmaInst.on('leaveNode', () => { tooltip.style.display = 'none'; });
+  container.addEventListener('mousemove', e => { if (tooltip.style.display !== 'none') moveTip(e); });
+  function moveTip(e) {
+    const r = container.getBoundingClientRect();
+    tooltip.style.left = (e.clientX - r.left + 12) + 'px';
+    tooltip.style.top  = (e.clientY - r.top  - 8)  + 'px';
+  }
+
+  // Legend
+  buildLegend(schemas);
+  sigmaFit();
+}
+
+function buildLegend(schemas) {
+  const legend = document.getElementById('legend');
+  const items  = document.getElementById('legend-items');
+  items.innerHTML = '';
+  [...schemas].sort().slice(0, 8).forEach(s => {
+    const el = document.createElement('div');
+    el.className = 'legend-item';
+    const dot = document.createElement('div');
+    dot.className = 'legend-dot';
+    dot.style.background = schemaColor(s);
+    el.appendChild(dot);
+    el.appendChild(document.createTextNode(s || '(unknown)'));
+    items.appendChild(el);
+  });
+  legend.style.display = 'block';
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DETAIL PANEL
+// ═══════════════════════════════════════════════════════════════════════════
+
+function showNodeDetail(nodeId, nodeData) {
+  const nd = nodeData[nodeId];
+  if (!nd) return;
+
+  const panel = document.getElementById('side-content');
+  let html = '';
+
+  // Node identity card
+  html += card('Node Identity', [
+    ['Table',  nd.table  || '', false],
+    ['Column', nd.column || '', false],
+    ['Schema', nd.schema || '', false],
+  ]);
+
+  if (!nd.rows || nd.rows.length === 0) {
+    html += `<div style="color:#aaa; font-size:13px; padding:12px; text-align:center">
+      No lineage records found for this node.<br>This may be a base-level source table.
+    </div>`;
+    panel.innerHTML = html;
+    return;
+  }
+
+  // Group by sql_process
+  const byProcess = {};
+  nd.rows.forEach(r => {
+    const p = r.sql_process || 'unknown';
+    if (!byProcess[p]) byProcess[p] = [];
+    byProcess[p].push(r);
+  });
+
+  ['select', 'select-value', 'select*', 'join', 'where', 'having', 'where-subquery'].forEach(proc => {
+    if (!byProcess[proc]) return;
+    const rows = byProcess[proc];
+
+    // Deduplicate by source_table+source_column+target_column
+    const seen = new Set();
+    const deduped = rows.filter(r => {
+      const k = `${r.source_table}|${r.source_column}|${r.target_column}`;
+      if (seen.has(k)) return false;
+      seen.add(k); return true;
+    });
+
+    deduped.forEach((r, i) => {
+      const badge = badgeHtml(proc);
+      html += `<div class="detail-card">`;
+      html += `<div class="card-header">${badge} Record ${i+1} of ${deduped.length}</div>`;
+      html += fieldRow('Target Table',     r.target_table);
+      html += fieldRow('Target Schema',    r.target_schema);
+      html += fieldRow('Sub-Target Table', r.sub_target_table);
+      html += fieldRow('Sub-Target Schema',r.sub_target_schema);
+      html += fieldRow('Target Column',    r.target_column);
+      html += fieldRow('Source Table',     r.source_table);
+      html += fieldRow('Source Schema',    r.source_schema);
+      html += fieldRow('Source Column',    r.source_column);
+      html += fieldRow('Process',          r.process);
+      html += fieldRow('SQL Process',      r.sql_process);
+      if (r.logic && r.logic.trim()) {
+        html += `<div class="detail-row"><span class="detail-label">Logic</span>
+          <span class="detail-value mono">${escHtml(r.logic.trim().substring(0, 300))}</span></div>`;
+      }
+      html += `</div>`;
+    });
+  });
+
+  panel.innerHTML = html;
+}
+
+function card(title, fields) {
+  let html = `<div class="detail-card"><div class="card-header">${title}</div>`;
+  fields.forEach(([label, val, mono]) => { html += fieldRow(label, val, mono); });
+  html += '</div>';
+  return html;
+}
+
+function fieldRow(label, val, mono = false) {
+  const empty = !val || val.trim() === '';
+  const cls = empty ? 'empty' : (mono ? 'mono' : '');
+  const display = empty ? '—' : escHtml(val);
+  return `<div class="detail-row">
+    <span class="detail-label">${label}</span>
+    <span class="detail-value ${cls}">${display}</span>
+  </div>`;
+}
+
+function badgeHtml(proc) {
+  const map = {
+    'select':        'badge-select',
+    'select-value':  'badge-value',
+    'select*':       'badge-star',
+    'join':          'badge-join',
+    'where':         'badge-where',
+    'having':        'badge-having',
+    'where-subquery':'badge-where',
+  };
+  const cls = map[proc] || 'badge-select';
+  return `<span class="badge ${cls}">${proc}</span>`;
+}
+
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CAMERA CONTROLS
+// ═══════════════════════════════════════════════════════════════════════════
+
+function sigmaZoom(factor) {
+  if (!sigmaInst) return;
+  const cam = sigmaInst.getCamera();
+  cam.animatedZoom({ duration: 200, factor });
+}
+
+function sigmaFit() {
+  if (!sigmaInst) return;
+  sigmaInst.getCamera().animatedReset({ duration: 400 });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ENTER KEY
+// ═══════════════════════════════════════════════════════════════════════════
+
+document.getElementById('col-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') traceLineage();
+});
+
+document.getElementById('btn-trace').disabled = true;
+</script>
+</body>
+</html>

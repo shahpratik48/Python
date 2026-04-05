@@ -660,7 +660,7 @@ def _extract_aliases(query: str) -> Dict[str, Tuple[str, str]]:
     """
     aliases: Dict[str, Tuple[str, str]] = {}
 
-    # First: register named real tables
+    # Register named real tables from FROM/JOIN
     for m in _RC_TBLREF.finditer(query):
         tbl_raw = m.group(2).strip()
         alias_raw = (m.group(4) or '').strip()  # group 4 after negative lookahead fix
@@ -674,11 +674,42 @@ def _extract_aliases(query: str) -> Dict[str, Tuple[str, str]]:
         aliases[alias] = (schema, tbl)
         aliases[tbl_lower] = (schema, tbl)
 
-    # Second: resolve inline subquery aliases  JOIN (SELECT ...) alias
-    inline = _extract_inline_subquery_aliases(query)
-    for alias, (schema, tbl, _) in inline.items():
-        if alias not in aliases:   # don't overwrite a real table alias
-            aliases[alias] = (schema, tbl)
+    # Register inline subquery aliases WITHOUT building col maps (avoids recursion)
+    # Just map alias -> first real table inside the subquery for source resolution
+    pat = re.compile(
+        r'\b(?:FROM|(?:LEFT|RIGHT|FULL|INNER|CROSS)?\s*(?:OUTER\s+)?JOIN)\s*\(',
+        re.IGNORECASE
+    )
+    i = 0
+    n = len(query)
+    while i < n:
+        m = pat.search(query, i)
+        if not m:
+            break
+        try:
+            paren_start = query.index('(', m.start())
+        except ValueError:
+            break
+        paren_end = _find_paren_end(query, paren_start)
+        inner_sql = query[paren_start+1:paren_end].strip()
+        if re.search(r'\bSELECT\b', inner_sql, re.IGNORECASE):
+            after = query[paren_end+1:].lstrip()
+            alias_m = re.match(r'(?:AS\s+)?(\w+)', after, re.IGNORECASE)
+            if alias_m:
+                alias = alias_m.group(1).lower()
+                if alias.upper() not in SQL_KEYWORDS and alias not in aliases:
+                    # Find first real table in the inner SELECT (lightweight scan)
+                    inner_tbls = []
+                    for tm in _RC_TBLREF.finditer(inner_sql):
+                        tr = tm.group(2).strip()
+                        if tr and not tr.startswith('(') and tr.upper() not in SQL_KEYWORDS:
+                            s, t = _parse_table_token(tr)
+                            if t:
+                                inner_tbls.append((s, t))
+                                break
+                    if inner_tbls:
+                        aliases[alias] = inner_tbls[0]
+        i = paren_end + 1
 
     return aliases
 
@@ -1223,12 +1254,27 @@ def _find_last_top_level_word_pos(expr: str, word: str) -> Optional[int]:
 #  CTE COLUMN MAP
 # ===========================================================================
 
+_BUILD_CTE_VISITED: set = set()  # tracks CTE names currently being built (cycle guard)
+
 def _build_cte_col_map(
     cte_name: str, cte_body: str, all_ctes: Dict[str, str]
 ) -> Dict[str, List[Tuple[str, str, str]]]:
     """
     Returns {output_col_lower: [(schema, real_table, real_col), ...]}.
+    Uses a visited-set to prevent mutual recursion cycles.
     """
+    if cte_name in _BUILD_CTE_VISITED:
+        return {}  # cycle detected — return empty rather than recurse
+    _BUILD_CTE_VISITED.add(cte_name)
+    try:
+        return _build_cte_col_map_inner(cte_name, cte_body, all_ctes)
+    finally:
+        _BUILD_CTE_VISITED.discard(cte_name)
+
+
+def _build_cte_col_map_inner(
+    cte_name: str, cte_body: str, all_ctes: Dict[str, str]
+) -> Dict[str, List[Tuple[str, str, str]]]:
     col_map: Dict[str, List[Tuple[str, str, str]]] = {}
 
     inner_ctes, inner_body = _extract_ctes(cte_body)
@@ -1280,9 +1326,8 @@ def _resolve_col_ref(
 ) -> List[Tuple[str, str, str]]:
     """
     Return [(schema, table, col), ...].
-    Handles CTE lookup and single-table inference.
+    Handles CTE lookup, inline subquery virtual CTEs, and single-table inference.
     """
-    # Guard: skip anything that looks like a schema/param reference
     if alias and (alias.upper() in SQL_KEYWORDS or alias.upper() in SQL_FUNCTIONS):
         alias = ''
 
@@ -1293,20 +1338,52 @@ def _resolve_col_ref(
             r = cte_map.get(col.lower())
             if r:
                 return r
-            # Try to resolve from the CTE body directly
             if tbl in all_ctes:
-                inline_map = _build_cte_col_map(tbl, all_ctes[tbl], all_ctes)
-                r2 = inline_map.get(col.lower())
-                if r2:
-                    return r2
+                try:
+                    inline_map = _build_cte_col_map(tbl, all_ctes[tbl], all_ctes)
+                    r2 = inline_map.get(col.lower())
+                    if r2:
+                        return r2
+                except RecursionError:
+                    pass
             return [('', tbl, col)]
-        # Return resolved
         return [(schema, tbl, col)]
     else:
-        # No alias — single-table inference
+        # No alias — single real-table inference
         real_tbls = [(s, t) for s, t in all_from_tables if t.lower() not in all_ctes]
         if len(real_tbls) == 1:
             return [(real_tbls[0][0], real_tbls[0][1], col)]
+
+        # No real tables — check if there's a single CTE/virtual-CTE in scope
+        # (e.g. outer SELECT FROM (SELECT ...) k — all columns come from k)
+        cte_sources = [(s, t) for t, (s, _) in aliases.items()
+                       if s == '__CTE__' and t in cte_col_maps]
+        # Deduplicate by CTE name
+        seen_cte: set = set()
+        unique_ctes = []
+        for s, t in cte_sources:
+            if t not in seen_cte:
+                seen_cte.add(t); unique_ctes.append((s, t))
+
+        if len(unique_ctes) == 1:
+            cte_name = unique_ctes[0][1]
+            cte_map = cte_col_maps.get(cte_name, {})
+            r = cte_map.get(col.lower())
+            if r:
+                return r
+            if cte_name in all_ctes:
+                inline_map = _build_cte_col_map(cte_name, all_ctes[cte_name], all_ctes)
+                r2 = inline_map.get(col.lower())
+                if r2:
+                    return r2
+
+        # Try all CTEs in scope for column lookup
+        for _, cte_name in unique_ctes:
+            cte_map = cte_col_maps.get(cte_name, {})
+            r = cte_map.get(col.lower())
+            if r:
+                return r
+
         return [('', '', col)]
 
 
@@ -1738,6 +1815,50 @@ def _from_tables_raw(query: str) -> List[Tuple[str, str]]:
     return result
 
 
+def _expand_inline_subqueries(
+    query: str,
+    virtual_ctes: dict,
+    virtual_cte_col_maps: dict,
+    all_ctes: dict,
+    _depth: int = 0,
+) -> None:
+    """
+    Find FROM (SELECT ...) alias and JOIN (SELECT ...) alias patterns.
+    Register each as a virtual CTE so outer columns can resolve through it.
+    Mutates virtual_ctes and virtual_cte_col_maps in-place.
+    """
+    if _depth > 2:   # guard against infinite recursion on deeply nested subqueries
+        return
+    pat = re.compile(
+        r'\b(?:FROM|(?:LEFT|RIGHT|FULL|INNER|CROSS)?\s*(?:OUTER\s+)?JOIN)\s*\(',
+        re.IGNORECASE
+    )
+    i = 0
+    n = len(query)
+    while i < n:
+        m = pat.search(query, i)
+        if not m:
+            break
+        paren_start = query.index('(', m.start())
+        paren_end = _find_paren_end(query, paren_start)
+        inner_sql = query[paren_start+1:paren_end].strip()
+        if not re.search(r'\bSELECT\b', inner_sql, re.IGNORECASE):
+            i = paren_end + 1
+            continue
+        after = query[paren_end+1:].lstrip()
+        alias_m = re.match(r'(?:AS\s+)?(\w+)', after, re.IGNORECASE)
+        if alias_m:
+            alias = alias_m.group(1).lower()
+            if alias.upper() not in SQL_KEYWORDS and alias not in virtual_ctes:
+                virtual_ctes[alias] = inner_sql
+                merged = {**all_ctes, **virtual_ctes}
+                try:
+                    virtual_cte_col_maps[alias] = _build_cte_col_map(alias, inner_sql, merged)
+                except RecursionError:
+                    virtual_cte_col_maps[alias] = {}
+        i = paren_end + 1
+
+
 def _parse_file_worker(args: tuple):
     """Top-level worker for multiprocessing — must be picklable."""
     from pathlib import Path as _P2
@@ -1865,6 +1986,21 @@ def extract_lineage_from_sql(
                 branch_aliases_outer[cn] = ('__CTE__', cn)
             branch_tbls_outer = _from_tables_raw(outer_branch) or all_from_tables
 
+
+            # Register inline subqueries  FROM/JOIN (SELECT ...) alias  as virtual CTEs
+            virtual_ctes: dict = {}
+            virtual_cte_col_maps: dict = {}
+            _expand_inline_subqueries(outer_branch, virtual_ctes, virtual_cte_col_maps, all_ctes, _depth=0)
+            merged_ctes = {**all_ctes, **virtual_ctes}
+            merged_col_maps = {**cte_col_maps, **virtual_cte_col_maps}
+            for vn in virtual_ctes:
+                branch_aliases_outer[vn] = ('__CTE__', vn)
+            # Emit lineage rows for each virtual CTE (inner subquery)
+            for vn, vbody in virtual_ctes.items():
+                _emit_cte_rows(vn, vbody, merged_ctes,
+                               file_name_with_ext, file_path, final_table, final_schema,
+                               process, now_ts, rows)
+
             sel_list = _extract_select_list(outer_branch)
             if sel_list:
                 for expr in _split_comma(sel_list):
@@ -1937,7 +2073,7 @@ def extract_lineage_from_sql(
                         continue
 
                     partial_rows = _analyse_expr(
-                        expr, branch_aliases_outer, all_ctes, cte_col_maps, branch_tbls_outer
+                        expr, branch_aliases_outer, merged_ctes, merged_col_maps, branch_tbls_outer
                     )
                     for pr in partial_rows:
                         rows.append(make(
@@ -2002,6 +2138,18 @@ def _emit_cte_rows(
         if not branch_tbls:
             branch_tbls = all_tbls
 
+        # Expand inline FROM (SELECT ...) subqueries as virtual CTEs
+        v_ctes: dict = {}
+        v_cte_maps: dict = {}
+        _expand_inline_subqueries(branch_sql, v_ctes, v_cte_maps, merged, _depth=1)
+        merged_v = {**merged, **v_ctes}
+        cte_col_maps_inner_v = {**cte_col_maps_inner, **v_cte_maps}
+        for vn in v_ctes:
+            branch_aliases[vn] = ('__CTE__', vn)
+        for vn, vbody in v_ctes.items():
+            _emit_cte_rows(vn, vbody, merged_v,
+                           file, path, final_tbl, final_schema, process, now_ts, rows)
+
         sel = _extract_select_list(branch_sql)
         if not sel:
             continue
@@ -2028,7 +2176,7 @@ def _emit_cte_rows(
                         rows.append(_make_row(file, path, final_tbl, final_schema, process, now_ts,
                                               cte_name, '', '*', s_tbl, s_schema, '*', expr, 'select*'))
                     continue
-            partial = _analyse_expr(expr, branch_aliases, merged, cte_col_maps_inner, branch_tbls)
+            partial = _analyse_expr(expr, branch_aliases, merged_v, cte_col_maps_inner_v, branch_tbls)
             for pr in partial:
                 rows.append(_make_row(file, path, final_tbl, final_schema, process, now_ts,
                                       cte_name, '',
