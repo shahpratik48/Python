@@ -415,52 +415,81 @@ def _split_comma(text: str) -> List[str]:
 
 
 def _split_stmts(sql: str) -> List[str]:
-    """Split on top-level semicolons."""
-    stmts, cur, depth = [], [], 0
-    i, n = 0, len(sql)
+    """Split on top-level semicolons. Slice-based for speed."""
+    result, start, depth, i, n = [], 0, 0, 0, len(sql)
     while i < n:
         c = sql[i]
         if c == "'":
-            cur.append(c); i += 1
-            while i < n and sql[i] != "'":
-                if sql[i] == '\\': cur.append(sql[i]); i += 1
-                cur.append(sql[i]); i += 1
-            if i < n: cur.append(sql[i])
-        elif c == '(':
-            depth += 1; cur.append(c)
+            i += 1
+            while i < n:
+                if sql[i] == "'": break
+                if sql[i] == '\\': i += 1
+                i += 1
+        elif c == '(': depth += 1
         elif c == ')':
-            depth -= 1; cur.append(c)
+            if depth > 0: depth -= 1
         elif c == ';' and depth == 0:
-            s = ''.join(cur).strip()
-            if s: stmts.append(s)
-            cur = []
-        else:
-            cur.append(c)
+            chunk = sql[start:i].strip()
+            if chunk: result.append(chunk)
+            start = i + 1
         i += 1
-    s = ''.join(cur).strip()
-    if s: stmts.append(s)
-    return stmts
+    chunk = sql[start:].strip()
+    if chunk: result.append(chunk)
+    return result
 
-
-# ===========================================================================
-#  VALUE / LITERAL DETECTION
-# ===========================================================================
-
+# ── Speed: module-level constants (prevents rebuilding on every call) ──────────
 _LITERAL_PATTERNS = [
-    re.compile(r"^'[^']*'(?:::\w[\w\s]*)?$"),          # 'string'[::type]
-    re.compile(r"^\{\{[^}]+\}\}(?:::\w[\w\s]*)?$"),     # {{params.X}}[::type]
-    re.compile(r"^-?\d+(\.\d+)?(?:::\w[\w\s]*)?$"),     # number[::type]
-    re.compile(r"^(true|false|null)(?:::\w[\w\s]*)?$", re.IGNORECASE),
+    re.compile(r"^'[^']*'(?::\:\w[\w\s]*)?$"),
+    re.compile(r"^\{\{[^}]+\}\}(?::\:\w[\w\s]*)?$"),
+    re.compile(r"^-?\d+(\.\d+)?(?::\:\w[\w\s]*)?$"),
+    re.compile(r"^(true|false|null)(?::\:\w[\w\s]*)?$", re.IGNORECASE),
 ]
-# NOTE: double-quoted "strings" are COLUMN IDENTIFIERS in Postgres/Greenplum, NOT literals.
-
-# System-value pseudo-columns: these have no source table/column —
-# the function itself IS the source.  Source_column = function name/call.
 _SYSTEM_VALUE_TOKENS = {
     'CURRENT_DATE', 'CURRENT_TIMESTAMP', 'CURRENT_TIME',
     'LOCALTIMESTAMP', 'LOCALTIME', 'NOW', 'CLOCK_TIMESTAMP',
     'TRANSACTION_TIMESTAMP', 'STATEMENT_TIMESTAMP',
 }
+_HARD_KW_EXPR = frozenset(SQL_KEYWORDS | {
+    'NEW','OLD','ARRAY',
+    'YEAR','MONTH','DAY','HOUR','MINUTE','SECOND','MILLISECOND','MICROSECOND',
+    'WEEK','DOW','DOY','EPOCH','DECADE','CENTURY','MILLENNIUM',
+    'TIMEZONE','TIMEZONE_HOUR','TIMEZONE_MINUTE','INTERVAL','AT','TIME','ZONE',
+})
+_HARD_KW_OVER = frozenset({
+    'SELECT','FROM','WHERE','AND','OR','NOT','IN','IS','CASE','WHEN','THEN',
+    'ELSE','END','AS','ON','JOIN','LEFT','RIGHT','INNER','OUTER','FULL','CROSS',
+    'GROUP','BY','ORDER','HAVING','LIMIT','DISTINCT','ALL','UNION','NULLS',
+    'LAST','FIRST','ASC','DESC','NULL','TRUE','FALSE','ROWS','RANGE','GROUPS',
+    'PARTITION','OVER','FILTER','BETWEEN','LIKE','ILIKE','UNBOUNDED',
+    'PRECEDING','FOLLOWING','CURRENT','ROW','WINDOW','WITHIN','EXCLUDE',
+})
+_NEVER_ALIAS_SET = frozenset({
+    'FROM','BY','PARTITION','ORDER','ROWS','RANGE','PRECEDING','FOLLOWING',
+    'UNBOUNDED','BETWEEN','AND','OR','NOT','WHEN','THEN',
+    'ON','USING','INTO','SET','WHERE','HAVING','IS','IN','LIKE','ILIKE','WITHIN','GROUPS',
+})
+_SYSONLY_KW = frozenset({
+    'SELECT','FROM','WHERE','AND','OR','NOT','IN','IS','AS','ON',
+    'JOIN','GROUP','BY','ORDER','HAVING','LIMIT','CASE','WHEN','THEN',
+    'ELSE','END','NULL','TRUE','FALSE','BETWEEN','LIKE','ILIKE',
+    'PARTITION','OVER','FILTER','INTERVAL','EXTRACT','EPOCH','DOW',
+    'CONCAT','SUBSTRING','TEXT','INT','INTEGER','NUMERIC',
+    'BIGINT','VARCHAR','TIMESTAMP','DAYS','COALESCE',
+})
+_P_SQ           = re.compile(r"'[^']*'")
+_P_DQ           = re.compile(r'"[^"]*"')
+_P_JINJA        = re.compile(r'\{\{[^}]+\}\}')
+_P_CAST         = re.compile(r'::\s*\w+')
+_P_NUM          = re.compile(r'\b\d+\.?\d*\b')
+_P_DOT_ANY      = re.compile(r'\b\w+\.\w+\b')
+_P_ALIAS_DOTCOL = re.compile(r'\b(\w+)\s*\.\s*("(?:[^"]+)"|\w+)')
+_P_LONE_DQ      = re.compile(r'(?<!\w)"([^"]+)"')
+_P_PART_BY      = re.compile(r'\bPARTITION\s+BY\b', re.IGNORECASE)
+_P_ORDER_BY     = re.compile(r'\bORDER\s+BY\b', re.IGNORECASE)
+_P_PART_STOP    = re.compile(r'\b(PARTITION\s+BY|ORDER\s+BY|ROWS|RANGE|GROUPS|EXCLUDE|FILTER)\b', re.IGNORECASE)
+_P_FROM_M       = re.compile(r'\bFROM\b', re.IGNORECASE)
+_P_WORDS        = re.compile(r'\b([a-zA-Z_]\w*)\b')
+_P_KW_CACHE: dict = {}
 
 def _is_system_value(expr: str) -> bool:
     """Return True if expr is a system pseudo-column (CURRENT_DATE, NOW(), etc.)."""
@@ -524,148 +553,71 @@ def _is_function_name(word: str) -> bool:
 
 
 def _extract_col_refs_from_expr(logic: str) -> List[Tuple[str, str]]:
-    """
-    Extract (table_alias_or_empty, column_name) from an expression.
-    Handles:
-      - alias.col, alias."quoted_col"
-      - plain bare word col
-      - "quoted_col" standalone (no alias)
-    Returns list of (alias, col).
-    """
+    """Extract (alias, col) refs using pre-compiled patterns and module-level sets."""
     refs: List[Tuple[str, str]] = []
-
-    # ── Keywords never valid as column names in expressions ───────────────
-    HARD_KW = {
-        'SELECT','FROM','WHERE','AND','OR','NOT','IN','IS','CASE','WHEN',
-        'THEN','ELSE','END','AS','ON','JOIN','LEFT','RIGHT','INNER','OUTER',
-        'FULL','CROSS','GROUP','BY','ORDER','HAVING','LIMIT','OFFSET',
-        'DISTINCT','ALL','UNION','INTERSECT','EXCEPT','WITH','RECURSIVE',
-        'INSERT','INTO','UPDATE','SET','DELETE','CREATE','TABLE','TEMP',
-        'TEMPORARY','DROP','IF','EXISTS','PARTITION','OVER','TRUE','FALSE',
-        'DISTRIBUTED','GRANT','ALTER','OWNER','TO','RETURNING','VALUES',
-        'FILTER','NULLS','LAST','FIRST','ROWS','RANGE','PRECEDING',
-        'FOLLOWING','UNBOUNDED','CURRENT','ROW','WINDOW','WITHIN',
-        'NATURAL','LATERAL','NO','CYCLE','BETWEEN','LIKE','ILIKE',
-        'ASC','DESC','NULL','ARRAY',
-        # Greenplum/PG trigger row references — never table aliases
-        'NEW','OLD',
-        # EXTRACT datetime fields
-        'YEAR','MONTH','DAY','HOUR','MINUTE','SECOND','MILLISECOND',
-        'MICROSECOND','QUARTER','WEEK','DOW','DOY','EPOCH','DECADE',
-        'CENTURY','MILLENNIUM','TIMEZONE','TIMEZONE_HOUR','TIMEZONE_MINUTE',
-        'INTERVAL','AT','TIME','ZONE',
-    }
-
-    # ── 1. alias."QuotedCol"  or  alias.plain_col ─────────────────────────
-    # Match: word . "quoted" or word . word
-    for m in re.finditer(r'\b(\w+)\s*\.\s*("(?:[^"]+)"|(\w+))', logic):
+    for m in _P_ALIAS_DOTCOL.finditer(logic):
         pfx = m.group(1)
+        if pfx.upper() in SQL_FUNCTIONS or pfx.upper() in _HARD_KW_EXPR or pfx[0].isdigit():
+            continue
         col_raw = m.group(2)
-        if pfx.upper() in SQL_FUNCTIONS or pfx.upper() in HARD_KW:
-            continue
-        if re.match(r'^\d', pfx):
-            continue
-        col = _dequote(col_raw) if col_raw.startswith('"') else col_raw
-        refs.append((pfx.lower(), col))
-
+        refs.append((pfx.lower(), col_raw[1:-1] if col_raw.startswith('"') else col_raw))
     if refs:
         return refs
-
-    # ── 2. Standalone "QuotedCol" (double-quoted identifier, no alias prefix) ─
-    dq_refs = []
-    for m in re.finditer(r'(?<!\w)"([^"]+)"', logic):
-        col = m.group(1)
-        # Not a string inside a function call — trust it's a column identifier
-        dq_refs.append(('', col))
-
-    if dq_refs:
-        return dq_refs
-
-    # ── 3. No alias.col, no quoted — look for plain identifiers ─────────────
-    cleaned = re.sub(r"'[^']*'", ' ', logic)
-    cleaned = re.sub(r'"[^"]*"', ' __QUOTED__ ', cleaned)
-    cleaned = re.sub(r'\{\{[^}]+\}\}', ' __JINJA__ ', cleaned)
-    cleaned = re.sub(r'::\s*\w+', ' ', cleaned)
-    cleaned = re.sub(r'\b\d+\.?\d*\b', ' ', cleaned)
-
-    for m in _RC_WORDS.finditer(cleaned):
+    for m in _P_LONE_DQ.finditer(logic):
+        refs.append(('', m.group(1)))
+    if refs:
+        return refs
+    cl = _P_SQ.sub(' ', logic)
+    cl = _P_DQ.sub(' __Q__ ', cl)
+    cl = _P_JINJA.sub(' __J__ ', cl)
+    cl = _P_CAST.sub(' ', cl)
+    cl = _P_NUM.sub(' ', cl)
+    for m in _P_WORDS.finditer(cl):
         w = m.group(1)
-        if w.upper() in HARD_KW or w.upper() in SQL_FUNCTIONS:
-            continue
-        if w in ('__JINJA__', '__QUOTED__'):
-            continue
-        refs.append(('', w))
-
+        if w.upper() not in _HARD_KW_EXPR and w.upper() not in SQL_FUNCTIONS and w not in ('__J__', '__Q__'):
+            refs.append(('', w))
     return refs
-
-
 def _parse_over_clause(logic: str) -> List[Tuple[str, str]]:
-    """
-    Extract column refs from OVER ( PARTITION BY ... ORDER BY ... ) and FILTER (WHERE ...).
-    Returns [(alias_prefix, col), ...]. Never returns bare alias names as standalone cols.
-    """
+    """Extract col refs from OVER/FILTER clauses. Pre-compiled patterns."""
     refs: List[Tuple[str, str]] = []
-    _HARD = {
-        'SELECT','FROM','WHERE','AND','OR','NOT','IN','IS','CASE','WHEN','THEN',
-        'ELSE','END','AS','ON','JOIN','LEFT','RIGHT','INNER','OUTER','FULL','CROSS',
-        'GROUP','BY','ORDER','HAVING','LIMIT','DISTINCT','ALL','UNION','NULLS',
-        'LAST','FIRST','ASC','DESC','NULL','TRUE','FALSE','ROWS','RANGE','GROUPS',
-        'PARTITION','OVER','FILTER','BETWEEN','LIKE','ILIKE','UNBOUNDED',
-        'PRECEDING','FOLLOWING','CURRENT','ROW','WINDOW','WITHIN','EXCLUDE',
-    }
-
-    # OVER ( PARTITION BY / ORDER BY )
     over_m = _RC_OVER.search(logic)
     if over_m:
-        start = over_m.end() - 1
-        end = _find_paren_end(logic, start)
-        inner = logic[start+1:end]
-        for kw in ['PARTITION BY', 'ORDER BY']:
-            kb_m = re.search(r'\b' + kw + r'\b', inner, re.IGNORECASE)
-            if kb_m:
-                rest = inner[kb_m.end():]
-                stop = re.search(r'\b(PARTITION BY|ORDER BY|ROWS|RANGE|GROUPS|EXCLUDE|FILTER)\b',
-                                 rest, re.IGNORECASE)
+        ep = _find_paren_end(logic, over_m.end() - 1)
+        inner = logic[over_m.end():ep]
+        for pat in (_P_PART_BY, _P_ORDER_BY):
+            km = pat.search(inner)
+            if km:
+                rest = inner[km.end():]
+                stop = _P_PART_STOP.search(rest)
                 clause = rest[:stop.start()] if stop else rest
-                # Prefixed: alias.col
-                for ref_m in _RC_ALIAS_DOT.finditer(clause):
-                    pfx, col = ref_m.group(1), ref_m.group(2)
-                    if pfx.upper() not in _HARD and pfx.upper() not in SQL_FUNCTIONS:
-                        refs.append((pfx.lower(), col))
-                # Plain words only if no prefixed refs found yet for this clause
-                cleaned = re.sub(r'\b\w+\.\w+\b', ' ', clause)
-                cleaned = re.sub(r"'[^']*'", ' ', cleaned)
-                cleaned = re.sub(r'\b\d+\.?\d*\b', ' ', cleaned)
-                for word_m in _RC_WORDS.finditer(cleaned):
-                    w = word_m.group(1)
-                    if w.upper() not in _HARD and w.upper() not in SQL_FUNCTIONS:
-                        if not any(r[1] == w for r in refs):
-                            refs.append(('', w))
-
-    # FILTER (WHERE ...)
+                seen: set = set()
+                for m in _RC_ALIAS_DOT.finditer(clause):
+                    p, c = m.group(1), m.group(2)
+                    if p.upper() not in _HARD_KW_OVER and p.upper() not in SQL_FUNCTIONS:
+                        refs.append((p.lower(), c)); seen.add(c)
+                cl2 = _P_DOT_ANY.sub(' ', clause)
+                cl2 = _P_SQ.sub(' ', cl2); cl2 = _P_NUM.sub(' ', cl2)
+                for m in _P_WORDS.finditer(cl2):
+                    w = m.group(1)
+                    if w.upper() not in _HARD_KW_OVER and w.upper() not in SQL_FUNCTIONS and w not in seen:
+                        refs.append(('', w)); seen.add(w)
     filter_m = _RC_FILTER_W.search(logic)
     if filter_m:
-        start = logic.index('(', filter_m.start())
-        end = _find_paren_end(logic, start)
-        inner = logic[start+1:end]
-        # Prefixed: alias.col
-        for ref_m in _RC_ALIAS_DOT.finditer(inner):
-            pfx, col = ref_m.group(1), ref_m.group(2)
-            if pfx.upper() not in _HARD and pfx.upper() not in SQL_FUNCTIONS:
-                refs.append((pfx.lower(), col))
-        # Plain words
-        cleaned = re.sub(r'\b\w+\.\w+\b', ' ', inner)
-        cleaned = re.sub(r"'[^']*'", ' ', cleaned)
-        cleaned = re.sub(r'\b\d+\.?\d*\b', ' ', cleaned)
-        for word_m in re.finditer(r'\b([a-zA-Z_]\w*)\b', cleaned):
-            w = word_m.group(1)
-            if w.upper() not in _HARD and w.upper() not in SQL_FUNCTIONS:
-                if not any(r[1] == w for r in refs):
-                    refs.append(('', w))
-
+        fp = logic.index('(', filter_m.start())
+        ep2 = _find_paren_end(logic, fp)
+        inner2 = logic[fp+1:ep2]
+        seen2: set = set()
+        for m in _RC_ALIAS_DOT.finditer(inner2):
+            p, c = m.group(1), m.group(2)
+            if p.upper() not in _HARD_KW_OVER and p.upper() not in SQL_FUNCTIONS:
+                refs.append((p.lower(), c)); seen2.add(c)
+        cl3 = _P_DOT_ANY.sub(' ', inner2)
+        cl3 = _P_SQ.sub(' ', cl3); cl3 = _P_NUM.sub(' ', cl3)
+        for m in _P_WORDS.finditer(cl3):
+            w = m.group(1)
+            if w.upper() not in _HARD_KW_OVER and w.upper() not in SQL_FUNCTIONS and w not in seen2:
+                refs.append(('', w)); seen2.add(w)
     return refs
-
-
 def _determine_sql_process(logic: str, refs: List[Tuple[str, str]]) -> str:
     """
     Decide sql_process:
@@ -787,7 +739,7 @@ def _extract_select_list(query: str) -> str:
             if depth < 0:
                 return query[start:i].strip()
         elif depth == 0:
-            if re.match(r'FROM\b', query[i:], re.IGNORECASE) and (i == 0 or not query[i-1:i].isalpha()):
+            if _P_FROM_M.match(query, i) and (i == 0 or not query[i-1].isalpha()):
                 return query[start:i].strip()
         i += 1
     return query[start:].strip()
@@ -904,19 +856,12 @@ def _analyse_expr(
                      logic=expr, sql_process='select-value')]
 
     # (c) Expression uses ONLY system pseudo-cols / pure functions → select-value
-    logic_no_literals = re.sub(r"'[^']*'", ' ', use_logic)
-    logic_no_literals = re.sub(r'\b\d+\.?\d*\b', ' ', logic_no_literals)
-    logic_no_literals = re.sub(r'::\s*\w+', ' ', logic_no_literals)
-    logic_no_literals = re.sub(r'\{\{[^}]+\}\}', ' ', logic_no_literals)
-    word_tokens = re.findall(r'\b([a-zA-Z_]\w*)\b', logic_no_literals)
-    _SYSTEM_ONLY_KW = _SYSTEM_VALUE_TOKENS | SQL_FUNCTIONS | {
-        'SELECT','FROM','WHERE','AND','OR','NOT','IN','IS','AS','ON',
-        'JOIN','GROUP','BY','ORDER','HAVING','LIMIT','CASE','WHEN','THEN',
-        'ELSE','END','NULL','TRUE','FALSE','BETWEEN','LIKE','ILIKE',
-        'PARTITION','OVER','FILTER','INTERVAL','EXTRACT','EPOCH','DOW',
-        'CONCAT','SUBSTRING','TEXT','INT','INTEGER','NUMERIC',
-        'BIGINT','VARCHAR','TIMESTAMP','DAYS','COALESCE',
-    }
+    logic_no_literals = _P_SQ.sub(' ', use_logic)
+    logic_no_literals = _P_NUM.sub(' ', logic_no_literals)
+    logic_no_literals = _P_CAST.sub(' ', logic_no_literals)
+    logic_no_literals = _P_JINJA.sub(' ', logic_no_literals)
+    word_tokens = _P_WORDS.findall(logic_no_literals)
+    _SYSTEM_ONLY_KW = _SYSONLY_KW | _SYSTEM_VALUE_TOKENS | SQL_FUNCTIONS
     real_word_tokens = [w for w in word_tokens if w.upper() not in _SYSTEM_ONLY_KW]
     sys_val_tokens = [w.upper() for w in word_tokens if w.upper() in _SYSTEM_VALUE_TOKENS]
 
@@ -1136,12 +1081,7 @@ def _find_implicit_alias(expr: str) -> Tuple[str, str]:
         after_paren = stripped[close+1:].strip()
         after_paren = re.sub(r'^::\s*\w[\w\s]*', '', after_paren).strip()
         trail_m = re.match(r'^([a-zA-Z_]\w*)\s*$', after_paren)
-        _NEVER = {
-            'FROM','BY','PARTITION','ORDER','ROWS','RANGE','PRECEDING','FOLLOWING',
-            'UNBOUNDED','BETWEEN','AND','OR','NOT','WHEN','THEN',
-            'ON','USING','INTO','SET','WHERE','HAVING','IS','IN',
-            'LIKE','ILIKE','WITHIN','GROUPS',
-        }
+        _NEVER = _NEVER_ALIAS_SET
         if trail_m and trail_m.group(1).upper() not in _NEVER:
             alias_word = trail_m.group(1)
             logic_part = stripped[:close+1].strip()
@@ -1440,40 +1380,37 @@ def _find_top_level_where(query: str) -> int:
 
 
 def _find_top_level_kw_pos(query: str, kw: str) -> int:
-    """Find top-level keyword. Returns index or -1."""
-    kw_upper = kw.upper()
-    kw_lower = kw.lower()
-    fc_u = kw_upper[0]
-    fc_l = kw_lower[0]
-    kw_len = len(kw.split()[0])
-    full_pat = re.compile(r'\b' + kw.replace(' ', r'\s+') + r'\b', re.IGNORECASE)
-    first_pat = re.compile(r'\b' + re.escape(kw.split()[0]) + r'\b', re.IGNORECASE)
-    depth = 0
-    i = 0
-    n = len(query)
+    """Find top-level keyword. Compiled patterns cached in _P_KW_CACHE."""
+    kw_u = kw.upper()
+    if kw_u not in _P_KW_CACHE:
+        w0 = kw.split()[0]
+        _P_KW_CACHE[kw_u] = (
+            w0[0].upper(), w0[0].lower(),
+            re.compile(r'\b' + re.escape(w0) + r'\b', re.IGNORECASE),
+            re.compile(r'\b' + kw.replace(' ', r'\s+') + r'\b', re.IGNORECASE),
+        )
+    fc_u, fc_l, fp, fkp = _P_KW_CACHE[kw_u]
+    depth, i, n = 0, 0, len(query)
     while i < n:
         c = query[i]
         if c == "'":
             i += 1
-            while i < n and query[i] != "'":
+            while i < n:
+                if query[i] == "'": break
                 if query[i] == '\\': i += 1
                 i += 1
         elif c == '"':
             i += 1
             while i < n and query[i] != '"': i += 1
-        elif c == '(':
-            depth += 1
-        elif c == ')':
-            depth -= 1
+        elif c == '(': depth += 1
+        elif c == ')': depth -= 1
         elif depth == 0 and (c == fc_u or c == fc_l):
-            if first_pat.match(query, i) and full_pat.match(query, i):
+            if fp.match(query, i) and fkp.match(query, i):
                 b = query[i-1] if i > 0 else ' '
                 if not (b.isalnum() or b == '_'):
                     return i
         i += 1
     return -1
-
-
 def _where_text(query: str) -> str:
     pos = _find_top_level_where(query)
     if pos == -1:
@@ -1567,13 +1504,11 @@ def _clause_col_rows(clause_text: str, sql_proc: str,
 
     # ── 2. Plain (unaliased) column references ─────────────────────────────
     # Remove string literals, numbers, jinja params, and aliased refs first
-    cleaned = re.sub(r"'[^']*'", ' ', clause_text)
-    cleaned = re.sub(r'\{\{[^}]+\}\}', ' ', cleaned)
-    cleaned = re.sub(r'::\s*\w+', ' ', cleaned)
-    # Remove already-handled alias.col patterns
-    cleaned = re.sub(r'\b\w+\.\w+\b', ' ', cleaned)
-    # Remove numbers
-    cleaned = re.sub(r'\b\d+\.?\d*\b', ' ', cleaned)
+    cleaned = _P_SQ.sub(' ', clause_text)
+    cleaned = _P_JINJA.sub(' ', cleaned)
+    cleaned = _P_CAST.sub(' ', cleaned)
+    cleaned = _P_DOT_ANY.sub(' ', cleaned)
+    cleaned = _P_NUM.sub(' ', cleaned)
 
     # Collect real tables (non-CTE)
     real_tbls = [(s, t) for t, (s, _t) in aliases.items()
@@ -1686,6 +1621,56 @@ def _find_column_in_tables(col_name: str,
     except Exception as e:
         logger.debug(f"Column lookup failed for {col_name}: {e}")
     return '', ''
+
+
+def _parse_file_worker(args: tuple):
+    """Top-level worker for multiprocessing — must be picklable."""
+    from pathlib import Path as _P2
+    fpath, content = args
+    try:
+        rows = extract_lineage_from_sql(content, _P2(fpath).name, fpath, _P2(fpath).parent.name)
+        return rows, None
+    except Exception as e:
+        return [], {'file': fpath, 'error': str(e)}
+
+
+def parse_lineage_parallel(file_dict: dict, n_workers: int = 0) -> tuple:
+    """
+    Fast parallel lineage parser for Jupyter notebooks.
+    Drop-in replacement for the slow serial loop.
+
+    Usage in notebook::
+
+        all_rows, parse_errors = parse_lineage_parallel(file_dict)
+    """
+    import concurrent.futures as _cf
+    import multiprocessing as _mp
+
+    items = list(file_dict.items())
+    n = len(items)
+    if n_workers <= 0:
+        n_workers = min(_mp.cpu_count(), 8)
+
+    all_rows: list = []
+    parse_errors: list = []
+
+    try:
+        chunksize = max(1, n // (n_workers * 4))
+        with _cf.ProcessPoolExecutor(max_workers=n_workers) as pool:
+            for done, (rows, err) in enumerate(pool.map(_parse_file_worker, items, chunksize=chunksize), 1):
+                all_rows.extend(rows)
+                if err: parse_errors.append(err)
+                if done % 100 == 0: print(f'  {done}/{n}...', end='\r')
+    except Exception as exc:
+        logger.warning(f"Parallel failed ({exc}), running serially...")
+        all_rows, parse_errors = [], []
+        for item in items:
+            rows, err = _parse_file_worker(item)
+            all_rows.extend(rows)
+            if err: parse_errors.append(err)
+
+    print(f'  Done: {n} files parsed, {len(all_rows)} records, {len(parse_errors)} errors.      ')
+    return all_rows, parse_errors
 
 
 def extract_lineage_from_sql(
