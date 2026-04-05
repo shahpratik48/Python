@@ -227,7 +227,8 @@ _RC_HAVING      = re.compile(r'\bHAVING\b', re.IGNORECASE)
 _RC_WITH        = re.compile(r'\bWITH\b\s*', re.IGNORECASE)
 _RC_CTE_HEAD    = re.compile(r'(\w+)\s+AS\s*\(', re.IGNORECASE)
 _RC_TBLREF      = re.compile(
-    r'\b(FROM|JOIN)\s+((?:\{\{[^}]+\}\}|\w+)(?:\.(?:\{\{[^}]+\}\}|\w+))?)(?:\s+(?:AS\s+)?(\w+))?',
+    r'\b(FROM|JOIN)\s+((?:\{\{[^}]+\}\}|\w+)(?:\.(?:\{\{[^}]+\}\}|\w+))?)'
+    r'(?:\s+(?:AS\s+)?(?!(LEFT|RIGHT|FULL|INNER|CROSS|OUTER|JOIN|WHERE|ON|GROUP|ORDER|HAVING|LIMIT|SET|DISTRIBUTED|UNION|INTERSECT|EXCEPT)\b)(\w+)(?!\s*\())?',
     re.IGNORECASE)
 _RC_JOIN_FULL   = re.compile(
     r'((?:LEFT|RIGHT|FULL|INNER|CROSS)?\s*(?:OUTER\s+)?JOIN)\s+'
@@ -491,6 +492,18 @@ _P_FROM_M       = re.compile(r'\bFROM\b', re.IGNORECASE)
 _P_WORDS        = re.compile(r'\b([a-zA-Z_]\w*)\b')
 _P_KW_CACHE: dict = {}
 
+# Pre-warm keyword position cache — eliminates re.compile overhead at runtime
+for _kw in ('GROUP BY', 'HAVING', 'ORDER BY', 'LIMIT', 'DISTRIBUTED',
+            'UNION', 'INTERSECT', 'EXCEPT', 'UNION ALL', 'WHERE', 'FROM'):
+    _w0 = _kw.split()[0]
+    _P_KW_CACHE[_kw.upper()] = (
+        _w0[0].upper(), _w0[0].lower(),
+        re.compile(r'\b' + re.escape(_w0) + r'\b', re.IGNORECASE),
+        re.compile(r'\b' + _kw.replace(' ', r'\s+') + r'\b', re.IGNORECASE),
+    )
+del _kw, _w0
+
+
 def _is_system_value(expr: str) -> bool:
     """Return True if expr is a system pseudo-column (CURRENT_DATE, NOW(), etc.)."""
     e = _strip_cast(expr).strip().upper()
@@ -641,30 +654,31 @@ _TBL_TOK = r'((?:\{\{[^}]+\}\}|\w+)(?:\.(?:\{\{[^}]+\}\}|\w+))?)'
 
 def _extract_aliases(query: str) -> Dict[str, Tuple[str, str]]:
     """
-    Scan FROM / JOIN for table references.
+    Scan FROM / JOIN for table references, including inline subqueries.
+    JOIN (SELECT ... FROM real_table) alias  ->  alias -> real_table
     Returns {alias_lower: (schema, tablename)}.
     """
     aliases: Dict[str, Tuple[str, str]] = {}
 
+    # First: register named real tables
     for m in _RC_TBLREF.finditer(query):
         tbl_raw = m.group(2).strip()
-        alias_raw = (m.group(3) or '').strip()
-
+        alias_raw = (m.group(4) or '').strip()  # group 4 after negative lookahead fix
         if tbl_raw.upper() in SQL_KEYWORDS or tbl_raw.upper() in SQL_FUNCTIONS:
             continue
         if tbl_raw.startswith('('):
             continue
-
         schema, tbl = _parse_table_token(tbl_raw)
         tbl_lower = tbl.lower()
-
-        if alias_raw and alias_raw.upper() not in SQL_KEYWORDS:
-            alias = alias_raw.lower()
-        else:
-            alias = tbl_lower
-
+        alias = alias_raw.lower() if alias_raw and alias_raw.upper() not in SQL_KEYWORDS else tbl_lower
         aliases[alias] = (schema, tbl)
         aliases[tbl_lower] = (schema, tbl)
+
+    # Second: resolve inline subquery aliases  JOIN (SELECT ...) alias
+    inline = _extract_inline_subquery_aliases(query)
+    for alias, (schema, tbl, _) in inline.items():
+        if alias not in aliases:   # don't overwrite a real table alias
+            aliases[alias] = (schema, tbl)
 
     return aliases
 
@@ -1623,6 +1637,107 @@ def _find_column_in_tables(col_name: str,
     return '', ''
 
 
+def _split_union_branches(sql: str) -> List[str]:
+    """
+    Split a SELECT (or CTE body) on top-level UNION [ALL] / INTERSECT / EXCEPT.
+    Returns list of individual SELECT branch strings.
+    """
+    branches = []
+    _UNION_PAT = re.compile(
+        r'\bUNION(?:\s+ALL)?\b|\bINTERSECT\b|\bEXCEPT\b',
+        re.IGNORECASE
+    )
+    depth = 0
+    i = 0
+    n = len(sql)
+    start = 0
+    while i < n:
+        c = sql[i]
+        if c == "'":
+            i += 1
+            while i < n:
+                if sql[i] == "'": break
+                if sql[i] == '\\': i += 1
+                i += 1
+        elif c == '"':
+            i += 1
+            while i < n and sql[i] != '"': i += 1
+        elif c == '(':
+            depth += 1
+        elif c == ')':
+            if depth > 0: depth -= 1
+        elif depth == 0:
+            m = _UNION_PAT.match(sql, i)
+            if m:
+                b = sql[i-1] if i > 0 else ' '
+                if not (b.isalnum() or b == '_'):
+                    chunk = sql[start:i].strip()
+                    if chunk:
+                        branches.append(chunk)
+                    start = m.end()
+                    i = m.end()
+                    continue
+        i += 1
+    chunk = sql[start:].strip()
+    if chunk:
+        branches.append(chunk)
+    return branches if len(branches) > 1 else [sql]
+
+
+def _extract_inline_subquery_aliases(query: str) -> Dict[str, Tuple[str, str, str]]:
+    """
+    Find inline subqueries in JOIN/FROM clauses:
+      JOIN (SELECT ... FROM schema.real_table) alias
+    Returns {alias_lower: (schema, real_table, 'subquery')}
+    so _extract_aliases can register them correctly.
+    """
+    result: Dict[str, Tuple[str, str, str]] = {}
+    # Pattern: FROM/JOIN followed by ( ... ) alias
+    pat = re.compile(
+        r'\b(?:FROM|(?:LEFT|RIGHT|FULL|INNER|CROSS)?\s*(?:OUTER\s+)?JOIN)\s*\(',
+        re.IGNORECASE
+    )
+    i = 0
+    n = len(query)
+    while i < n:
+        m = pat.search(query, i)
+        if not m:
+            break
+        # Find the matching closing paren
+        paren_start = query.index('(', m.start())
+        paren_end = _find_paren_end(query, paren_start)
+        inner_sql = query[paren_start+1:paren_end].strip()
+        # Get alias after the closing paren
+        after = query[paren_end+1:].lstrip()
+        alias_m = re.match(r'(?:AS\s+)?(\w+)', after, re.IGNORECASE)
+        if alias_m:
+            alias = alias_m.group(1).lower()
+            # Extract all real tables from the inner subquery
+            inner_from = _from_tables_raw(inner_sql)
+            for schema, tbl in inner_from:
+                result[alias] = (schema, tbl, 'subquery')
+                break  # take first real table as the representative
+        i = paren_end + 1
+    return result
+
+
+def _from_tables_raw(query: str) -> List[Tuple[str, str]]:
+    """Like _from_tables but skips registering aliases — direct FROM/JOIN table list."""
+    seen, result = set(), []
+    for m in _RC_TBLREF.finditer(query):
+        tbl_raw = m.group(2).strip()
+        if tbl_raw.upper() in SQL_KEYWORDS or tbl_raw.upper() in SQL_FUNCTIONS:
+            continue
+        if tbl_raw.startswith('('):
+            continue
+        schema, tbl = _parse_table_token(tbl_raw)
+        key = (schema, tbl)
+        if key not in seen and tbl:
+            seen.add(key)
+            result.append((schema, tbl))
+    return result
+
+
 def _parse_file_worker(args: tuple):
     """Top-level worker for multiprocessing — must be picklable."""
     from pathlib import Path as _P2
@@ -1742,117 +1857,119 @@ def extract_lineage_from_sql(
                 process, now_ts, rows
             )
 
-        # ── SELECT list of outer query ────────────────────────────────
-        sel_list = _extract_select_list(outer_sel)
-        if sel_list:
-            for expr in _split_comma(sel_list):
-                expr = expr.strip()
-                if not expr:
-                    continue
-                # ── Handle SELECT * or a.* ─────────────────────────────────
-                if re.match(r'^(\w+\.)?\*$', expr.strip()):
-                    star_pfx_m = re.match(r'^(\w+)\.\*$', expr.strip())
-                    if star_pfx_m:
-                        pfx = star_pfx_m.group(1).lower()
-                        s_schema, s_tbl = outer_aliases.get(pfx, ('', pfx))
-                        if s_schema == '__CTE__': s_schema = ''
-                        source_tbls = [(s_schema, s_tbl)] if s_tbl else []
-                    else:
-                        source_tbls = [(s, t) for s, t in all_from_tables
-                                       if t and t.lower() not in all_ctes]
-                        s_schema, s_tbl = source_tbls[0] if len(source_tbls) == 1 else ('', '')
+        # ── SELECT list of outer query (handles UNION ALL) ───────────────
+        outer_branches = _split_union_branches(outer_sel)
+        for outer_branch in outer_branches:
+            branch_aliases_outer = _extract_aliases(outer_branch)
+            for cn in all_ctes:
+                branch_aliases_outer[cn] = ('__CTE__', cn)
+            branch_tbls_outer = _from_tables_raw(outer_branch) or all_from_tables
 
-                    # Case A: source is a subquery (FROM (...) alias) — unfold inline
-                    # Detect if outer_sel's FROM is a subquery
-                    from_subq_m = re.search(
-                        r'\bFROM\s*\((.+?)\)\s*(?:AS\s+)?(\w+)\s*(?:;|$|\bWHERE\b|\bJOIN\b)',
-                        outer_sel, re.IGNORECASE | re.DOTALL
-                    )
-                    if from_subq_m and not source_tbls:
-                        inner_sql = from_subq_m.group(1).strip()
-                        inner_alias = (from_subq_m.group(2) or '').lower()
-                        inner_from_tables = _from_tables(inner_sql)
-                        inner_aliases = _extract_aliases(inner_sql)
-                        inner_ctes2, inner_body2 = _extract_ctes(inner_sql)
-                        merged2 = {**all_ctes, **inner_ctes2}
-                        for cn in merged2: inner_aliases[cn] = ('__CTE__', cn)
-                        inner_sel2 = _extract_select_list(inner_body2)
-                        # Emit one row per column from the inner SELECT
-                        if inner_sel2:
-                            for ie in _split_comma(inner_sel2):
-                                ie = ie.strip()
-                                if not ie: continue
-                                i_alias, i_logic = _split_alias(ie)
-                                i_tgt = i_alias or (re.match(r'^(?:\w+\.)?(\w+)(?:::\w+)?$', (i_logic or ie).strip()) or re.match(r'^(\w+)', (i_logic or ie).strip()) or type('', (), {'group': lambda self, x: ''})()).group(1) or ''
-                                i_refs = _extract_col_refs_from_expr(i_logic or ie)
-                                if i_refs:
-                                    for ra, rc in i_refs:
-                                        rl = _resolve_col_ref(ra, rc, inner_aliases, merged2, {}, inner_from_tables)
-                                        for rs, rt, rcol in rl:
-                                            if not rt and inner_from_tables:
-                                                rs2, rt2 = _find_column_in_tables(rcol, inner_from_tables)
-                                                if rt2: rs, rt = rs2, rt2
-                                            rows.append(make(sub_tbl, sub_schema, i_tgt, rt, rs, rcol, ie, 'select*'))
-                                else:
-                                    rows.append(make(sub_tbl, sub_schema, i_tgt, '', '', i_tgt, ie, 'select*'))
-                        # Also emit WHERE of subquery as where-subquery
-                        inner_wh = _where_text(inner_body2)
-                        if inner_wh:
-                            rows.append(make(sub_tbl, sub_schema, '', '', '', '', inner_wh[:2000], 'where-subquery'))
-                            rows.extend(_clause_col_rows(inner_wh, 'where-subquery', inner_aliases,
-                                                         sub_tbl, sub_schema, final_table, final_schema,
-                                                         file_name_with_ext, file_path, process, now_ts))
+            sel_list = _extract_select_list(outer_branch)
+            if sel_list:
+                for expr in _split_comma(sel_list):
+                    expr = expr.strip()
+                    if not expr:
+                        continue
+                    # ── Handle SELECT * or a.* ─────────────────────────────
+                    if re.match(r'^(\w+\.)?\*$', expr.strip()):
+                        star_pfx_m = re.match(r'^(\w+)\.\*$', expr.strip())
+                        if star_pfx_m:
+                            pfx = star_pfx_m.group(1).lower()
+                            s_schema, s_tbl = branch_aliases_outer.get(pfx, ('', pfx))
+                            if s_schema == '__CTE__': s_schema = ''
+                            source_tbls = [(s_schema, s_tbl)] if s_tbl else []
+                        else:
+                            source_tbls = [(s, t) for s, t in branch_tbls_outer
+                                           if t and t.lower() not in all_ctes]
+                            s_schema, s_tbl = source_tbls[0] if len(source_tbls) == 1 else ('', '')
+
+                        from_subq_m = re.search(
+                            r'\bFROM\s*\((.+?)\)\s*(?:AS\s+)?(\w+)\s*(?:;|$|\bWHERE\b|\bJOIN\b)',
+                            outer_branch, re.IGNORECASE | re.DOTALL
+                        )
+                        if from_subq_m and not source_tbls:
+                            inner_sql = from_subq_m.group(1).strip()
+                            inner_from_tables = _from_tables(inner_sql)
+                            inner_aliases = _extract_aliases(inner_sql)
+                            inner_ctes2, inner_body2 = _extract_ctes(inner_sql)
+                            merged2 = {**all_ctes, **inner_ctes2}
+                            for cn in merged2: inner_aliases[cn] = ('__CTE__', cn)
+                            inner_sel2 = _extract_select_list(inner_body2)
+                            if inner_sel2:
+                                for ie in _split_comma(inner_sel2):
+                                    ie = ie.strip()
+                                    if not ie: continue
+                                    i_alias, i_logic = _split_alias(ie)
+                                    bm = re.match(r'^(?:\w+\.)?(\w+)(?:::\w+)?$', (i_logic or ie).strip())
+                                    i_tgt = i_alias or (bm.group(1) if bm else '')
+                                    i_refs = _extract_col_refs_from_expr(i_logic or ie)
+                                    if i_refs:
+                                        for ra, rc in i_refs:
+                                            rl = _resolve_col_ref(ra, rc, inner_aliases, merged2, {}, inner_from_tables)
+                                            for rs, rt, rcol in rl:
+                                                if not rt and inner_from_tables:
+                                                    rs2, rt2 = _find_column_in_tables(rcol, inner_from_tables)
+                                                    if rt2: rs, rt = rs2, rt2
+                                                rows.append(make(sub_tbl, sub_schema, i_tgt, rt, rs, rcol, ie, 'select*'))
+                                    else:
+                                        rows.append(make(sub_tbl, sub_schema, i_tgt, '', '', i_tgt, ie, 'select*'))
+                            inner_wh = _where_text(inner_body2)
+                            if inner_wh:
+                                rows.append(make(sub_tbl, sub_schema, '', '', '', '', inner_wh[:2000], 'where-subquery'))
+                                rows.extend(_clause_col_rows(inner_wh, 'where-subquery', inner_aliases,
+                                                             sub_tbl, sub_schema, final_table, final_schema,
+                                                             file_name_with_ext, file_path, process, now_ts))
+                            continue
+
+                        # Case B: expand via information_schema
+                        expanded = False
+                        for ts_schema, ts_tbl in (source_tbls if source_tbls else [(s_schema, s_tbl)]):
+                            cols_from_db = _get_table_columns(ts_schema, ts_tbl) if ts_tbl else []
+                            if cols_from_db:
+                                for col in cols_from_db:
+                                    rows.append(make(sub_tbl, sub_schema, col, ts_tbl,
+                                                     _resolve_schema_label(ts_schema), col, col, 'select*'))
+                                expanded = True
+                        if not expanded:
+                            rows.append(make(sub_tbl, sub_schema, '*', s_tbl,
+                                             _resolve_schema_label(s_schema), '*', expr, 'select*'))
                         continue
 
-                    # Case B: source is a real table → expand via information_schema
-                    expanded = False
-                    for ts_schema, ts_tbl in (source_tbls if source_tbls else [(s_schema, s_tbl)]):
-                        cols_from_db = _get_table_columns(ts_schema, ts_tbl) if ts_tbl else []
-                        if cols_from_db:
-                            for col in cols_from_db:
-                                rows.append(make(sub_tbl, sub_schema, col, ts_tbl,
-                                                 _resolve_schema_label(ts_schema), col, col, 'select*'))
-                            expanded = True
-                    if not expanded:
-                        rows.append(make(sub_tbl, sub_schema, '*', s_tbl,
-                                         _resolve_schema_label(s_schema), '*', expr, 'select*'))
-                    continue
+                    partial_rows = _analyse_expr(
+                        expr, branch_aliases_outer, all_ctes, cte_col_maps, branch_tbls_outer
+                    )
+                    for pr in partial_rows:
+                        rows.append(make(
+                            sub_tbl, sub_schema,
+                            pr['target_column'], pr['source_table'], pr['source_schema'],
+                            pr['source_column'], pr['logic'], pr['sql_process'],
+                        ))
 
-                partial_rows = _analyse_expr(
-                    expr, outer_aliases, all_ctes, cte_col_maps, all_from_tables
-                )
-                for pr in partial_rows:
-                    rows.append(make(
-                        sub_tbl, sub_schema,
-                        pr['target_column'], pr['source_table'], pr['source_schema'],
-                        pr['source_column'], pr['logic'], pr['sql_process'],
-                    ))
-
-        # ── WHERE ─────────────────────────────────────────────────────
-        wh = _where_text(outer_sel)
-        if wh:
-            rows.append(make(sub_tbl, sub_schema, '', '', '', '', wh[:2000], 'where'))
-            rows.extend(_clause_col_rows(wh, 'where', outer_aliases, sub_tbl, sub_schema,
-                                         final_table, final_schema,
-                                         file_name_with_ext, file_path, process, now_ts))
-
-        # ── JOIN ──────────────────────────────────────────────────────
-        for jkw, tbl_raw, j_alias, on_clause, full_text in _extract_joins(outer_sel):
-            j_schema, j_tbl = _parse_table_token(tbl_raw)
-            rows.append(make(sub_tbl, sub_schema, '', j_tbl, j_schema, '', full_text[:2000], 'join'))
-            if on_clause:
-                rows.extend(_clause_col_rows('ON ' + on_clause, 'join', outer_aliases,
-                                             sub_tbl, sub_schema, final_table, final_schema,
+            # ── WHERE ─────────────────────────────────────────────────
+            wh = _where_text(outer_branch)
+            if wh:
+                rows.append(make(sub_tbl, sub_schema, '', '', '', '', wh[:2000], 'where'))
+                rows.extend(_clause_col_rows(wh, 'where', branch_aliases_outer, sub_tbl, sub_schema,
+                                             final_table, final_schema,
                                              file_name_with_ext, file_path, process, now_ts))
 
-        # ── HAVING ────────────────────────────────────────────────────
-        hv = _having_text(outer_sel)
-        if hv:
-            rows.append(make(sub_tbl, sub_schema, '', '', '', '', hv[:2000], 'having'))
-            rows.extend(_clause_col_rows(hv, 'having', outer_aliases, sub_tbl, sub_schema,
-                                         final_table, final_schema,
-                                         file_name_with_ext, file_path, process, now_ts))
+            # ── HAVING ────────────────────────────────────────────────
+            hv = _having_text(outer_branch)
+            if hv:
+                rows.append(make(sub_tbl, sub_schema, '', '', '', '', hv[:2000], 'having'))
+                rows.extend(_clause_col_rows(hv, 'having', branch_aliases_outer, sub_tbl, sub_schema,
+                                             final_table, final_schema,
+                                             file_name_with_ext, file_path, process, now_ts))
 
+            # ── JOINs ─────────────────────────────────────────────────
+            for jkw, tbl_raw, j_alias, on_clause, full_text in _extract_joins(outer_branch):
+                j_schema, j_tbl = _parse_table_token(tbl_raw)
+                rows.append(make(sub_tbl, sub_schema, '', j_tbl, j_schema, '', full_text[:2000], 'join'))
+                if on_clause:
+                    rows.extend(_clause_col_rows('ON ' + on_clause, 'join', branch_aliases_outer,
+                                                 sub_tbl, sub_schema, final_table, final_schema,
+                                                 file_name_with_ext, file_path, process, now_ts))
     return rows
 
 
@@ -1874,8 +1991,20 @@ def _emit_cte_rows(
     }
     all_tbls = _from_tables(cte_body)
 
-    sel = _extract_select_list(inner_body)
-    if sel:
+    # Handle UNION ALL / UNION — parse each branch independently
+    branches = _split_union_branches(inner_body)
+
+    for branch_sql in branches:
+        branch_aliases = _extract_aliases(branch_sql)
+        for cn in merged:
+            branch_aliases[cn] = ('__CTE__', cn)
+        branch_tbls = _from_tables_raw(branch_sql)
+        if not branch_tbls:
+            branch_tbls = all_tbls
+
+        sel = _extract_select_list(branch_sql)
+        if not sel:
+            continue
         for expr in _split_comma(sel):
             expr = expr.strip()
             if not expr:
@@ -1884,10 +2013,10 @@ def _emit_cte_rows(
                     star_pfx_m = re.match(r'^(\w+)\.\*$', expr.strip())
                     if star_pfx_m:
                         pfx = star_pfx_m.group(1).lower()
-                        s_schema, s_tbl = aliases.get(pfx, ('', pfx))
+                        s_schema, s_tbl = branch_aliases.get(pfx, ('', pfx))
                         if s_schema == '__CTE__': s_schema = ''
-                    elif len(all_tbls) == 1:
-                        s_schema, s_tbl = all_tbls[0]
+                    elif len(branch_tbls) == 1:
+                        s_schema, s_tbl = branch_tbls[0]
                     else:
                         s_schema, s_tbl = '', ''
                     cols_from_db = _get_table_columns(s_schema, s_tbl) if s_tbl else []
@@ -1899,19 +2028,19 @@ def _emit_cte_rows(
                         rows.append(_make_row(file, path, final_tbl, final_schema, process, now_ts,
                                               cte_name, '', '*', s_tbl, s_schema, '*', expr, 'select*'))
                     continue
-            partial = _analyse_expr(expr, aliases, merged, cte_col_maps_inner, all_tbls)
+            partial = _analyse_expr(expr, branch_aliases, merged, cte_col_maps_inner, branch_tbls)
             for pr in partial:
                 rows.append(_make_row(file, path, final_tbl, final_schema, process, now_ts,
                                       cte_name, '',
                                       pr['target_column'], pr['source_table'], pr['source_schema'],
                                       pr['source_column'], pr['logic'], pr['sql_process']))
 
-    wh = _where_text(inner_body)
-    if wh:
-        rows.append(_make_row(file, path, final_tbl, final_schema, process, now_ts,
-                              cte_name, '', '', '', '', '', wh[:2000], 'where'))
-        rows.extend(_clause_col_rows(wh, 'where', aliases, cte_name, '',
-                                     final_tbl, final_schema, file, path, process, now_ts))
+        wh = _where_text(branch_sql)
+        if wh:
+            rows.append(_make_row(file, path, final_tbl, final_schema, process, now_ts,
+                                  cte_name, '', '', '', '', '', wh[:2000], 'where'))
+            rows.extend(_clause_col_rows(wh, 'where', branch_aliases, cte_name, '',
+                                         final_tbl, final_schema, file, path, process, now_ts))
 
 
 # ===========================================================================
