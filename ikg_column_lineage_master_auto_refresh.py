@@ -201,6 +201,70 @@ SQL_FUNCTIONS: Set[str] = {
     "WIDTH_BUCKET","SETSEED","RANDOM",
 }
 
+
+# ===========================================================================
+#  PRE-COMPILED REGEX — compiled once at import time for speed
+# ===========================================================================
+_RC_BLOCK_CMT   = re.compile(r'/\*.*?\*/', re.DOTALL)
+_RC_LINE_CMT    = re.compile(r'--[^\n]*')
+_RC_WS          = re.compile(r'[ \t]+')
+_RC_JINJA       = re.compile(r'\{\{[^}]+\}\}')
+_RC_JINJA_SCH   = re.compile(r'(\{\{[^}]+\}\})\.(.*)')
+_RC_CAST        = re.compile(r'::\s*\w[\w\s,()]*$')
+_RC_SELECT      = re.compile(r'\bSELECT\b\s*', re.IGNORECASE)
+_RC_DISTINCT_SK = re.compile(r'(?:DISTINCT\s*(?:ON\s*\((?:[^()]*|\([^()]*\))*\)\s*)?|ALL\s+)', re.IGNORECASE)
+_RC_DISTINCT_ON = re.compile(r'^DISTINCT\s+ON\s*\(', re.IGNORECASE)
+_RC_FROM_KW     = re.compile(r'\bFROM\b', re.IGNORECASE)
+_RC_AS_KW       = re.compile(r'\bAS\b', re.IGNORECASE)
+_RC_OVER        = re.compile(r'\bOVER\s*\(', re.IGNORECASE)
+_RC_FILTER_W    = re.compile(r'\bFILTER\s*\(\s*WHERE\s+', re.IGNORECASE)
+_RC_FILTER      = re.compile(r'\bFILTER\s*\(', re.IGNORECASE)
+_RC_PART_BY     = re.compile(r'\bPARTITION\s+BY\b', re.IGNORECASE)
+_RC_ORDER_BY    = re.compile(r'\bORDER\s+BY\b', re.IGNORECASE)
+_RC_PART_STOP   = re.compile(r'\b(PARTITION\s+BY|ORDER\s+BY|ROWS|RANGE|GROUPS|EXCLUDE|FILTER)\b', re.IGNORECASE)
+_RC_WHERE       = re.compile(r'\bWHERE\b', re.IGNORECASE)
+_RC_HAVING      = re.compile(r'\bHAVING\b', re.IGNORECASE)
+_RC_WITH        = re.compile(r'\bWITH\b\s*', re.IGNORECASE)
+_RC_CTE_HEAD    = re.compile(r'(\w+)\s+AS\s*\(', re.IGNORECASE)
+_RC_TBLREF      = re.compile(
+    r'\b(FROM|JOIN)\s+((?:\{\{[^}]+\}\}|\w+)(?:\.(?:\{\{[^}]+\}\}|\w+))?)(?:\s+(?:AS\s+)?(\w+))?',
+    re.IGNORECASE)
+_RC_JOIN_FULL   = re.compile(
+    r'((?:LEFT|RIGHT|FULL|INNER|CROSS)?\s*(?:OUTER\s+)?JOIN)\s+'
+    r'((?:\{\{[^}]+\}\}|\w+)(?:\.(?:\{\{[^}]+\}\}|\w+))?)'
+    r'(?:\s+(?:AS\s+)?(\w+))?'
+    r'(?:\s+ON\s+(.*?))?'
+    r'(?=\s*(?:LEFT|RIGHT|FULL|INNER|CROSS|WHERE|GROUP|HAVING|ORDER|LIMIT|DISTRIBUTED|UNION|;|$))',
+    re.IGNORECASE | re.DOTALL)
+_RC_ALIAS_COL   = re.compile(r'\b(\w+)\s*\.\s*("(?:[^"]+)"|\w+)')
+_RC_ALIAS_DOT   = re.compile(r'\b(\w+)\.(\w+)\b')
+_RC_WORDS       = re.compile(r'\b([a-zA-Z_]\w*)\b')
+_RC_NUMS        = re.compile(r'\b\d+\.?\d*\b')
+_RC_SQ          = re.compile(r"'[^']*'")
+_RC_DQ          = re.compile(r'"[^"]*"')
+_RC_AS_TRAIL    = re.compile(r'\bAS\s+', re.IGNORECASE)
+_RC_COUNT_STAR  = re.compile(r'^(COUNT\s*\(\s*(?:DISTINCT\s+)?\*?\s*\))', re.IGNORECASE)
+_RC_CREATE_CTA  = re.compile(
+    r'CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?'
+    r'((?:\{\{[^}]+\}\}|\w+)(?:\.(?:\w+|\{\{[^}]+\}\}))?)'
+    r'\s+AS\s*', re.IGNORECASE)
+_RC_CREATE_TEMP = re.compile(r'\bTEMP(?:ORARY)?\b', re.IGNORECASE)
+_RC_INSERT      = re.compile(
+    r'INSERT\s+INTO\s+((?:\{\{[^}]+\}\}|\w+)(?:\.(?:\w+|\{\{[^}]+\}\}))?)',
+    re.IGNORECASE)
+_RC_SUBQ_ALIAS  = re.compile(r'^\((.+)\)\s*(?:AS\s+)?(\w+)\s*$', re.IGNORECASE | re.DOTALL)
+_RC_FROM_SUBQ   = re.compile(
+    r'\bFROM\s*\((.+?)\)\s*(?:AS\s+)?(\w+)\s*(?:;|$|\bWHERE\b|\bJOIN\b)',
+    re.IGNORECASE | re.DOTALL)
+_RC_STAR        = re.compile(r'^(\w+\.)?\*$')
+_RC_STAR_PFX    = re.compile(r'^(\w+)\.\*$')
+_RC_DQ_TRAIL    = re.compile(r'\s("(?:[^"]+)")\s*$')
+_RC_BARE        = re.compile(r'^(\w+)(?:::\w+)?$')
+_RC_DOTCOL      = re.compile(r'^(\w+)\.(\w+)(?:::\w+)?$')
+_RC_ALIAS_DQ    = re.compile(r'^(\w+)\."([^"]+)"(?:::\w+)?$')
+_RC_ALIAS_SONLY = re.compile(r'^\w+\.\w+(?:::\w[\w\s,()]*)?$')
+_RC_ALIAS_DQONLY= re.compile(r'^\w+\."[^"]+"(?:::\w+)?$')
+
 # ---------------------------------------------------------------------------
 # Airflow helpers
 # ---------------------------------------------------------------------------
@@ -263,15 +327,15 @@ def get_greenplum_credentials() -> Optional[dict]:
 # ===========================================================================
 
 def _strip_comments(sql: str) -> str:
-    sql = re.sub(r'/\*.*?\*/', ' ', sql, flags=re.DOTALL)
-    sql = re.sub(r'--[^\n]*', ' ', sql)
+    sql = _RC_BLOCK_CMT.sub(' ', sql)
+    sql = _RC_LINE_CMT.sub(' ', sql)
     return sql
 
 
 def _normalize(sql: str) -> str:
     sql = _strip_comments(sql)
     sql = sql.replace('\r\n', '\n').replace('\r', '\n')
-    return re.sub(r'[ \t]+', ' ', sql).strip()
+    return _RC_WS.sub(' ', sql).strip()
 
 
 def _jinja_label(token: str) -> str:
@@ -433,7 +497,7 @@ def _extract_literal_src(expr: str) -> str:
 
 def _strip_cast(expr: str) -> str:
     """Remove trailing ::typename (possibly with spaces) from expression."""
-    return re.sub(r'::\s*\w[\w\s,()]*$', '', expr).strip()
+    return _RC_CAST.sub('', expr).strip()
 
 
 def _dequote(name: str) -> str:
@@ -524,7 +588,7 @@ def _extract_col_refs_from_expr(logic: str) -> List[Tuple[str, str]]:
     cleaned = re.sub(r'::\s*\w+', ' ', cleaned)
     cleaned = re.sub(r'\b\d+\.?\d*\b', ' ', cleaned)
 
-    for m in re.finditer(r'\b([a-zA-Z_]\w*)\b', cleaned):
+    for m in _RC_WORDS.finditer(cleaned):
         w = m.group(1)
         if w.upper() in HARD_KW or w.upper() in SQL_FUNCTIONS:
             continue
@@ -551,7 +615,7 @@ def _parse_over_clause(logic: str) -> List[Tuple[str, str]]:
     }
 
     # OVER ( PARTITION BY / ORDER BY )
-    over_m = re.search(r'\bOVER\s*\(', logic, re.IGNORECASE)
+    over_m = _RC_OVER.search(logic)
     if over_m:
         start = over_m.end() - 1
         end = _find_paren_end(logic, start)
@@ -564,7 +628,7 @@ def _parse_over_clause(logic: str) -> List[Tuple[str, str]]:
                                  rest, re.IGNORECASE)
                 clause = rest[:stop.start()] if stop else rest
                 # Prefixed: alias.col
-                for ref_m in re.finditer(r'\b(\w+)\.(\w+)\b', clause):
+                for ref_m in _RC_ALIAS_DOT.finditer(clause):
                     pfx, col = ref_m.group(1), ref_m.group(2)
                     if pfx.upper() not in _HARD and pfx.upper() not in SQL_FUNCTIONS:
                         refs.append((pfx.lower(), col))
@@ -572,20 +636,20 @@ def _parse_over_clause(logic: str) -> List[Tuple[str, str]]:
                 cleaned = re.sub(r'\b\w+\.\w+\b', ' ', clause)
                 cleaned = re.sub(r"'[^']*'", ' ', cleaned)
                 cleaned = re.sub(r'\b\d+\.?\d*\b', ' ', cleaned)
-                for word_m in re.finditer(r'\b([a-zA-Z_]\w*)\b', cleaned):
+                for word_m in _RC_WORDS.finditer(cleaned):
                     w = word_m.group(1)
                     if w.upper() not in _HARD and w.upper() not in SQL_FUNCTIONS:
                         if not any(r[1] == w for r in refs):
                             refs.append(('', w))
 
     # FILTER (WHERE ...)
-    filter_m = re.search(r'\bFILTER\s*\(\s*WHERE\s+', logic, re.IGNORECASE)
+    filter_m = _RC_FILTER_W.search(logic)
     if filter_m:
         start = logic.index('(', filter_m.start())
         end = _find_paren_end(logic, start)
         inner = logic[start+1:end]
         # Prefixed: alias.col
-        for ref_m in re.finditer(r'\b(\w+)\.(\w+)\b', inner):
+        for ref_m in _RC_ALIAS_DOT.finditer(inner):
             pfx, col = ref_m.group(1), ref_m.group(2)
             if pfx.upper() not in _HARD and pfx.upper() not in SQL_FUNCTIONS:
                 refs.append((pfx.lower(), col))
@@ -630,11 +694,7 @@ def _extract_aliases(query: str) -> Dict[str, Tuple[str, str]]:
     """
     aliases: Dict[str, Tuple[str, str]] = {}
 
-    pattern = re.compile(
-        r'\b(FROM|JOIN)\s+' + _TBL_TOK + r'(?:\s+(?:AS\s+)?(\w+))?',
-        re.IGNORECASE
-    )
-    for m in pattern.finditer(query):
+    for m in _RC_TBLREF.finditer(query):
         tbl_raw = m.group(2).strip()
         alias_raw = (m.group(3) or '').strip()
 
@@ -700,16 +760,13 @@ def _extract_ctes(sql: str) -> Tuple[Dict[str, str], str]:
 
 def _extract_select_list(query: str) -> str:
     """Return column list between SELECT [DISTINCT [ON (...)]] and top-level FROM."""
-    sel_m = re.search(r'\bSELECT\b\s*', query, re.IGNORECASE)
+    sel_m = _RC_SELECT.search(query)
     if not sel_m:
         return ''
     start = sel_m.end()
     # Skip DISTINCT ON (...), DISTINCT, or ALL
     rest = query[start:]
-    skip_m = re.match(
-        r'(?:DISTINCT\s*(?:ON\s*\((?:[^()]*|\([^()]*\))*\)\s*)?|ALL\s+)',
-        rest, re.IGNORECASE
-    )
+    skip_m = _RC_DISTINCT_SK.match(rest)
     if skip_m:
         start += skip_m.end()
     depth, i, n = 0, start, len(query)
@@ -755,7 +812,7 @@ def _analyse_expr(
         return []
 
     # ── Skip DISTINCT ON (...) ─────────────────────────────────────────────
-    if re.match(r'^DISTINCT\s+ON\s*\(', expr, re.IGNORECASE):
+    if _RC_DISTINCT_ON.match(expr):
         return []
 
     # ── Subquery expression: (SELECT ...) alias ───────────────────────────
@@ -764,7 +821,7 @@ def _analyse_expr(
         if subq_m:
             inner_sql = subq_m.group(1).strip()
             sub_alias = subq_m.group(2)
-            if re.search(r'\bSELECT\b', inner_sql, re.IGNORECASE):
+            if _RC_SELECT.search(inner_sql):
                 inner_sel = _extract_select_list(inner_sql)
                 inner_from_tables = _from_tables(inner_sql)
                 inner_aliases = _extract_aliases(inner_sql)
@@ -919,7 +976,7 @@ def _analyse_expr(
             target_col = bm.group(1)
 
     # ── Step 3: window function detection ─────────────────────────────────
-    has_over = bool(re.search(r'\bOVER\s*\(', use_logic, re.IGNORECASE))
+    has_over = bool(_RC_OVER.search(use_logic))
 
     main_logic = use_logic
     if has_over:
@@ -1023,9 +1080,11 @@ def _split_alias(expr: str) -> Tuple[str, str]:
     return alias, logic
 
 
-def _find_top_level_as(expr: str) -> Optional[Tuple[int, int]]:
-    """Return (start_of_AS, end_of_AS) if there is a top-level AS keyword, else None."""
-    depth, i, n = 0, 0, len(expr)
+def _find_top_level_as(expr: str):
+    """Return (start, end) of top-level AS keyword, or None."""
+    depth = 0
+    i = 0
+    n = len(expr)
     last_as = None
     while i < n:
         c = expr[i]
@@ -1041,13 +1100,11 @@ def _find_top_level_as(expr: str) -> Optional[Tuple[int, int]]:
             depth += 1
         elif c == ')':
             depth -= 1
-        elif depth == 0:
-            m = re.match(r'\bAS\b', expr[i:], re.IGNORECASE)
-            if m:
-                before = expr[i-1] if i > 0 else ' '
-                after = expr[i+len(m.group()):i+len(m.group())+1] if i+len(m.group()) < n else ' '
-                if not before.isalnum() and before != '_' and not after.isalnum() and after != '_':
-                    last_as = (i, i + len(m.group()) + 1)  # include trailing space
+        elif depth == 0 and (c == 'A' or c == 'a'):
+            if i+2 < n and (expr[i+1] == 'S' or expr[i+1] == 's') and not (expr[i+2].isalnum() or expr[i+2] == '_'):
+                b = expr[i-1] if i > 0 else ' '
+                if not (b.isalnum() or b == '_'):
+                    last_as = (i, i + 3)
         i += 1
     return last_as
 
@@ -1354,59 +1411,65 @@ def _find_final_table(stmts: List[str], file_stem: str) -> Tuple[str, str]:
 # ===========================================================================
 
 def _find_top_level_where(query: str) -> int:
-    """Return index of top-level WHERE keyword, skipping FILTER(WHERE ...) subforms."""
-    depth, i, n = 0, 0, len(query)
+    """Find top-level WHERE (not inside parens/quotes). Returns index or -1."""
+    depth = 0
+    i = 0
+    n = len(query)
     while i < n:
         c = query[i]
-        if c == chr(39):
+        if c == "'":
             i += 1
-            while i < n and query[i] != chr(39):
-                if query[i] == chr(92): i += 1
+            while i < n and query[i] != "'":
+                if query[i] == '\\': i += 1
                 i += 1
-        elif c == chr(34):
+        elif c == '"':
             i += 1
-            while i < n and query[i] != chr(34): i += 1
-        elif c == chr(40):
+            while i < n and query[i] != '"': i += 1
+        elif c == '(':
             depth += 1
-        elif c == chr(41):
+        elif c == ')':
             depth -= 1
-        elif depth == 0:
-            m = re.match(r'\bWHERE\b', query[i:], re.IGNORECASE)
-            if m:
-                before = query[i-1] if i > 0 else chr(32)
-                after = query[i+5:i+6] if i+5 < n else chr(32)
-                if not (before.isalnum() or before == chr(95)) and not (after.isalnum() or after == chr(95)):
+        elif depth == 0 and (c == 'W' or c == 'w'):
+            if _RC_WHERE.match(query, i):
+                b = query[i-1] if i > 0 else ' '
+                a = query[i+5] if i+5 < n else ' '
+                if not (b.isalnum() or b == '_') and not (a.isalnum() or a == '_'):
                     return i
         i += 1
     return -1
 
 
 def _find_top_level_kw_pos(query: str, kw: str) -> int:
-    """Return index of top-level keyword occurrence, or -1."""
-    depth, i, n = 0, 0, len(query)
-    pat = re.compile(r'\b' + re.escape(kw.split()[0]) + r'\b', re.IGNORECASE)
+    """Find top-level keyword. Returns index or -1."""
+    kw_upper = kw.upper()
+    kw_lower = kw.lower()
+    fc_u = kw_upper[0]
+    fc_l = kw_lower[0]
+    kw_len = len(kw.split()[0])
+    full_pat = re.compile(r'\b' + kw.replace(' ', r'\s+') + r'\b', re.IGNORECASE)
+    first_pat = re.compile(r'\b' + re.escape(kw.split()[0]) + r'\b', re.IGNORECASE)
+    depth = 0
+    i = 0
+    n = len(query)
     while i < n:
         c = query[i]
-        if c == chr(39):
+        if c == "'":
             i += 1
-            while i < n and query[i] != chr(39):
-                if query[i] == chr(92): i += 1
+            while i < n and query[i] != "'":
+                if query[i] == '\\': i += 1
                 i += 1
-        elif c == chr(34):
+        elif c == '"':
             i += 1
-            while i < n and query[i] != chr(34): i += 1
-        elif c == chr(40):
+            while i < n and query[i] != '"': i += 1
+        elif c == '(':
             depth += 1
-        elif c == chr(41):
+        elif c == ')':
             depth -= 1
-        elif depth == 0:
-            m = pat.match(query[i:])
-            if m:
-                full_kw = kw.replace(' ', r'\s+')
-                if re.match(r'\b' + full_kw + r'\b', query[i:], re.IGNORECASE):
-                    before = query[i-1] if i > 0 else chr(32)
-                    if not (before.isalnum() or before == chr(95)):
-                        return i
+        elif depth == 0 and (c == fc_u or c == fc_l):
+            if first_pat.match(query, i) and full_pat.match(query, i):
+                b = query[i-1] if i > 0 else ' '
+                if not (b.isalnum() or b == '_'):
+                    return i
         i += 1
     return -1
 
@@ -1478,7 +1541,7 @@ def _clause_col_rows(clause_text: str, sql_proc: str,
     seen = set()
 
     # ── 1. Prefixed: alias.col ─────────────────────────────────────────────
-    for m in re.finditer(r'\b(\w+)\.(\w+)\b', clause_text):
+    for m in _RC_ALIAS_DOT.finditer(clause_text):
         pfx, col = m.group(1).lower(), m.group(2)
         if pfx.upper() in SQL_KEYWORDS or pfx.upper() in SQL_FUNCTIONS:
             continue
@@ -1516,7 +1579,7 @@ def _clause_col_rows(clause_text: str, sql_proc: str,
     real_tbls = [(s, t) for t, (s, _t) in aliases.items()
                  if s not in ('__CTE__', '') and t == _t]
 
-    for m in re.finditer(r'\b([a-zA-Z_]\w*)\b', cleaned):
+    for m in _RC_WORDS.finditer(cleaned):
         w = m.group(1)
         _HARD_KW = {
             'SELECT','FROM','WHERE','AND','OR','NOT','IN','IS','CASE','WHEN',
@@ -2054,15 +2117,36 @@ def run(private_token=None, pg_password=None, use_local_sql=False,
             private_token = get_private_token(allow_prompt=allow_prompt)
         file_dict = _fetch_sql_files_from_gitlab(private_token)
 
-    all_rows, errors = [], []
-    for fpath, content in file_dict.items():
-        fname_ext = Path(fpath).name
-        proc = Path(fpath).parent.name
+    def _parse_file(args):
+        fpath, sql_content = args
         try:
-            all_rows.extend(extract_lineage_from_sql(content, fname_ext, fpath, proc))
+            rows = extract_lineage_from_sql(
+                sql_content, Path(fpath).name, fpath, Path(fpath).parent.name)
+            return rows, None
         except Exception as e:
-            errors.append((fpath, str(e)))
-            logger.warning(f"Error parsing {fpath}: {e}")
+            return [], (fpath, str(e))
+
+    all_rows, errors = [], []
+    items = list(file_dict.items())
+    try:
+        import concurrent.futures as _cf
+        import multiprocessing as _mp
+        n_workers = min(_mp.cpu_count(), 8)
+        logger.info(f"Parsing {len(items)} files using {n_workers} CPU workers...")
+        with _cf.ProcessPoolExecutor(max_workers=n_workers) as pool:
+            for i, (rows, err) in enumerate(pool.map(_parse_file, items, chunksize=20)):
+                all_rows.extend(rows)
+                if err:
+                    errors.append(err)
+                if (i + 1) % 200 == 0:
+                    logger.info(f"  {i+1}/{len(items)} files parsed...")
+    except Exception as e:
+        logger.warning(f"Parallel parse failed ({e}), falling back to serial...")
+        all_rows, errors = [], []
+        for fpath, content in items:
+            rows, err = _parse_file((fpath, content))
+            all_rows.extend(rows)
+            if err: errors.append(err)
 
     logger.info(f"Total records: {len(all_rows)}, Errors: {len(errors)}")
     if errors:
