@@ -1349,6 +1349,24 @@ def _resolve_col_ref(
             return [('', tbl, col)]
         return [(schema, tbl, col)]
     else:
+        # No alias — try virtual CTE col map FIRST before single-table shortcut.
+        # When the outer SELECT references a bare column (e.g. 'assets') and the only
+        # FROM source is an inline subquery alias, look up through its col map so we
+        # get the inner source column (e.g. 'assets_sd') not the outer alias name.
+        cte_sources_early = [(s, t) for t, (s, _) in aliases.items()
+                              if s == '__CTE__' and t in cte_col_maps]
+        seen_e: set = set()
+        unique_ctes_early = []
+        for s, t in cte_sources_early:
+            if t not in seen_e:
+                seen_e.add(t); unique_ctes_early.append((s, t))
+        if unique_ctes_early:
+            for _, cte_name in unique_ctes_early:
+                cte_map = cte_col_maps.get(cte_name, {})
+                r = cte_map.get(col.lower())
+                if r:
+                    return r
+
         # No alias — single real-table inference
         real_tbls = [(s, t) for s, t in all_from_tables if t.lower() not in all_ctes]
         if len(real_tbls) == 1:
@@ -1401,6 +1419,58 @@ def _classify(stmt: str) -> str:
         return 'INSERT'
     return 'OTHER'
 
+
+
+# ===========================================================================
+#  DDL COLUMN EXTRACTION  (for CREATE TABLE col_name type, ... patterns)
+# ===========================================================================
+
+def _extract_ddl_columns(stmt: str) -> List[str]:
+    """
+    Extract ordered column names from a CREATE TABLE DDL statement.
+    Returns list of column names in definition order, empty if not a plain DDL.
+    """
+    s = re.sub(r'\{\{[^}]+\}\}', '__JINJA__', stmt)
+    m = re.search(
+        r'CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?'
+        r'(?:\w+\.)?\w+\s*\(',
+        s, re.IGNORECASE
+    )
+    if not m:
+        return []
+    paren_start = m.end() - 1
+    paren_end   = _find_paren_end(s, paren_start)
+    if paren_end < 0:
+        return []
+    body = s[paren_start + 1 : paren_end]
+    cols: List[str] = []
+    depth = 0
+    current: List[str] = []
+    _SKIP_KW = {'PRIMARY', 'UNIQUE', 'CHECK', 'FOREIGN', 'CONSTRAINT',
+                'PARTITION', 'SUBPARTITION', 'DEFAULT'}
+    for ch in body:
+        if ch == '(':
+            depth += 1; current.append(ch)
+        elif ch == ')':
+            depth -= 1; current.append(ch)
+        elif ch == ',' and depth == 0:
+            col_def = ''.join(current).strip(); current = []
+            if not col_def: continue
+            toks = col_def.split()
+            if not toks or toks[0].upper() in _SKIP_KW: continue
+            cn = toks[0].strip('"').strip('`').strip()
+            if cn and re.match(r'^[A-Za-z_]\w*$', cn):
+                cols.append(cn.lower())
+        else:
+            current.append(ch)
+    if current:
+        col_def = ''.join(current).strip()
+        toks = col_def.split()
+        if toks and toks[0].upper() not in _SKIP_KW:
+            cn = toks[0].strip('"').strip('`').strip()
+            if cn and re.match(r'^[A-Za-z_]\w*$', cn):
+                cols.append(cn.lower())
+    return cols
 
 # ===========================================================================
 #  FINAL TABLE DETECTION
@@ -1930,12 +2000,28 @@ def extract_lineage_from_sql(
                         process, now_ts, sub_tbl, sub_schema, target_col,
                         src_tbl, src_schema, src_col, logic, sql_proc)
 
+    # ── Pre-scan: collect DDL column definitions for each named table ──────
+    # When INSERT INTO has no explicit column list, use these as target_column
+    _ddl_cols_map: Dict[str, List[str]] = {}   # lower(table_name) -> [col, ...]
+    for _stmt in stmts:
+        if _classify(_stmt) == 'CTD':
+            _m = re.search(
+                r'CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?' + _TBL_TOK,
+                _stmt, re.IGNORECASE
+            )
+            if _m:
+                _, _tbl = _parse_table_token(_m.group(1))
+                _cols = _extract_ddl_columns(_stmt)
+                if _tbl and _cols:
+                    _ddl_cols_map[_tbl.lower()] = _cols
+
     for stmt in stmts:
         kind = _classify(stmt)
         if kind not in ('CTA', 'INSERT'):
             continue
 
         # ── Identify sub_target and get select body ───────────────────
+        _insert_target_cols: List[str] = []   # populated below for INSERT kind
         if kind == 'CTA':
             m = re.search(
                 r'CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?' + _TBL_TOK + r'\s+AS\s*',
@@ -1952,9 +2038,24 @@ def extract_lineage_from_sql(
                 continue
             sub_schema, sub_tbl = _parse_table_token(m.group(1))
             select_body = stmt[m.end():].lstrip()
+            # Check for explicit column list: INSERT INTO tbl (col1, col2, ...)
+            _insert_explicit_cols: List[str] = []
             if select_body.startswith('('):
                 ce = _find_paren_end(select_body, 0)
+                _col_list_candidate = select_body[1:ce].strip()
+                # It's a column list if it contains only identifiers and commas (no SELECT)
+                if not re.search(r'\bSELECT\b', _col_list_candidate, re.IGNORECASE):
+                    _insert_explicit_cols = [
+                        c.strip().strip('"').strip() for c in _col_list_candidate.split(',')
+                        if c.strip()
+                    ]
                 select_body = select_body[ce+1:].lstrip()
+            # Determine effective target column list for this INSERT:
+            # priority: explicit col list > DDL col list > derive from SELECT aliases
+            _insert_target_cols: List[str] = (
+                _insert_explicit_cols if _insert_explicit_cols
+                else _ddl_cols_map.get(sub_tbl.lower(), [])
+            )
 
         # ── CTEs from select body ─────────────────────────────────────
         ctes, outer_sel = _extract_ctes(select_body)
@@ -2003,10 +2104,9 @@ def extract_lineage_from_sql(
 
             sel_list = _extract_select_list(outer_branch)
             if sel_list:
-                for expr in _split_comma(sel_list):
-                    expr = expr.strip()
-                    if not expr:
-                        continue
+                _sel_exprs = [e.strip() for e in _split_comma(sel_list) if e.strip()]
+                _expr_idx  = 0   # position counter for DDL column mapping (Fix 1)
+                for expr in _sel_exprs:
                     # ── Handle SELECT * or a.* ─────────────────────────────
                     if re.match(r'^(\w+\.)?\*$', expr.strip()):
                         star_pfx_m = re.match(r'^(\w+)\.\*$', expr.strip())
@@ -2076,11 +2176,63 @@ def extract_lineage_from_sql(
                         expr, branch_aliases_outer, merged_ctes, merged_col_maps, branch_tbls_outer
                     )
                     for pr in partial_rows:
+                        # ── Fix 1: override target_column from DDL col list ──────────
+                        # When INSERT INTO has no explicit column list, use the CREATE
+                        # TABLE DDL column names positionally as target_column.
+                        tgt_col = pr['target_column']
+                        if kind == 'INSERT' and _insert_target_cols:
+                            if _expr_idx < len(_insert_target_cols):
+                                tgt_col = _insert_target_cols[_expr_idx]
+
+                        # ── Fix 2: trace through inline subquery col map ─────────────
+                        # If the source resolves to an inline subquery alias, look up
+                        # the real source_column and source_table from the inner select.
+                        # The inner map may itself reference a table alias — resolve that
+                        # one more level via branch_aliases_outer.
+                        src_tbl    = pr['source_table']
+                        src_schema = pr['source_schema']
+                        src_col    = pr['source_column']
+                        if src_tbl and src_tbl.lower() in virtual_cte_col_maps:
+                            inner_map = virtual_cte_col_maps[src_tbl.lower()]
+                            # Try lookup by source_col first, then by target_col
+                            resolved  = inner_map.get(src_col.lower()) or inner_map.get(tgt_col.lower())
+                            if resolved:
+                                for r_schema, r_tbl, r_col in resolved:
+                                    if not r_tbl:
+                                        continue
+                                    rl = r_tbl.lower()
+                                    # If r_tbl is another virtual CTE alias, recurse one level
+                                    if rl in virtual_cte_col_maps:
+                                        inner2 = virtual_cte_col_maps[rl]
+                                        resolved2 = inner2.get(r_col.lower())
+                                        if resolved2:
+                                            for r2_schema, r2_tbl, r2_col in resolved2:
+                                                if r2_tbl and r2_tbl.lower() not in virtual_cte_col_maps:
+                                                    src_schema = r2_schema
+                                                    src_tbl    = r2_tbl
+                                                    src_col    = r2_col
+                                                    break
+                                    elif rl in branch_aliases_outer:
+                                        # r_tbl is a FROM-clause alias — dereference it
+                                        alias_schema, alias_real_tbl = branch_aliases_outer[rl]
+                                        if alias_schema != '__CTE__' and alias_real_tbl:
+                                            src_schema = alias_schema
+                                            src_tbl    = alias_real_tbl
+                                            src_col    = r_col
+                                        break
+                                    else:
+                                        # r_tbl is an actual table name
+                                        src_schema = r_schema
+                                        src_tbl    = r_tbl
+                                        src_col    = r_col
+                                        break
+
                         rows.append(make(
                             sub_tbl, sub_schema,
-                            pr['target_column'], pr['source_table'], pr['source_schema'],
-                            pr['source_column'], pr['logic'], pr['sql_process'],
+                            tgt_col, src_tbl, src_schema,
+                            src_col, pr['logic'], pr['sql_process'],
                         ))
+                    _expr_idx += 1   # advance after all partial_rows for this expression
 
             # ── WHERE ─────────────────────────────────────────────────
             wh = _where_text(outer_branch)
