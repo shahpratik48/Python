@@ -1736,8 +1736,9 @@ def _make_row(file, path, target_table, target_schema, process, now_ts,
 
 def _get_table_columns(schema: str, table: str) -> List[str]:
     """
-    Fetch column names for a table from information_schema.
-    Resolves Jinja schema params (IKG_SCHEMA -> core_ikg) automatically.
+    Fetch column names for a table/view/MV using pg_catalog (handles tables, views, MVs).
+    Falls back to information_schema if pg_catalog fails.
+    Resolves Jinja schema params automatically.
     """
     actual_schema = _resolve_schema_label(schema) if schema else ''
     key = (actual_schema.lower(), table.lower())
@@ -1749,48 +1750,102 @@ def _get_table_columns(schema: str, table: str) -> List[str]:
     try:
         import pandas as _pd
         if actual_schema:
-            q = (f"SELECT column_name FROM information_schema.columns "
-                 f"WHERE table_schema = '{actual_schema}' AND table_name = '{table}' "
-                 f"ORDER BY ordinal_position")
+            q = (
+                "SELECT a.attname AS column_name "
+                "FROM pg_catalog.pg_class c "
+                "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+                "JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid "
+                "WHERE n.nspname = '" + actual_schema + "' AND c.relname = '" + table + "' "
+                "AND a.attnum > 0 AND NOT a.attisdropped "
+                "AND c.relkind IN ('r','v','m') "
+                "ORDER BY a.attnum"
+            )
         else:
-            q = (f"SELECT column_name FROM information_schema.columns "
-                 f"WHERE table_name = '{table}' ORDER BY ordinal_position LIMIT 200")
+            q = (
+                "SELECT a.attname AS column_name "
+                "FROM pg_catalog.pg_class c "
+                "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+                "JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid "
+                "WHERE c.relname = '" + table + "' "
+                "AND a.attnum > 0 AND NOT a.attisdropped "
+                "AND c.relkind IN ('r','v','m') "
+                "ORDER BY a.attnum LIMIT 500"
+            )
         result = _pd.read_sql(q, _DB_ENGINE)
         cols = result['column_name'].tolist()
+        if not cols:
+            # fallback to information_schema
+            if actual_schema:
+                q2 = ("SELECT column_name FROM information_schema.columns "
+                      "WHERE table_schema = '" + actual_schema + "' "
+                      "AND table_name = '" + table + "' ORDER BY ordinal_position")
+            else:
+                q2 = ("SELECT column_name FROM information_schema.columns "
+                      "WHERE table_name = '" + table + "' ORDER BY ordinal_position LIMIT 500")
+            cols = _pd.read_sql(q2, _DB_ENGINE)['column_name'].tolist()
         _INFO_SCHEMA_CACHE[key] = cols
         return cols
     except Exception as e:
-        logger.debug(f"info_schema lookup failed for {actual_schema}.{table}: {e}")
+        logger.debug(f"pg_catalog lookup failed for {actual_schema}.{table}: {e}")
         _INFO_SCHEMA_CACHE[key] = []
         return []
+
+# Known canonical schemas for unresolved-column lookups
+_LOOKUP_SCHEMAS = (
+    'core_wma_shared', 'sandbox_prj_smart_insights', 'core_ikg',
+    'core_model', 'core_nlg', 'core_in_shared', 'core_wma_shared_masked',
+    'sandbox_wma_shared', 'sandbox_prj_ds_data', 'sandbox_prj_sbl',
+    'sandbox_prj_dsforoverdrive', 'sandbox_prj_adhoc',
+    'sandbox_prj_smart_relationship', 'sandbox_prj_rbat',
+)
 
 
 def _find_column_in_tables(col_name: str,
                            candidate_tables: List[Tuple[str, str]]) -> Tuple[str, str]:
     """
-    Query information_schema to find which table among candidates owns col_name.
+    Use pg_catalog to find which table/view/MV among candidates owns col_name.
+    Searches across all known IKG schemas for unresolved bare columns.
     Returns (schema, table) of the first match, or ('', '') if not found / no DB.
     """
     if not candidate_tables or _DB_ENGINE is None:
         return '', ''
     try:
         import pandas as _pd
+        _SKIP = {'SELECT', 'FROM', 'WHERE', 'JOIN', 'ON', 'AS', 'WITH'}
         tbl_list = list({t for s, t in candidate_tables
-                         if t and t.upper() not in {'SELECT','FROM','WHERE','JOIN','ON'}})
+                         if t and t.upper() not in _SKIP})
         if not tbl_list:
             return '', ''
-        tbl_in = ', '.join(f"'{t}'" for t in tbl_list)
-        q = (f"SELECT table_schema AS source_schema, table_name AS source_table "
-             f"FROM information_schema.columns "
-             f"WHERE column_name = '{col_name}' AND table_name IN ({tbl_in}) "
-             f"LIMIT 1")
+        tbl_in = ', '.join("'" + t + "'" for t in tbl_list)
+
+        # Collect all relevant schemas
+        sch_set = set()
+        for s, t in candidate_tables:
+            rs = _resolve_schema_label(s) if s else ''
+            if rs:
+                sch_set.add(rs)
+        for s in _LOOKUP_SCHEMAS:
+            sch_set.add(s)
+        sch_in = ', '.join("'" + s + "'" for s in sch_set)
+
+        q = (
+            "SELECT n.nspname AS source_schema, c.relname AS source_table "
+            "FROM pg_catalog.pg_class c "
+            "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+            "JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid "
+            "WHERE n.nspname IN (" + sch_in + ") "
+            "AND c.relname IN (" + tbl_in + ") "
+            "AND a.attname = '" + col_name + "' "
+            "AND a.attnum > 0 AND NOT a.attisdropped "
+            "AND c.relkind IN ('r','v','m') "
+            "LIMIT 1"
+        )
         result = _pd.read_sql(q, _DB_ENGINE)
         if not result.empty:
             return result['source_schema'].iloc[0], result['source_table'].iloc[0]
     except Exception as e:
-        logger.debug(f"Column lookup failed for {col_name}: {e}")
+        logger.debug(f"pg_catalog column lookup failed for {col_name}: {e}")
     return '', ''
-
 
 def _split_union_branches(sql: str) -> List[str]:
     """
@@ -1929,9 +1984,22 @@ def _expand_inline_subqueries(
             alias = alias_m.group(1).lower()
             if alias.upper() not in SQL_KEYWORDS and alias not in virtual_ctes:
                 virtual_ctes[alias] = inner_sql
-                merged = {**all_ctes, **virtual_ctes}
+                # Build col map with a SCOPED merged dict:
+                # Use all_ctes (named CTEs) + already-found virtual CTEs at this level,
+                # but do NOT include any entry whose name matches a local alias INSIDE
+                # inner_sql — those will be resolved within inner_sql's own context.
+                # Concretely: extract the aliases used inside inner_sql's body.
+                # If any of them collide with virtual_ctes keys, exclude those outer
+                # entries so the inner resolution stays correct.
+                _inner_aliases_preview = _extract_aliases(inner_sql)
+                # Build scope: named CTEs always in; outer virtual CTEs only if their
+                # name is NOT used as a FROM-alias inside this inner_sql
+                _safe_merged = dict(all_ctes)  # start with named CTEs only
+                for _vk, _vv in virtual_ctes.items():
+                    if _vk not in _inner_aliases_preview:  # no collision → safe to include
+                        _safe_merged[_vk] = _vv
                 try:
-                    virtual_cte_col_maps[alias] = _build_cte_col_map(alias, inner_sql, merged)
+                    virtual_cte_col_maps[alias] = _build_cte_col_map(alias, inner_sql, _safe_merged)
                 except RecursionError:
                     virtual_cte_col_maps[alias] = {}
         i = paren_end + 1
@@ -2103,6 +2171,10 @@ def extract_lineage_from_sql(
             merged_ctes = {**all_ctes, **virtual_ctes}
             merged_col_maps = {**cte_col_maps, **virtual_cte_col_maps}
             for vn in virtual_ctes:
+                # Always mark virtual CTEs at this scope level.
+                # These are the inline subqueries found in THIS SELECT's FROM/JOIN clauses.
+                # Any alias in branch_aliases_outer with the same name came from _extract_aliases
+                # scanning nested subquery text and is NOT the correct outer-scope alias.
                 branch_aliases_outer[vn] = ('__CTE__', vn)
             # Emit lineage rows for each virtual CTE (inner subquery)
             for vn, vbody in virtual_ctes.items():
@@ -2118,16 +2190,50 @@ def extract_lineage_from_sql(
                     # ── Handle SELECT * or a.* ─────────────────────────────
                     if re.match(r'^(\w+\.)?\*$', expr.strip()):
                         star_pfx_m = re.match(r'^(\w+)\.\*$', expr.strip())
-                        if star_pfx_m:
-                            pfx = star_pfx_m.group(1).lower()
-                            s_schema, s_tbl = branch_aliases_outer.get(pfx, ('', pfx))
-                            if s_schema == '__CTE__': s_schema = ''
-                            source_tbls = [(s_schema, s_tbl)] if s_tbl else []
+                        pfx = star_pfx_m.group(1).lower() if star_pfx_m else None
+
+                        # ── Case 1: prefixed alias (e.g. a.*) ──────────────
+                        if pfx:
+                            alias_entry = branch_aliases_outer.get(pfx, ('', pfx))
+                            alias_schema, alias_tbl = alias_entry
+
+                            # 1a: alias is a virtual CTE (inline subquery) → expand via col map
+                            if alias_schema == '__CTE__' and alias_tbl in virtual_cte_col_maps:
+                                vcm = virtual_cte_col_maps[alias_tbl]
+                                for out_col, srcs in vcm.items():
+                                    if out_col == '*':
+                                        continue
+                                    for r_schema, r_tbl, r_col in (srcs or []):
+                                        # Dereference inner aliases if needed
+                                        if r_tbl and r_tbl.lower() in merged_ctes:
+                                            inner2 = merged_col_maps.get(r_tbl.lower(), {})
+                                            resolved2 = inner2.get(r_col.lower())
+                                            if resolved2:
+                                                for r2s, r2t, r2c in resolved2:
+                                                    if not r2t:
+                                                        r2s, r2t = _find_column_in_tables(r2c, list(merged_ctes.items()))
+                                                    rows.append(make(sub_tbl, sub_schema, out_col, r2t, r2s, r2c, expr, 'select*'))
+                                                continue
+                                        if not r_tbl:
+                                            r_schema, r_tbl = _find_column_in_tables(r_col, list(
+                                                (s,t) for t,(s,_) in branch_aliases_outer.items()
+                                                if s != '__CTE__'))
+                                        rows.append(make(sub_tbl, sub_schema, out_col, r_tbl, r_schema, r_col, expr, 'select*'))
+                                _expr_idx += 1
+                                continue
+
+                            # 1b: alias is a real table → expand via pg_catalog
+                            if alias_schema == '__CTE__':
+                                alias_schema = ''
+                            source_tbls = [(alias_schema, alias_tbl)] if alias_tbl else []
+
                         else:
+                            # 1c: bare * → all non-CTE FROM tables
                             source_tbls = [(s, t) for s, t in branch_tbls_outer
                                            if t and t.lower() not in all_ctes]
                             s_schema, s_tbl = source_tbls[0] if len(source_tbls) == 1 else ('', '')
 
+                        # ── Case 2: inline subquery with no prefix match ────
                         from_subq_m = re.search(
                             r'\bFROM\s*\((.+?)\)\s*(?:AS\s+)?(\w+)\s*(?:;|$|\bWHERE\b|\bJOIN\b)',
                             outer_branch, re.IGNORECASE | re.DOTALL
@@ -2138,7 +2244,10 @@ def extract_lineage_from_sql(
                             inner_aliases = _extract_aliases(inner_sql)
                             inner_ctes2, inner_body2 = _extract_ctes(inner_sql)
                             merged2 = {**all_ctes, **inner_ctes2}
-                            for cn in merged2: inner_aliases[cn] = ('__CTE__', cn)
+                            for cn in merged2:
+                                ex = inner_aliases.get(cn)
+                                if not (ex and ex[0] != '__CTE__'):
+                                    inner_aliases[cn] = ('__CTE__', cn)
                             inner_sel2 = _extract_select_list(inner_body2)
                             if inner_sel2:
                                 for ie in _split_comma(inner_sel2):
@@ -2164,9 +2273,13 @@ def extract_lineage_from_sql(
                                 rows.extend(_clause_col_rows(inner_wh, 'where-subquery', inner_aliases,
                                                              sub_tbl, sub_schema, final_table, final_schema,
                                                              file_name_with_ext, file_path, process, now_ts))
+                            _expr_idx += 1
                             continue
 
-                        # Case B: expand via information_schema
+                        # ── Case 3: expand real table via pg_catalog ────────
+                        s_schema = s_tbl = ''
+                        if not pfx and source_tbls:
+                            s_schema, s_tbl = source_tbls[0]
                         expanded = False
                         for ts_schema, ts_tbl in (source_tbls if source_tbls else [(s_schema, s_tbl)]):
                             cols_from_db = _get_table_columns(ts_schema, ts_tbl) if ts_tbl else []
@@ -2177,7 +2290,9 @@ def extract_lineage_from_sql(
                                 expanded = True
                         if not expanded:
                             rows.append(make(sub_tbl, sub_schema, '*', s_tbl,
-                                             _resolve_schema_label(s_schema), '*', expr, 'select*'))
+                                             _resolve_schema_label(s_schema if s_schema else ''),
+                                             '*', expr, 'select*'))
+                        _expr_idx += 1
                         continue
 
                     partial_rows = _analyse_expr(
@@ -2280,7 +2395,10 @@ def _emit_cte_rows(
 
     aliases = _extract_aliases(cte_body)
     for cn in merged:
-        aliases[cn] = ('__CTE__', cn)
+        # Don't overwrite a real-table alias with a CTE marker (same fix as _build_cte_col_map_inner)
+        ex = aliases.get(cn)
+        if not (ex and ex[0] != '__CTE__'):
+            aliases[cn] = ('__CTE__', cn)
 
     cte_col_maps_inner: Dict[str, Dict] = {
         cn: _build_cte_col_map(cn, cb, merged) for cn, cb in inner_ctes.items()
@@ -2293,7 +2411,10 @@ def _emit_cte_rows(
     for branch_sql in branches:
         branch_aliases = _extract_aliases(branch_sql)
         for cn in merged:
-            branch_aliases[cn] = ('__CTE__', cn)
+            # Don't overwrite a real-table alias with a CTE marker
+            ex = branch_aliases.get(cn)
+            if not (ex and ex[0] != '__CTE__'):
+                branch_aliases[cn] = ('__CTE__', cn)
         branch_tbls = _from_tables_raw(branch_sql)
         if not branch_tbls:
             branch_tbls = all_tbls
@@ -2302,12 +2423,42 @@ def _emit_cte_rows(
         v_ctes: dict = {}
         v_cte_maps: dict = {}
         _expand_inline_subqueries(branch_sql, v_ctes, v_cte_maps, merged, _depth=1)
-        merged_v = {**merged, **v_ctes}
+
+        # Build SCOPED merged dict:
+        # - For this branch's LOCAL resolution: inner virtual CTEs override outer ones
+        #   (the inner 'a' inside ine is the one relevant here)
+        # - For recursive _emit_cte_rows calls: pass a scope where the inner virtual CTE
+        #   is scoped to its OWN body, NOT polluting the outer level
+        # We detect name collisions and handle them explicitly:
+        collisions = {vn for vn in v_ctes if vn in merged}  # inner names that shadow outer
+
+        # Local scope for expressions IN THIS branch: inner wins
+        merged_v_local = {**merged, **v_ctes}
+        # Scope for RECURSIVE calls: outer merged + inner, but collision names are
+        # resolved to the INNER body (since we're descending into them)
+        merged_v = merged_v_local  # same for recursion — the inner body is correct scope
+
         cte_col_maps_inner_v = {**cte_col_maps_inner, **v_cte_maps}
         for vn in v_ctes:
-            branch_aliases[vn] = ('__CTE__', vn)
+            # Mark as virtual CTE unless: the existing alias is a real table AND the
+            # virtual CTE col map is empty (e.g. SELECT * with no DB to expand it).
+            # In that case keep the real-table alias so columns resolve to the source table.
+            ex_vn = branch_aliases.get(vn)
+            vcte_map_empty = not v_cte_maps.get(vn)
+            if ex_vn and ex_vn[0] != '__CTE__' and vcte_map_empty:
+                pass  # keep real-table alias — empty col map can't help resolution
+            else:
+                branch_aliases[vn] = ('__CTE__', vn)
         for vn, vbody in v_ctes.items():
-            _emit_cte_rows(vn, vbody, merged_v,
+            # For each inner virtual CTE, build an isolated scope:
+            # start from outer merged (named CTEs only), then add ONLY this inner's
+            # own virtual CTEs — do NOT import outer virtual CTEs with the same name
+            # into the inner scope (they belong to the outer level, not this one).
+            # We separate named CTEs (all_ctes equivalent) from virtual ones by
+            # using merged minus any outer virtual CTE names that collide.
+            inner_scope = {k: v for k, v in merged.items() if k not in collisions}
+            inner_scope[vn] = vbody  # this inner virtual CTE is in scope for itself
+            _emit_cte_rows(vn, vbody, inner_scope,
                            file, path, final_tbl, final_schema, process, now_ts, rows)
 
         sel = _extract_select_list(branch_sql)
@@ -2319,10 +2470,24 @@ def _emit_cte_rows(
                 continue
             if re.match(r'^(\w+\.)?\*$', expr.strip()):
                     star_pfx_m = re.match(r'^(\w+)\.\*$', expr.strip())
-                    if star_pfx_m:
-                        pfx = star_pfx_m.group(1).lower()
-                        s_schema, s_tbl = branch_aliases.get(pfx, ('', pfx))
-                        if s_schema == '__CTE__': s_schema = ''
+                    pfx_e = star_pfx_m.group(1).lower() if star_pfx_m else None
+                    if pfx_e:
+                        alias_entry_e = branch_aliases.get(pfx_e, ('', pfx_e))
+                        ae_schema, ae_tbl = alias_entry_e
+                        # If the prefix is a virtual CTE, expand via its col map
+                        if ae_schema == '__CTE__' and ae_tbl in v_cte_maps:
+                            vcm_e = v_cte_maps[ae_tbl]
+                            for out_col_e, srcs_e in vcm_e.items():
+                                if out_col_e == '*': continue
+                                for r_schema_e, r_tbl_e, r_col_e in (srcs_e or []):
+                                    if not r_tbl_e:
+                                        r_schema_e, r_tbl_e = _find_column_in_tables(r_col_e, branch_tbls)
+                                    rows.append(_make_row(file, path, final_tbl, final_schema, process, now_ts,
+                                                          cte_name, '', out_col_e, r_tbl_e, r_schema_e,
+                                                          r_col_e, expr, 'select*'))
+                            continue
+                        if ae_schema == '__CTE__': ae_schema = ''
+                        s_schema, s_tbl = ae_schema, ae_tbl
                     elif len(branch_tbls) == 1:
                         s_schema, s_tbl = branch_tbls[0]
                     else:
@@ -2331,7 +2496,8 @@ def _emit_cte_rows(
                     if cols_from_db:
                         for col in cols_from_db:
                             rows.append(_make_row(file, path, final_tbl, final_schema, process, now_ts,
-                                                  cte_name, '', col, s_tbl, s_schema, col, expr, 'select*'))
+                                                  cte_name, '', col, s_tbl,
+                                                  _resolve_schema_label(s_schema), col, expr, 'select*'))
                     else:
                         rows.append(_make_row(file, path, final_tbl, final_schema, process, now_ts,
                                               cte_name, '', '*', s_tbl, s_schema, '*', expr, 'select*'))
