@@ -1282,6 +1282,14 @@ def _build_cte_col_map_inner(
 
     aliases = _extract_aliases(cte_body)
     for cn in merged:
+        # Do NOT overwrite an alias that already resolves to a real table.
+        # e.g. when building the col map for virtual CTE 'a', the inner FROM
+        # clause "FROM asset_security_hist a" correctly sets aliases['a'] ->
+        # asset_security_hist.  Overwriting it with ('__CTE__', 'a') loses that
+        # mapping and causes source_table to remain as the alias name 'a'.
+        existing = aliases.get(cn)
+        if existing and existing[0] != '__CTE__':
+            continue   # real-table alias wins — keep it
         aliases[cn] = ('__CTE__', cn)
 
     sel = _extract_select_list(inner_body)
