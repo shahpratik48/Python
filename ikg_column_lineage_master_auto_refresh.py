@@ -106,11 +106,32 @@ def _resolve_schema_label(schema_label: str) -> str:
     return schema_label
 
 COLUMN_ORDER = [
-    "file", "path", "target_table", "target_schema", "process",
+    "file", "path", "web_url", "target_table", "target_schema", "process",
     "current_date_time", "sub_target_table", "sub_target_schema",
     "target_column", "source_table", "source_schema", "source_column",
     "logic", "sql_process",
 ]
+
+# Base URL for web_url generation
+_GITLAB_BASE = (
+    "https://devcloud.ubs.net/ubs/gwma/smart-technology-and-analytics/"
+    "staat-data-science/staat-ds-genesis/genesis-platform/ikg-dags/-/blob/"
+    "develop/"
+)
+
+def _build_web_url(file_path: str) -> str:
+    """Convert absolute file_path to GitLab blob URL."""
+    if not file_path:
+        return ""
+    # Normalise separators
+    fp = file_path.replace("\\", "/").replace("\\", "/")
+    # Find the 'dags/' anchor in the path
+    marker = "dags/"
+    idx = fp.find(marker)
+    if idx >= 0:
+        relative = fp[idx:]  # e.g. dags/ikg/scripts/sql/...
+        return _GITLAB_BASE + relative
+    return ""
 
 # SQL reserved words that can NEVER be column / table names
 SQL_KEYWORDS: Set[str] = {
@@ -1721,6 +1742,7 @@ def _make_row(file, path, target_table, target_schema, process, now_ts,
               logic, sql_process) -> Dict[str, Any]:
     return {
         'file': file, 'path': path,
+        'web_url': _build_web_url(path),
         'target_table': target_table, 'target_schema': target_schema,
         'process': process, 'current_date_time': now_ts,
         'sub_target_table': sub_tbl, 'sub_target_schema': sub_schema,
@@ -2091,6 +2113,10 @@ def extract_lineage_from_sql(
                 if _tbl and _cols:
                     _ddl_cols_map[_tbl.lower()] = _cols
 
+    # Collect all virtual CTE qualified names (inline subquery aliases) across all statements.
+    # These should never appear as real source_table or sub_target_table values.
+    _all_vcte_names: set = set()
+
     for stmt in stmts:
         kind = _classify(stmt)
         if kind not in ('CTA', 'INSERT'):
@@ -2170,6 +2196,7 @@ def extract_lineage_from_sql(
             _expand_inline_subqueries(outer_branch, virtual_ctes, virtual_cte_col_maps, all_ctes, _depth=0)
             merged_ctes = {**all_ctes, **virtual_ctes}
             merged_col_maps = {**cte_col_maps, **virtual_cte_col_maps}
+            _all_vcte_names.update(virtual_ctes.keys())  # track flat virtual CTE names
             for vn in virtual_ctes:
                 # Always mark virtual CTEs at this scope level.
                 # These are the inline subqueries found in THIS SELECT's FROM/JOIN clauses.
@@ -2381,15 +2408,59 @@ def extract_lineage_from_sql(
                     rows.extend(_clause_col_rows('ON ' + on_clause, 'join', branch_aliases_outer,
                                                  sub_tbl, sub_schema, final_table, final_schema,
                                                  file_name_with_ext, file_path, process, now_ts))
+    # ── Post-process: remove virtual CTE aliases from source_table / sub_target_table ──
+    # Collect ALL qualified virtual CTE names that appear as sub_target_table in rows.
+    # These include dotted names like 'a.man', 'a.ine.a' produced by _emit_cte_rows.
+    _emitted_vcte_names = set()
+    for r in rows:
+        stt = r.get('sub_target_table', '')
+        # A sub_target_table is a virtual CTE if it's NOT the final target table
+        # AND it's NOT a known named CTE (WITH clause CTE).
+        # Named CTEs are also tracked — but they ARE real logical units.
+        # The simplest heuristic: it's a virtual CTE if it contains '.' (qualified name)
+        # OR if it's in _all_vcte_names (flat virtual CTE names from inline subqueries).
+        if stt and stt != final_table and ('.' in stt or stt in _all_vcte_names):
+            _emitted_vcte_names.add(stt)
+
+    if _emitted_vcte_names:
+        cleaned = []
+        for r in rows:
+            src_tbl = r.get('source_table', '')
+            sub_tbl = r.get('sub_target_table', '')
+
+            # Fix source_table: if it's a virtual CTE name, clear it
+            # (the actual source is already tracked through the CTE's own rows)
+            if src_tbl in _emitted_vcte_names:
+                r = dict(r)
+                r['source_table'] = ''
+                r['source_schema'] = ''
+
+            # Fix sub_target_table: if it's a virtual CTE, re-home to final_table
+            # so all lineage is attributed to the real physical target
+            if sub_tbl in _emitted_vcte_names:
+                r = dict(r)
+                r['sub_target_table'] = final_table
+                r['sub_target_schema'] = final_schema
+
+            cleaned.append(r)
+        rows = cleaned
+
     return rows
 
 
 def _emit_cte_rows(
     cte_name: str, cte_body: str, all_ctes: Dict[str, str],
     file: str, path: str, final_tbl: str, final_schema: str,
-    process: str, now_ts: datetime, rows: List[Dict[str, Any]]
+    process: str, now_ts: datetime, rows: List[Dict[str, Any]],
+    parent_prefix: str = "",
 ):
-    """Parse one CTE body and emit rows with sub_target_table = cte_name."""
+    """Parse one CTE body and emit rows with sub_target_table = scoped name.
+
+    parent_prefix: dot-separated ancestor chain, e.g. "a" so that nested
+    virtual CTEs get names like "a.man", "a.ine", "a.ine.a".
+    """
+    # Build the fully-qualified name for this CTE
+    qualified_name = (parent_prefix + "." + cte_name) if parent_prefix else cte_name
     inner_ctes, inner_body = _extract_ctes(cte_body)
     merged = {**all_ctes, **inner_ctes}
 
@@ -2459,7 +2530,8 @@ def _emit_cte_rows(
             inner_scope = {k: v for k, v in merged.items() if k not in collisions}
             inner_scope[vn] = vbody  # this inner virtual CTE is in scope for itself
             _emit_cte_rows(vn, vbody, inner_scope,
-                           file, path, final_tbl, final_schema, process, now_ts, rows)
+                           file, path, final_tbl, final_schema, process, now_ts, rows,
+                           parent_prefix=qualified_name)
 
         sel = _extract_select_list(branch_sql)
         if not sel:
@@ -2483,7 +2555,7 @@ def _emit_cte_rows(
                                     if not r_tbl_e:
                                         r_schema_e, r_tbl_e = _find_column_in_tables(r_col_e, branch_tbls)
                                     rows.append(_make_row(file, path, final_tbl, final_schema, process, now_ts,
-                                                          cte_name, '', out_col_e, r_tbl_e, r_schema_e,
+                                                          qualified_name, '', out_col_e, r_tbl_e, r_schema_e,
                                                           r_col_e, expr, 'select*'))
                             continue
                         if ae_schema == '__CTE__': ae_schema = ''
@@ -2496,24 +2568,24 @@ def _emit_cte_rows(
                     if cols_from_db:
                         for col in cols_from_db:
                             rows.append(_make_row(file, path, final_tbl, final_schema, process, now_ts,
-                                                  cte_name, '', col, s_tbl,
+                                                  qualified_name, '', col, s_tbl,
                                                   _resolve_schema_label(s_schema), col, expr, 'select*'))
                     else:
                         rows.append(_make_row(file, path, final_tbl, final_schema, process, now_ts,
-                                              cte_name, '', '*', s_tbl, s_schema, '*', expr, 'select*'))
+                                              qualified_name, '', '*', s_tbl, s_schema, '*', expr, 'select*'))
                     continue
             partial = _analyse_expr(expr, branch_aliases, merged_v, cte_col_maps_inner_v, branch_tbls)
             for pr in partial:
                 rows.append(_make_row(file, path, final_tbl, final_schema, process, now_ts,
-                                      cte_name, '',
+                                      qualified_name, '',
                                       pr['target_column'], pr['source_table'], pr['source_schema'],
                                       pr['source_column'], pr['logic'], pr['sql_process']))
 
         wh = _where_text(branch_sql)
         if wh:
             rows.append(_make_row(file, path, final_tbl, final_schema, process, now_ts,
-                                  cte_name, '', '', '', '', '', wh[:2000], 'where'))
-            rows.extend(_clause_col_rows(wh, 'where', branch_aliases, cte_name, '',
+                                  qualified_name, '', '', '', '', '', wh[:2000], 'where'))
+            rows.extend(_clause_col_rows(wh, 'where', branch_aliases, qualified_name, '',
                                          final_tbl, final_schema, file, path, process, now_ts))
 
 
