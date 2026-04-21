@@ -1035,9 +1035,13 @@ def _analyse_expr(
             alias_pfx, col, aliases, all_ctes, cte_col_maps, all_from_tables
         )
         for res_schema, res_tbl, res_col in resolved:
-            # If no table resolved and we have a DB, try information_schema
+            # If no table resolved, search the current query's FROM tables first
+            # (strict — only these tables, not the broad LOOKUP_SCHEMAS list).
+            # This ensures bare columns like is_529_desc resolve to account_flags
+            # rather than guessing from a global schema list.
             if not res_tbl and all_from_tables:
-                is2, it2 = _find_column_in_tables(res_col, all_from_tables)
+                is2, it2 = _find_column_in_tables(res_col, all_from_tables,
+                                                   strict_candidates_only=True)
                 if it2:
                     res_schema, res_tbl = is2, it2
             rows.append(dict(
@@ -1816,17 +1820,17 @@ def _get_table_columns(schema: str, table: str) -> List[str]:
 _LOOKUP_SCHEMAS = (
     'core_wma_shared', 'sandbox_prj_smart_insights', 'core_ikg',
     'core_model', 'core_nlg', 'core_in_shared', 'core_wma_shared_masked',
-    'sandbox_wma_shared', 'sandbox_prj_ds_data', 'sandbox_prj_sbl',
-    'sandbox_prj_dsforoverdrive', 'sandbox_prj_adhoc',
-    'sandbox_prj_smart_relationship', 'sandbox_prj_rbat',
 )
 
 
 def _find_column_in_tables(col_name: str,
-                           candidate_tables: List[Tuple[str, str]]) -> Tuple[str, str]:
+                           candidate_tables: List[Tuple[str, str]],
+                           strict_candidates_only: bool = False) -> Tuple[str, str]:
     """
     Use pg_catalog to find which table/view/MV among candidates owns col_name.
-    Searches across all known IKG schemas for unresolved bare columns.
+    When strict_candidates_only=True, searches ONLY the provided candidate tables
+    (i.e. those in the current query's FROM clause) — no fallback to LOOKUP_SCHEMAS.
+    When False (default), also searches LOOKUP_SCHEMAS as a broader fallback.
     Returns (schema, table) of the first match, or ('', '') if not found / no DB.
     """
     if not candidate_tables or _DB_ENGINE is None:
@@ -1842,14 +1846,19 @@ def _find_column_in_tables(col_name: str,
         # For case-insensitive matching: compare LOWER(c.relname) to lowercased names
         tbl_in_lower = ', '.join("'" + t.lower() + "'" for t in tbl_list)
 
-        # Collect all relevant schemas
+        # Collect schemas: always include candidate table schemas.
+        # Only add LOOKUP_SCHEMAS when strict_candidates_only is False.
         sch_set = set()
         for s, t in candidate_tables:
             rs = _resolve_schema_label(s) if s else ''
             if rs:
                 sch_set.add(rs.lower())
-        for s in _LOOKUP_SCHEMAS:
-            sch_set.add(s.lower())
+        if not strict_candidates_only:
+            for s in _LOOKUP_SCHEMAS:
+                sch_set.add(s.lower())
+        if not sch_set:
+            # No schemas known — fall back to LOOKUP_SCHEMAS
+            sch_set = {s.lower() for s in _LOOKUP_SCHEMAS}
         sch_in = ', '.join("'" + s + "'" for s in sch_set)
 
         q = (
@@ -2149,6 +2158,7 @@ def extract_lineage_from_sql(
     # Collect all virtual CTE qualified names (inline subquery aliases) across all statements.
     # These should never appear as real source_table or sub_target_table values.
     _all_vcte_names: set = set()
+    _all_named_cte_names: set = set()  # WITH clause CTE names across all statements
 
 
 
@@ -2196,6 +2206,7 @@ def extract_lineage_from_sql(
 
         # ── CTEs from select body ─────────────────────────────────────
         ctes, outer_sel = _extract_ctes(select_body)
+        _all_named_cte_names.update(ctes.keys())  # track for post-processing
 
         outer_aliases = _extract_aliases(outer_sel)
         for cn in ctes:
@@ -2324,7 +2335,7 @@ def extract_lineage_from_sql(
                                             rl = _resolve_col_ref(ra, rc, inner_aliases, merged2, {}, inner_from_tables)
                                             for rs, rt, rcol in rl:
                                                 if not rt and inner_from_tables:
-                                                    rs2, rt2 = _find_column_in_tables(rcol, inner_from_tables)
+                                                    rs2, rt2 = _find_column_in_tables(rcol, inner_from_tables, strict_candidates_only=True)
                                                     if rt2: rs, rt = rs2, rt2
                                                 rows.append(make(sub_tbl, sub_schema, i_tgt, rt, rs, rcol, ie, 'select*'))
                                     else:
@@ -2446,38 +2457,134 @@ def extract_lineage_from_sql(
                     rows.extend(_clause_col_rows('ON ' + on_clause, 'join', branch_aliases_outer,
                                                  sub_tbl, sub_schema, final_table, final_schema,
                                                  file_name_with_ext, file_path, process, now_ts))
-    # ── Post-process: remove virtual CTE aliases from source_table / sub_target_table ──
-    # Collect ALL qualified virtual CTE names that appear as sub_target_table in rows.
-    # These include dotted names like 'a.man', 'a.ine.a' produced by _emit_cte_rows.
+    # ── Post-process: resolve CTE aliases in source_table / sub_target_table ─
+    #
+    # Part A — Virtual CTEs (inline subquery aliases, dotted qualified names):
+    #   source_table=virtual_CTE → clear to ''
+    #   sub_target_table=virtual_CTE → re-home to final_table
+    #
+    # Part B — Named CTEs (WITH clause):
+    #   sub_target_table=named_CTE → re-home to final_table
+    #   source_table=named_CTE → resolve recursively to the real backing table(s)
+    #   by walking through the rows already emitted for that named CTE.
+
+    # Collect virtual CTE names (inline subquery aliases)
     _emitted_vcte_names = set()
     for r in rows:
         stt = r.get('sub_target_table', '')
-        # A sub_target_table is a virtual CTE if it's NOT the final target table
-        # AND it's NOT a known named CTE (WITH clause CTE).
-        # Named CTEs are also tracked — but they ARE real logical units.
-        # The simplest heuristic: it's a virtual CTE if it contains '.' (qualified name)
-        # OR if it's in _all_vcte_names (flat virtual CTE names from inline subqueries).
         if stt and stt != final_table and ('.' in stt or stt in _all_vcte_names):
             _emitted_vcte_names.add(stt)
 
-    if _emitted_vcte_names:
+    # Build a column-level lookup for named CTEs:
+    # (cte_name_lower, target_col_lower) -> [(source_schema, source_table, source_col)]
+    # Used to resolve source_table=named_CTE → real table.
+    _cte_col_lookup: Dict[str, Dict[str, List[Tuple[str, str, str]]]] = {}
+    for r in rows:
+        stt = r.get('sub_target_table', '').lower()
+        if stt in _all_named_cte_names:
+            tgt = r.get('target_column', '').lower()
+            src_t = r.get('source_table', '')
+            src_s = r.get('source_schema', '')
+            src_c = r.get('source_column', '')
+            if tgt and src_t:
+                _cte_col_lookup.setdefault(stt, {}).setdefault(tgt, [])
+                _cte_col_lookup[stt][tgt].append((src_s, src_t, src_c))
+
+    def _resolve_cte_source(schema: str, tbl: str, col: str,
+                             _depth: int = 0) -> List[Tuple[str, str, str]]:
+        """
+        Recursively resolve (schema, tbl, col) through named CTE layers until a
+        real table is found. Returns list of (schema, real_table, real_col) tuples.
+        Guards against infinite loops via _depth limit.
+        """
+        if _depth > 8:
+            return [(schema, tbl, col)]
+        tbl_low = tbl.lower()
+        col_low = col.lower()
+        if tbl_low not in _all_named_cte_names:
+            return [(schema, tbl, col)]  # already a real table
+        # Look up in the CTE col map
+        cte_map = _cte_col_lookup.get(tbl_low, {})
+        # Try exact col match first, then try matching by source_col name
+        candidates = cte_map.get(col_low, [])
+        if not candidates:
+            # col might be the source_col inside the CTE, not the target_col
+            for tgt_cols in cte_map.values():
+                for s_sch, s_tbl, s_col in tgt_cols:
+                    if s_col.lower() == col_low:
+                        candidates = [(s_sch, s_tbl, s_col)]
+                        break
+                if candidates:
+                    break
+        if not candidates:
+            # Can't resolve — return with CTE name cleared
+            return [('', '', col)]
+        result = []
+        for s_sch, s_tbl, s_col in candidates:
+            if s_tbl.lower() in _all_named_cte_names:
+                result.extend(_resolve_cte_source(s_sch, s_tbl, s_col, _depth + 1))
+            else:
+                result.append((s_sch, s_tbl, s_col))
+        return result if result else [('', '', col)]
+
+    _any_cte = _emitted_vcte_names | _all_named_cte_names
+
+    if _any_cte:
         cleaned = []
         for r in rows:
             src_tbl = r.get('source_table', '')
             sub_tbl = r.get('sub_target_table', '')
+            src_col = r.get('source_column', '')
+            src_sch = r.get('source_schema', '')
 
-            # Fix source_table: if it's a virtual CTE name, clear it
-            # (the actual source is already tracked through the CTE's own rows)
+            # Fix source_table that is a virtual CTE → clear it
             if src_tbl in _emitted_vcte_names:
                 r = dict(r)
                 r['source_table'] = ''
                 r['source_schema'] = ''
 
-            # Fix sub_target_table: if it's a virtual CTE, re-home to final_table
-            # so all lineage is attributed to the real physical target
+            # Fix source_table that is a named CTE → resolve to real table
+            elif src_tbl.lower() in _all_named_cte_names:
+                resolved_srcs = _resolve_cte_source(src_sch, src_tbl, src_col)
+                if resolved_srcs:
+                    # Take first non-CTE resolution; emit extra rows for multi-source
+                    real_sources = [(s, t, c) for s, t, c in resolved_srcs
+                                    if t and t.lower() not in _all_named_cte_names]
+                    if real_sources:
+                        r = dict(r)
+                        r['source_schema'] = real_sources[0][0]
+                        r['source_table']  = real_sources[0][1]
+                        r['source_column'] = real_sources[0][2]
+                        cleaned.append(r)
+                        # Emit additional rows for any extra real sources
+                        for rs, rt, rc in real_sources[1:]:
+                            extra = dict(r)
+                            extra['source_schema'] = rs
+                            extra['source_table']  = rt
+                            extra['source_column'] = rc
+                            cleaned.append(extra)
+                        # Fix sub_target_table too if needed
+                        if sub_tbl in _emitted_vcte_names or sub_tbl.lower() in _all_named_cte_names:
+                            cleaned[-1] = dict(cleaned[-1])
+                            cleaned[-1]['sub_target_table']  = final_table
+                            cleaned[-1]['sub_target_schema'] = final_schema
+                        continue
+                    else:
+                        # All sources still CTEs — clear source_table
+                        r = dict(r)
+                        r['source_table'] = ''
+                        r['source_schema'] = ''
+
+            # Fix sub_target_table: virtual CTE → final_table
             if sub_tbl in _emitted_vcte_names:
                 r = dict(r)
-                r['sub_target_table'] = final_table
+                r['sub_target_table']  = final_table
+                r['sub_target_schema'] = final_schema
+
+            # Fix sub_target_table: named CTE → final_table
+            elif sub_tbl.lower() in _all_named_cte_names:
+                r = dict(r)
+                r['sub_target_table']  = final_table
                 r['sub_target_schema'] = final_schema
 
             cleaned.append(r)
