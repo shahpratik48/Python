@@ -1777,7 +1777,7 @@ def _get_table_columns(schema: str, table: str) -> List[str]:
                 "FROM pg_catalog.pg_class c "
                 "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
                 "JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid "
-                "WHERE n.nspname = '" + actual_schema + "' AND c.relname = '" + table + "' "
+                "WHERE LOWER(n.nspname) = LOWER('" + actual_schema + "') AND LOWER(c.relname) = LOWER('" + table + "') "
                 "AND a.attnum > 0 AND NOT a.attisdropped "
                 "AND c.relkind IN ('r','v','m') "
                 "ORDER BY a.attnum"
@@ -1788,7 +1788,7 @@ def _get_table_columns(schema: str, table: str) -> List[str]:
                 "FROM pg_catalog.pg_class c "
                 "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
                 "JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid "
-                "WHERE c.relname = '" + table + "' "
+                "WHERE LOWER(c.relname) = LOWER('" + table + "') "
                 "AND a.attnum > 0 AND NOT a.attisdropped "
                 "AND c.relkind IN ('r','v','m') "
                 "ORDER BY a.attnum LIMIT 500"
@@ -1839,15 +1839,17 @@ def _find_column_in_tables(col_name: str,
         if not tbl_list:
             return '', ''
         tbl_in = ', '.join("'" + t + "'" for t in tbl_list)
+        # For case-insensitive matching: compare LOWER(c.relname) to lowercased names
+        tbl_in_lower = ', '.join("'" + t.lower() + "'" for t in tbl_list)
 
         # Collect all relevant schemas
         sch_set = set()
         for s, t in candidate_tables:
             rs = _resolve_schema_label(s) if s else ''
             if rs:
-                sch_set.add(rs)
+                sch_set.add(rs.lower())
         for s in _LOOKUP_SCHEMAS:
-            sch_set.add(s)
+            sch_set.add(s.lower())
         sch_in = ', '.join("'" + s + "'" for s in sch_set)
 
         q = (
@@ -1855,9 +1857,9 @@ def _find_column_in_tables(col_name: str,
             "FROM pg_catalog.pg_class c "
             "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
             "JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid "
-            "WHERE n.nspname IN (" + sch_in + ") "
-            "AND c.relname IN (" + tbl_in + ") "
-            "AND a.attname = '" + col_name + "' "
+            "WHERE LOWER(n.nspname) IN (" + sch_in + ") "
+            "AND LOWER(c.relname) IN (" + tbl_in_lower + ") "
+            "AND LOWER(a.attname) = LOWER('" + col_name + "') "
             "AND a.attnum > 0 AND NOT a.attisdropped "
             "AND c.relkind IN ('r','v','m') "
             "LIMIT 1"
@@ -2101,6 +2103,8 @@ def extract_lineage_from_sql(
     # ── Pre-scan: collect DDL column definitions for each named table ──────
     # When INSERT INTO has no explicit column list, use these as target_column
     _ddl_cols_map: Dict[str, List[str]] = {}   # lower(table_name) -> [col, ...]
+    # Track columns produced by in-file CTA tables for star expansion
+    _infile_cta_cols: Dict[str, List[str]] = {}  # lower(table_name) -> [col, ...]
     for _stmt in stmts:
         if _classify(_stmt) == 'CTD':
             _m = re.search(
@@ -2112,10 +2116,41 @@ def extract_lineage_from_sql(
                 _cols = _extract_ddl_columns(_stmt)
                 if _tbl and _cols:
                     _ddl_cols_map[_tbl.lower()] = _cols
+        elif _classify(_stmt) == 'CTA':
+            # Also pre-scan CTA (CREATE TABLE AS SELECT): extract select-list aliases
+            # so that later SELECT * FROM <this_table> can expand the star.
+            _cm = re.search(
+                r'CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?' + _TBL_TOK + r'\s+AS\s*',
+                _stmt, re.IGNORECASE
+            )
+            if _cm:
+                _, _cta_tbl = _parse_table_token(_cm.group(1))
+                _cta_sel = _stmt[_cm.end():]
+                _cta_ctes, _cta_body = _extract_ctes(_cta_sel)
+                _cta_sellist = _extract_select_list(_cta_body)
+                if _cta_tbl and _cta_sellist:
+                    _cta_col_names: List[str] = []
+                    for _ce in _split_comma(_cta_sellist):
+                        _ce = _ce.strip()
+                        if not _ce or re.match(r'^(\w+\.)?\*$', _ce):
+                            continue  # star — skip; will be expanded at runtime
+                        _ca, _cl = _split_alias(_ce)
+                        if _ca:
+                            _cta_col_names.append(_ca.lower())
+                        else:
+                            # bare expr or col ref — try to get name
+                            _bm = re.match(r'^(?:\w+\.)?([A-Za-z_]\w*)(?:::\w+)?$',
+                                           (_cl or _ce).strip())
+                            if _bm:
+                                _cta_col_names.append(_bm.group(1).lower())
+                    if _cta_col_names:
+                        _infile_cta_cols[_cta_tbl.lower()] = _cta_col_names
 
     # Collect all virtual CTE qualified names (inline subquery aliases) across all statements.
     # These should never appear as real source_table or sub_target_table values.
     _all_vcte_names: set = set()
+
+
 
     for stmt in stmts:
         kind = _classify(stmt)
@@ -2309,7 +2344,10 @@ def extract_lineage_from_sql(
                             s_schema, s_tbl = source_tbls[0]
                         expanded = False
                         for ts_schema, ts_tbl in (source_tbls if source_tbls else [(s_schema, s_tbl)]):
-                            cols_from_db = _get_table_columns(ts_schema, ts_tbl) if ts_tbl else []
+                            # First try in-file CTA map (for temp tables created earlier in same file)
+                            cols_from_db = _infile_cta_cols.get(ts_tbl.lower()) if ts_tbl else []
+                            if not cols_from_db:
+                                cols_from_db = _get_table_columns(ts_schema, ts_tbl) if ts_tbl else []
                             if cols_from_db:
                                 for col in cols_from_db:
                                     rows.append(make(sub_tbl, sub_schema, col, ts_tbl,
