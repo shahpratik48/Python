@@ -1282,24 +1282,34 @@ def _find_last_top_level_word_pos(expr: str, word: str) -> Optional[int]:
 _BUILD_CTE_VISITED: set = set()  # tracks CTE names currently being built (cycle guard)
 
 def _build_cte_col_map(
-    cte_name: str, cte_body: str, all_ctes: Dict[str, str]
+    cte_name: str, cte_body: str, all_ctes: Dict[str, str],
+    sibling_col_maps: Optional[Dict[str, Dict]] = None,
 ) -> Dict[str, List[Tuple[str, str, str]]]:
     """
     Returns {output_col_lower: [(schema, real_table, real_col), ...]}.
     Uses a visited-set to prevent mutual recursion cycles.
+    sibling_col_maps: resolved col maps for other named CTEs at same level.
     """
     if cte_name in _BUILD_CTE_VISITED:
         return {}  # cycle detected — return empty rather than recurse
     _BUILD_CTE_VISITED.add(cte_name)
     try:
-        return _build_cte_col_map_inner(cte_name, cte_body, all_ctes)
+        return _build_cte_col_map_inner(cte_name, cte_body, all_ctes,
+                                         sibling_col_maps=sibling_col_maps)
     finally:
         _BUILD_CTE_VISITED.discard(cte_name)
 
 
 def _build_cte_col_map_inner(
-    cte_name: str, cte_body: str, all_ctes: Dict[str, str]
+    cte_name: str, cte_body: str, all_ctes: Dict[str, str],
+    sibling_col_maps: Optional[Dict[str, Dict]] = None,
 ) -> Dict[str, List[Tuple[str, str, str]]]:
+    """Build col map for one CTE body.
+
+    sibling_col_maps: already-resolved col maps for other named CTEs at the
+    same WITH level, enabling cross-CTE resolution (e.g. "summary" CTE can
+    resolve its references through "base" CTE to real tables).
+    """
     col_map: Dict[str, List[Tuple[str, str, str]]] = {}
 
     inner_ctes, inner_body = _extract_ctes(cte_body)
@@ -1308,13 +1318,9 @@ def _build_cte_col_map_inner(
     aliases = _extract_aliases(cte_body)
     for cn in merged:
         # Do NOT overwrite an alias that already resolves to a real table.
-        # e.g. when building the col map for virtual CTE 'a', the inner FROM
-        # clause "FROM asset_security_hist a" correctly sets aliases['a'] ->
-        # asset_security_hist.  Overwriting it with ('__CTE__', 'a') loses that
-        # mapping and causes source_table to remain as the alias name 'a'.
         existing = aliases.get(cn)
-        if existing and existing[0] != '__CTE__':
-            continue   # real-table alias wins — keep it
+        if existing and existing[0] and existing[0] != '__CTE__':
+            continue   # real-table alias wins (only if schema is resolved, not blank)
         aliases[cn] = ('__CTE__', cn)
 
     sel = _extract_select_list(inner_body)
@@ -1322,6 +1328,16 @@ def _build_cte_col_map_inner(
         return col_map
 
     all_tbls = _from_tables(cte_body)
+
+    # Build effective CTE col maps: inner CTEs take precedence, then sibling CTEs.
+    effective_cte_maps: Dict[str, Dict] = {}
+    if sibling_col_maps:
+        effective_cte_maps.update(sibling_col_maps)
+    for _cn, _cb in inner_ctes.items():
+        try:
+            effective_cte_maps[_cn] = _build_cte_col_map(_cn, _cb, merged)
+        except RecursionError:
+            effective_cte_maps[_cn] = {}
 
     for expr in _split_comma(sel):
         expr = expr.strip()
@@ -1339,7 +1355,16 @@ def _build_cte_col_map_inner(
         resolved: List[Tuple[str, str, str]] = []
 
         for alias_pfx, col in refs:
-            resolved.extend(_resolve_col_ref(alias_pfx, col, aliases, merged, {}, all_tbls))
+            raw = _resolve_col_ref(alias_pfx, col, aliases, merged,
+                                    effective_cte_maps, all_tbls)
+            # Recursively resolve any remaining named CTE references
+            for rs, rt, rc in raw:
+                if rt and rt.lower() in effective_cte_maps:
+                    deeper = effective_cte_maps[rt.lower()].get(rc.lower())
+                    if deeper:
+                        resolved.extend(deeper)
+                        continue
+                resolved.append((rs, rt, rc))
 
         col_map[tgt.lower()] = resolved if resolved else [('', '', logic[:80])]
 
@@ -2114,6 +2139,8 @@ def extract_lineage_from_sql(
     _ddl_cols_map: Dict[str, List[str]] = {}   # lower(table_name) -> [col, ...]
     # Track columns produced by in-file CTA tables for star expansion
     _infile_cta_cols: Dict[str, List[str]] = {}  # lower(table_name) -> [col, ...]
+    # Track in-file TEMP table names for transparent resolution (like named CTEs)
+    _all_infile_temp_names: set = set()
     for _stmt in stmts:
         if _classify(_stmt) == 'CTD':
             _m = re.search(
@@ -2134,6 +2161,10 @@ def extract_lineage_from_sql(
             )
             if _cm:
                 _, _cta_tbl = _parse_table_token(_cm.group(1))
+                # Track TEMP table names for resolution (same as named CTEs)
+                _is_temp = bool(re.search(r'\bTEMP(?:ORARY)?\b', _stmt[:120], re.IGNORECASE))
+                if _is_temp and _cta_tbl:
+                    _all_infile_temp_names.add(_cta_tbl.lower())
                 _cta_sel = _stmt[_cm.end():]
                 _cta_ctes, _cta_body = _extract_ctes(_cta_sel)
                 _cta_sellist = _extract_select_list(_cta_body)
@@ -2158,7 +2189,7 @@ def extract_lineage_from_sql(
     # Collect all virtual CTE qualified names (inline subquery aliases) across all statements.
     # These should never appear as real source_table or sub_target_table values.
     _all_vcte_names: set = set()
-    _all_named_cte_names: set = set()  # WITH clause CTE names across all statements
+    _all_named_cte_names: set = set()   # WITH clause CTE names across all statements
 
 
 
@@ -2213,18 +2244,25 @@ def extract_lineage_from_sql(
             outer_aliases[cn] = ('__CTE__', cn)
 
         all_ctes = dict(ctes)
+        # Build CTE col maps in WITH-clause order with sibling resolution:
+        # each CTE gets access to col maps of CTEs defined before it.
         cte_col_maps: Dict[str, Dict[str, List[Tuple[str, str, str]]]] = {}
         for cn, cb in ctes.items():
-            cte_col_maps[cn] = _build_cte_col_map(cn, cb, all_ctes)
+            cte_col_maps[cn] = _build_cte_col_map(
+                cn, cb, all_ctes, sibling_col_maps=dict(cte_col_maps))
 
         all_from_tables = _from_tables(outer_sel)
 
         # ── Emit CTE sub-target rows ──────────────────────────────────
+        # Use cte_col_maps (already built with sibling maps via incremental
+        # dict(cte_col_maps) above) so nested CTE references like
+        # "summary → base → real_table" resolve correctly.
         for cte_name, cte_body in ctes.items():
             _emit_cte_rows(
                 cte_name, cte_body, all_ctes,
                 file_name_with_ext, file_path, final_table, final_schema,
-                process, now_ts, rows
+                process, now_ts, rows,
+                outer_cte_col_maps=cte_col_maps,
             )
 
         # ── SELECT list of outer query (handles UNION ALL) ───────────────
@@ -2478,10 +2516,12 @@ def extract_lineage_from_sql(
     # Build a column-level lookup for named CTEs:
     # (cte_name_lower, target_col_lower) -> [(source_schema, source_table, source_col)]
     # Used to resolve source_table=named_CTE → real table.
+    # All "transparent" intermediate tables: named CTEs + in-file temp tables
+    _all_transparent = _all_named_cte_names | _all_infile_temp_names
     _cte_col_lookup: Dict[str, Dict[str, List[Tuple[str, str, str]]]] = {}
     for r in rows:
         stt = r.get('sub_target_table', '').lower()
-        if stt in _all_named_cte_names:
+        if stt in _all_transparent:
             tgt = r.get('target_column', '').lower()
             src_t = r.get('source_table', '')
             src_s = r.get('source_schema', '')
@@ -2493,15 +2533,16 @@ def extract_lineage_from_sql(
     def _resolve_cte_source(schema: str, tbl: str, col: str,
                              _depth: int = 0) -> List[Tuple[str, str, str]]:
         """
-        Recursively resolve (schema, tbl, col) through named CTE layers until a
-        real table is found. Returns list of (schema, real_table, real_col) tuples.
+        Recursively resolve (schema, tbl, col) through named CTE / temp-table layers
+        until a real physical table is found.
+        Returns list of (schema, real_table, real_col) tuples.
         Guards against infinite loops via _depth limit.
         """
         if _depth > 8:
             return [(schema, tbl, col)]
         tbl_low = tbl.lower()
         col_low = col.lower()
-        if tbl_low not in _all_named_cte_names:
+        if tbl_low not in _all_transparent:
             return [(schema, tbl, col)]  # already a real table
         # Look up in the CTE col map
         cte_map = _cte_col_lookup.get(tbl_low, {})
@@ -2527,7 +2568,7 @@ def extract_lineage_from_sql(
                 result.append((s_sch, s_tbl, s_col))
         return result if result else [('', '', col)]
 
-    _any_cte = _emitted_vcte_names | _all_named_cte_names
+    _any_cte = _emitted_vcte_names | _all_transparent
 
     if _any_cte:
         cleaned = []
@@ -2544,7 +2585,7 @@ def extract_lineage_from_sql(
                 r['source_schema'] = ''
 
             # Fix source_table that is a named CTE → resolve to real table
-            elif src_tbl.lower() in _all_named_cte_names:
+            elif src_tbl.lower() in _all_transparent:
                 resolved_srcs = _resolve_cte_source(src_sch, src_tbl, src_col)
                 if resolved_srcs:
                     # Take first non-CTE resolution; emit extra rows for multi-source
@@ -2581,8 +2622,8 @@ def extract_lineage_from_sql(
                 r['sub_target_table']  = final_table
                 r['sub_target_schema'] = final_schema
 
-            # Fix sub_target_table: named CTE → final_table
-            elif sub_tbl.lower() in _all_named_cte_names:
+            # Fix sub_target_table: named CTE or in-file temp table → final_table
+            elif sub_tbl.lower() in _all_transparent:
                 r = dict(r)
                 r['sub_target_table']  = final_table
                 r['sub_target_schema'] = final_schema
@@ -2598,11 +2639,14 @@ def _emit_cte_rows(
     file: str, path: str, final_tbl: str, final_schema: str,
     process: str, now_ts: datetime, rows: List[Dict[str, Any]],
     parent_prefix: str = "",
+    outer_cte_col_maps: Optional[Dict[str, Dict]] = None,
 ):
     """Parse one CTE body and emit rows with sub_target_table = scoped name.
 
     parent_prefix: dot-separated ancestor chain, e.g. "a" so that nested
     virtual CTEs get names like "a.man", "a.ine", "a.ine.a".
+    outer_cte_col_maps: col maps for all sibling named CTEs so references
+    like "SELECT x FROM base" inside "summary" CTE resolve through "base".
     """
     # Build the fully-qualified name for this CTE
     qualified_name = (parent_prefix + "." + cte_name) if parent_prefix else cte_name
@@ -2616,9 +2660,15 @@ def _emit_cte_rows(
         if not (ex and ex[0] != '__CTE__'):
             aliases[cn] = ('__CTE__', cn)
 
+    # Build col maps for CTEs defined within this CTE's body,
+    # then merge in any outer sibling CTE col maps (without overwriting inner ones).
     cte_col_maps_inner: Dict[str, Dict] = {
         cn: _build_cte_col_map(cn, cb, merged) for cn, cb in inner_ctes.items()
     }
+    if outer_cte_col_maps:
+        for _ok, _ov in outer_cte_col_maps.items():
+            if _ok not in cte_col_maps_inner:
+                cte_col_maps_inner[_ok] = _ov
     all_tbls = _from_tables(cte_body)
 
     # Handle UNION ALL / UNION — parse each branch independently
@@ -2629,7 +2679,7 @@ def _emit_cte_rows(
         for cn in merged:
             # Don't overwrite a real-table alias with a CTE marker
             ex = branch_aliases.get(cn)
-            if not (ex and ex[0] != '__CTE__'):
+            if not (ex and ex[0] and ex[0] != '__CTE__'):
                 branch_aliases[cn] = ('__CTE__', cn)
         branch_tbls = _from_tables_raw(branch_sql)
         if not branch_tbls:
@@ -2676,7 +2726,8 @@ def _emit_cte_rows(
             inner_scope[vn] = vbody  # this inner virtual CTE is in scope for itself
             _emit_cte_rows(vn, vbody, inner_scope,
                            file, path, final_tbl, final_schema, process, now_ts, rows,
-                           parent_prefix=qualified_name)
+                           parent_prefix=qualified_name,
+                           outer_cte_col_maps=cte_col_maps_inner)
 
         sel = _extract_select_list(branch_sql)
         if not sel:
