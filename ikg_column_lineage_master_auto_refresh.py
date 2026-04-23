@@ -13,6 +13,7 @@ import getpass
 import logging
 from datetime import datetime
 from pathlib import Path
+from functools import lru_cache
 from typing import Optional, List, Dict, Any, Tuple, Set
 
 import pandas as pd
@@ -100,7 +101,7 @@ def _resolve_schema_label(schema_label: str) -> str:
     if schema_label in JINJA_SCHEMA_MAP:
         return _resolve_schema(schema_label)
     # Try stripping {{params.X}} to get X
-    jm = re.search(r'params\.([^}]+)', schema_label)
+    jm = _RC_JINJA_PARAM_LABEL.search(schema_label)
     if jm:
         return _resolve_schema(jm.group(1).strip())
     return schema_label
@@ -287,6 +288,46 @@ _RC_ALIAS_DQ    = re.compile(r'^(\w+)\."([^"]+)"(?:::\w+)?$')
 _RC_ALIAS_SONLY = re.compile(r'^\w+\.\w+(?:::\w[\w\s,()]*)?$')
 _RC_ALIAS_DQONLY= re.compile(r'^\w+\."[^"]+"(?:::\w+)?$')
 
+# ── Additional pre-compiled patterns (moved from inside functions) ─────────
+_RC_INLINE_SUBQ = re.compile(
+    r'\b(?:FROM|(?:LEFT|RIGHT|FULL|INNER|CROSS)?\s*(?:OUTER\s+)?JOIN)\s*\(',
+    re.IGNORECASE
+)
+_RC_JOINS = re.compile(
+    r'\b(LEFT\s+(?:OUTER\s+)?JOIN|RIGHT\s+(?:OUTER\s+)?JOIN|FULL\s+(?:OUTER\s+)?JOIN'
+    r'|INNER\s+JOIN|CROSS\s+JOIN|JOIN)\s+'
+    r'((?:(?:\{\{[^}]+\}\}|\w+)\.)?\w+)'
+    r'(?:\s+(?:AS\s+)?(\w+))?'
+    r'(?:\s+ON\s+(.+?))?(?=\s+(?:LEFT|RIGHT|FULL|INNER|CROSS|JOIN|WHERE|GROUP|ORDER|HAVING|LIMIT|$))',
+    re.IGNORECASE | re.DOTALL
+)
+# Frequently-used inline patterns now pre-compiled
+_RC_SELECT_KW    = re.compile(r'\bSELECT\b', re.IGNORECASE)
+_RC_TEMP_KW      = re.compile(r'\bTEMP(?:ORARY)?\b', re.IGNORECASE)
+_RC_OVER_KW      = re.compile(r'\bOVER\s*\(', re.IGNORECASE)
+_RC_FILTER_KW    = re.compile(r'\bFILTER\s*\(', re.IGNORECASE)
+_RC_IDENT        = re.compile(r'^[A-Za-z_]\w*$')
+_RC_BARE_COL     = re.compile(r'^(\w+)(?:::\w+)?$')
+_RC_DOT_COL      = re.compile(r'^(\w+)\.(\w+)(?:::\w+)?$')
+_RC_FULL_COL     = re.compile(r'^(?:\w+\.)?(\w+)(?:::\w+)?$')
+_RC_STAR         = re.compile(r'^(\w+\.)?\*$')
+_RC_PFXSTAR      = re.compile(r'^(\w+)\.\*$')
+_RC_JINJA_DOT    = re.compile(r'(\{\{[^}]+\}\})\.(.*)'  )
+_RC_JINJA_START  = re.compile(r'\{\{'                       )
+_RC_JINJA_PARAM  = re.compile(r'\{\{([^}]+)\}\}'          )
+_RC_CAST_STRIP   = re.compile(r'::\s*\w[\w\s,()]*$'       )
+_RC_ALIAS_AFTER  = re.compile(r'(?:AS\s+)?(\w+)'           , re.IGNORECASE)
+_RC_WITH_START   = re.compile(r'\bWITH\b\s*'              , re.IGNORECASE)
+_RC_CTE_NAMED    = re.compile(r'(\w+)\s+AS\s*\('         , re.IGNORECASE)
+_RC_SUBQ_ALIAS   = re.compile(r'^\((.+)\)\s*(?:AS\s+)?(\w+)\s*$', re.IGNORECASE | re.DOTALL)
+_RC_DQCOL        = re.compile(r'^(\w+)\."([^"]+)"(?:::\w+)?$')
+_RC_FUNC_CALL    = re.compile(r'^(\w+)\s*\(')
+_RC_FIRST_WORD   = re.compile(r'^(\w+)')
+_RC_JINJA_PARAM_LABEL = re.compile(r'params\.([^}]+)')
+_RC_CREATE_TABLE_HDR  = re.compile(r'CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE', re.IGNORECASE)
+_RC_INSERT_INTO       = re.compile(r'INSERT\s+INTO', re.IGNORECASE)
+_RC_CTA_BODY          = re.compile(r'\bAS\s*(?:\bWITH\b|\bSELECT\b|\()', re.IGNORECASE)
+
 # ---------------------------------------------------------------------------
 # Airflow helpers
 # ---------------------------------------------------------------------------
@@ -354,6 +395,7 @@ def _strip_comments(sql: str) -> str:
     return sql
 
 
+@lru_cache(maxsize=2048)
 def _normalize(sql: str) -> str:
     sql = _strip_comments(sql)
     sql = sql.replace('\r\n', '\n').replace('\r', '\n')
@@ -362,7 +404,7 @@ def _normalize(sql: str) -> str:
 
 def _jinja_label(token: str) -> str:
     """{{params.IKG_SCHEMA}} → 'IKG_SCHEMA'"""
-    m = re.search(r'params\.([^}]+)', token)
+    m = _RC_JINJA_PARAM_LABEL.search(token)
     return m.group(1).strip() if m else token.strip()
 
 
@@ -373,13 +415,13 @@ def _parse_table_token(raw: str) -> Tuple[str, str]:
     'tablename'               → ('', 'tablename')
     """
     raw = raw.strip().rstrip(';').strip()
-    jm = re.match(r'(\{\{[^}]+\}\})\.(.*)', raw)
+    jm = _RC_JINJA_DOT.match(raw)
     if jm:
         return _jinja_label(jm.group(1)), jm.group(2).strip()
     if '.' in raw:
         p = raw.rsplit('.', 1)
         schema = p[0].strip()
-        if re.match(r'\{\{', schema):
+        if _RC_JINJA_START.match(schema):
             return _jinja_label(schema), p[1].strip()
         return schema, p[1].strip()
     return '', raw.strip()
@@ -405,6 +447,7 @@ def _find_paren_end(text: str, start: int) -> int:
     return n - 1
 
 
+@lru_cache(maxsize=4096)
 def _split_comma(text: str) -> List[str]:
     """Split by top-level commas (not inside parentheses/quotes)."""
     parts, cur, depth = [], [], 0
@@ -436,6 +479,7 @@ def _split_comma(text: str) -> List[str]:
     return parts
 
 
+@lru_cache(maxsize=512)
 def _split_stmts(sql: str) -> List[str]:
     """Split on top-level semicolons. Slice-based for speed."""
     result, start, depth, i, n = [], 0, 0, 0, len(sql)
@@ -532,7 +576,7 @@ def _is_system_value(expr: str) -> bool:
     if e in _SYSTEM_VALUE_TOKENS:
         return True
     # function call: NOW() or NOW(...)
-    fn_m = re.match(r'^(\w+)\s*\(', e)
+    fn_m = _RC_FUNC_CALL.match(e)
     if fn_m and fn_m.group(1) in _SYSTEM_VALUE_TOKENS:
         return True
     return False
@@ -550,7 +594,7 @@ def _is_literal(expr: str) -> bool:
 def _extract_literal_src(expr: str) -> str:
     """Extract the readable source label from a literal expression."""
     e = re.sub(r'::\s*\w[\w\s,()]*$', '', expr.strip()).strip()
-    jm = re.match(r'\{\{([^}]+)\}\}', e)
+    jm = _RC_JINJA_PARAM.match(e)
     if jm:
         return '{{' + jm.group(1) + '}}'
     if e.startswith("'") and e.endswith("'"):
@@ -672,7 +716,16 @@ def _determine_sql_process(logic: str, refs: List[Tuple[str, str]]) -> str:
 
 _TBL_TOK = r'((?:\{\{[^}]+\}\}|\w+)(?:\.(?:\{\{[^}]+\}\}|\w+))?)'
 
+_RC_CREATE_TBL_TOK = re.compile(
+    r'CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?' + _TBL_TOK,
+    re.IGNORECASE
+)
+_RC_CTA_TBL_TOK = re.compile(
+    r'CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?' + _TBL_TOK + r'\s+AS\s*',
+    re.IGNORECASE
+)
 
+@lru_cache(maxsize=4096)
 def _extract_aliases(query: str) -> Dict[str, Tuple[str, str]]:
     """
     Scan FROM / JOIN for table references, including inline subqueries.
@@ -697,14 +750,10 @@ def _extract_aliases(query: str) -> Dict[str, Tuple[str, str]]:
 
     # Register inline subquery aliases WITHOUT building col maps (avoids recursion)
     # Just map alias -> first real table inside the subquery for source resolution
-    pat = re.compile(
-        r'\b(?:FROM|(?:LEFT|RIGHT|FULL|INNER|CROSS)?\s*(?:OUTER\s+)?JOIN)\s*\(',
-        re.IGNORECASE
-    )
     i = 0
     n = len(query)
     while i < n:
-        m = pat.search(query, i)
+        m = _RC_INLINE_SUBQ.search(query, i)
         if not m:
             break
         try:
@@ -735,6 +784,7 @@ def _extract_aliases(query: str) -> Dict[str, Tuple[str, str]]:
     return aliases
 
 
+@lru_cache(maxsize=4096)
 def _from_tables(query: str) -> List[Tuple[str, str]]:
     """Return unique (schema, table) from FROM/JOIN clauses."""
     seen, result = set(), []
@@ -748,6 +798,7 @@ def _from_tables(query: str) -> List[Tuple[str, str]]:
 #  CTE PARSING
 # ===========================================================================
 
+@lru_cache(maxsize=4096)
 def _extract_ctes(sql: str) -> Tuple[Dict[str, str], str]:
     """Extract WITH CTEs. Returns ({name: body}, remainder)."""
     ctes: Dict[str, str] = {}
@@ -776,6 +827,7 @@ def _extract_ctes(sql: str) -> Tuple[Dict[str, str], str]:
 #  SELECT LIST EXTRACTION
 # ===========================================================================
 
+@lru_cache(maxsize=4096)
 def _extract_select_list(query: str) -> str:
     """Return column list between SELECT [DISTINCT [ON (...)]] and top-level FROM."""
     sel_m = _RC_SELECT.search(query)
@@ -888,11 +940,11 @@ def _analyse_expr(
                          source_column=col, logic=expr, sql_process='select')]
 
     if not target_col:
-        dm = re.match(r'^(\w+)\.(\w+)(?:::\w+)?$', (logic or expr).strip())
+        dm = _RC_DOT_COL.match((logic or expr).strip())
         if dm:
             target_col = dm.group(2)
-        elif re.match(r'^(\w+)(?:::\w+)?$', (logic or expr).strip()):
-            target_col = re.match(r'^(\w+)', (logic or expr).strip()).group(1)
+        elif _RC_BARE_COL.match((logic or expr).strip()):
+            target_col = _RC_FIRST_WORD.match((logic or expr).strip()).group(1)
         if not target_col:
             target_col = ''
 
@@ -968,7 +1020,7 @@ def _analyse_expr(
     # (d) COUNT(*) / COUNT(DISTINCT *) without OVER → select-value
     count_star_m = re.match(r'^(COUNT\s*\(\s*(?:DISTINCT\s+)?\*?\s*\))',
                             use_logic.strip(), re.IGNORECASE)
-    if count_star_m and not re.search(r'\bOVER\s*\(', use_logic, re.IGNORECASE):
+    if count_star_m and not _RC_OVER_KW.search(use_logic):
         return [dict(target_column=target_col, source_table='', source_schema='',
                      source_column=count_star_m.group(1),
                      logic=expr, sql_process='select-value')]
@@ -997,7 +1049,7 @@ def _analyse_expr(
             ov_end = _find_paren_end(main_logic, ov_start)
             main_logic = main_logic[:ov_m.start()] + main_logic[ov_end+1:]
 
-    fl_m = re.search(r'\bFILTER\s*\(', main_logic, re.IGNORECASE)
+    fl_m = _RC_FILTER_KW.search(main_logic)
     if fl_m:
         fl_start = main_logic.index('(', fl_m.start())
         fl_end = _find_paren_end(main_logic, fl_start)
@@ -1056,6 +1108,7 @@ def _analyse_expr(
     )]
 
 
+@lru_cache(maxsize=4096)
 def _split_alias(expr: str) -> Tuple[str, str]:
     """
     Split 'logic [AS] alias' into (alias, logic).
@@ -1345,7 +1398,7 @@ def _build_cte_col_map_inner(
             continue
         tgt, logic = _split_alias(expr)
         if not tgt:
-            dm = re.match(r'^(?:\w+\.)?(\w+)(?:::\w+)?$', logic.strip())
+            dm = _RC_FULL_COL.match(logic.strip())
             if dm:
                 tgt = dm.group(1)
         if not tgt or tgt == '*':
@@ -1469,11 +1522,11 @@ def _resolve_col_ref(
 
 def _classify(stmt: str) -> str:
     s = stmt.lstrip().upper()
-    if re.match(r'CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE', s):
-        if re.search(r'\bAS\s*(?:\bWITH\b|\bSELECT\b|\()', stmt, re.IGNORECASE):
+    if _RC_CREATE_TABLE_HDR.match(s):
+        if _RC_CTA_BODY.search(stmt):
             return 'CTA'   # CREATE TABLE AS
         return 'CTD'       # CREATE TABLE DDL
-    if re.match(r'INSERT\s+INTO', s):
+    if _RC_INSERT_INTO.match(s):
         return 'INSERT'
     return 'OTHER'
 
@@ -1517,7 +1570,7 @@ def _extract_ddl_columns(stmt: str) -> List[str]:
             toks = col_def.split()
             if not toks or toks[0].upper() in _SKIP_KW: continue
             cn = toks[0].strip('"').strip('`').strip()
-            if cn and re.match(r'^[A-Za-z_]\w*$', cn):
+            if cn and _RC_IDENT.match(cn):
                 cols.append(cn.lower())
         else:
             current.append(ch)
@@ -1526,7 +1579,7 @@ def _extract_ddl_columns(stmt: str) -> List[str]:
         toks = col_def.split()
         if toks and toks[0].upper() not in _SKIP_KW:
             cn = toks[0].strip('"').strip('`').strip()
-            if cn and re.match(r'^[A-Za-z_]\w*$', cn):
+            if cn and _RC_IDENT.match(cn):
                 cols.append(cn.lower())
     return cols
 
@@ -1538,7 +1591,7 @@ def _find_final_table(stmts: List[str], file_stem: str) -> Tuple[str, str]:
     creates, inserts = [], []
     for stmt in stmts:
         kind = _classify(stmt)
-        is_temp = bool(re.search(r'\bTEMP(?:ORARY)?\b', stmt[:80], re.IGNORECASE))
+        is_temp = bool(_RC_TEMP_KW.search(stmt[:80]))
         m = re.search(r'(?:CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?|INSERT\s+INTO\s+)' + _TBL_TOK,
                       stmt, re.IGNORECASE)
         if not m:
@@ -1905,6 +1958,7 @@ def _find_column_in_tables(col_name: str,
         logger.debug(f"pg_catalog column lookup failed for {col_name}: {e}")
     return '', ''
 
+@lru_cache(maxsize=2048)
 def _split_union_branches(sql: str) -> List[str]:
     """
     Split a SELECT (or CTE body) on top-level UNION [ALL] / INTERSECT / EXCEPT.
@@ -1989,6 +2043,7 @@ def _extract_inline_subquery_aliases(query: str) -> Dict[str, Tuple[str, str, st
     return result
 
 
+@lru_cache(maxsize=4096)
 def _from_tables_raw(query: str) -> List[Tuple[str, str]]:
     """Like _from_tables but skips registering aliases — direct FROM/JOIN table list."""
     seen, result = set(), []
@@ -2076,38 +2131,29 @@ def _parse_file_worker(args: tuple):
 
 def parse_lineage_parallel(file_dict: dict, n_workers: int = 0) -> tuple:
     """
-    Fast parallel lineage parser for Jupyter notebooks.
-    Drop-in replacement for the slow serial loop.
+    Fast lineage parser. Runs serially in one process so all lru_cache hits
+    are shared across files — significantly faster than spawning workers.
 
     Usage in notebook::
 
         all_rows, parse_errors = parse_lineage_parallel(file_dict)
     """
-    import concurrent.futures as _cf
-    import multiprocessing as _mp
+    from pathlib import Path as _P
 
     items = list(file_dict.items())
     n = len(items)
-    if n_workers <= 0:
-        n_workers = min(_mp.cpu_count(), 8)
-
     all_rows: list = []
     parse_errors: list = []
 
-    try:
-        chunksize = max(1, n // (n_workers * 4))
-        with _cf.ProcessPoolExecutor(max_workers=n_workers) as pool:
-            for done, (rows, err) in enumerate(pool.map(_parse_file_worker, items, chunksize=chunksize), 1):
-                all_rows.extend(rows)
-                if err: parse_errors.append(err)
-                if done % 100 == 0: print(f'  {done}/{n}...', end='\r')
-    except Exception as exc:
-        logger.warning(f"Parallel failed ({exc}), running serially...")
-        all_rows, parse_errors = [], []
-        for item in items:
-            rows, err = _parse_file_worker(item)
+    for done, (fpath, content) in enumerate(items, 1):
+        try:
+            p = _P(fpath)
+            rows = extract_lineage_from_sql(content, p.name, fpath, p.parent.name)
             all_rows.extend(rows)
-            if err: parse_errors.append(err)
+        except Exception as exc:
+            parse_errors.append({'file': fpath, 'error': str(exc)})
+        if done % 100 == 0:
+            print(f'  {done}/{n}...', end='\r')
 
     print(f'  Done: {n} files parsed, {len(all_rows)} records, {len(parse_errors)} errors.      ')
     return all_rows, parse_errors
@@ -2143,10 +2189,7 @@ def extract_lineage_from_sql(
     _all_infile_temp_names: set = set()
     for _stmt in stmts:
         if _classify(_stmt) == 'CTD':
-            _m = re.search(
-                r'CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?' + _TBL_TOK,
-                _stmt, re.IGNORECASE
-            )
+            _m = _RC_CREATE_TBL_TOK.search(_stmt)
             if _m:
                 _, _tbl = _parse_table_token(_m.group(1))
                 _cols = _extract_ddl_columns(_stmt)
@@ -2154,11 +2197,7 @@ def extract_lineage_from_sql(
                     _ddl_cols_map[_tbl.lower()] = _cols
         elif _classify(_stmt) == 'CTA':
             # Also pre-scan CTA (CREATE TABLE AS SELECT): extract select-list aliases
-            # so that later SELECT * FROM <this_table> can expand the star.
-            _cm = re.search(
-                r'CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?' + _TBL_TOK + r'\s+AS\s*',
-                _stmt, re.IGNORECASE
-            )
+            _cm = _RC_CTA_TBL_TOK.search(_stmt)
             if _cm:
                 _, _cta_tbl = _parse_table_token(_cm.group(1))
                 # Track TEMP table names for resolution (same as named CTEs)
@@ -2299,8 +2338,8 @@ def extract_lineage_from_sql(
                 _expr_idx  = 0   # position counter for DDL column mapping (Fix 1)
                 for expr in _sel_exprs:
                     # ── Handle SELECT * or a.* ─────────────────────────────
-                    if re.match(r'^(\w+\.)?\*$', expr.strip()):
-                        star_pfx_m = re.match(r'^(\w+)\.\*$', expr.strip())
+                    if _RC_STAR.match(expr.strip()):
+                        star_pfx_m = _RC_PFXSTAR.match(expr.strip())
                         pfx = star_pfx_m.group(1).lower() if star_pfx_m else None
 
                         # ── Case 1: prefixed alias (e.g. a.*) ──────────────
@@ -2365,7 +2404,7 @@ def extract_lineage_from_sql(
                                     ie = ie.strip()
                                     if not ie: continue
                                     i_alias, i_logic = _split_alias(ie)
-                                    bm = re.match(r'^(?:\w+\.)?(\w+)(?:::\w+)?$', (i_logic or ie).strip())
+                                    bm = _RC_FULL_COL.match((i_logic or ie).strip())
                                     i_tgt = i_alias or (bm.group(1) if bm else '')
                                     i_refs = _extract_col_refs_from_expr(i_logic or ie)
                                     if i_refs:
@@ -2736,8 +2775,8 @@ def _emit_cte_rows(
             expr = expr.strip()
             if not expr:
                 continue
-            if re.match(r'^(\w+\.)?\*$', expr.strip()):
-                    star_pfx_m = re.match(r'^(\w+)\.\*$', expr.strip())
+            if _RC_STAR.match(expr.strip()):
+                    star_pfx_m = _RC_PFXSTAR.match(expr.strip())
                     pfx_e = star_pfx_m.group(1).lower() if star_pfx_m else None
                     if pfx_e:
                         alias_entry_e = branch_aliases.get(pfx_e, ('', pfx_e))
@@ -2973,36 +3012,19 @@ def run(private_token=None, pg_password=None, use_local_sql=False,
             private_token = get_private_token(allow_prompt=allow_prompt)
         file_dict = _fetch_sql_files_from_gitlab(private_token)
 
-    def _parse_file(args):
-        fpath, sql_content = args
-        try:
-            rows = extract_lineage_from_sql(
-                sql_content, Path(fpath).name, fpath, Path(fpath).parent.name)
-            return rows, None
-        except Exception as e:
-            return [], (fpath, str(e))
-
     all_rows, errors = [], []
     items = list(file_dict.items())
-    try:
-        import concurrent.futures as _cf
-        import multiprocessing as _mp
-        n_workers = min(_mp.cpu_count(), 8)
-        logger.info(f"Parsing {len(items)} files using {n_workers} CPU workers...")
-        with _cf.ProcessPoolExecutor(max_workers=n_workers) as pool:
-            for i, (rows, err) in enumerate(pool.map(_parse_file, items, chunksize=20)):
-                all_rows.extend(rows)
-                if err:
-                    errors.append(err)
-                if (i + 1) % 200 == 0:
-                    logger.info(f"  {i+1}/{len(items)} files parsed...")
-    except Exception as e:
-        logger.warning(f"Parallel parse failed ({e}), falling back to serial...")
-        all_rows, errors = [], []
-        for fpath, content in items:
-            rows, err = _parse_file((fpath, content))
+    n = len(items)
+    logger.info(f"Parsing {n} SQL files...")
+    for i, (fpath, content) in enumerate(items, 1):
+        try:
+            rows = extract_lineage_from_sql(
+                content, Path(fpath).name, fpath, Path(fpath).parent.name)
             all_rows.extend(rows)
-            if err: errors.append(err)
+        except Exception as e:
+            errors.append((fpath, str(e)))
+        if i % 200 == 0:
+            logger.info(f"  {i}/{n} files parsed...")
 
     logger.info(f"Total records: {len(all_rows)}, Errors: {len(errors)}")
     if errors:
