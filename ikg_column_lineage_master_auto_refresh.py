@@ -2129,31 +2129,74 @@ def _parse_file_worker(args: tuple):
         return [], {'file': fpath, 'error': str(e)}
 
 
-def parse_lineage_parallel(file_dict: dict, n_workers: int = 0) -> tuple:
+def parse_lineage_parallel(file_dict: dict, n_workers: int = 0,
+                            file_timeout: float = 30.0) -> tuple:
     """
-    Fast lineage parser. Runs serially in one process so all lru_cache hits
-    are shared across files — significantly faster than spawning workers.
+    Fast lineage parser. Runs serially so all lru_cache hits are shared
+    across all files (huge speedup for repeated SQL fragments).
+
+    file_timeout: max seconds per file before skipping (default 30s).
 
     Usage in notebook::
 
         all_rows, parse_errors = parse_lineage_parallel(file_dict)
     """
+    import signal as _sig
     from pathlib import Path as _P
+    import time as _t
 
     items = list(file_dict.items())
     n = len(items)
     all_rows: list = []
     parse_errors: list = []
 
+    # Per-file timeout via SIGALRM (Unix only); falls back to no-timeout on Windows
+    _use_alarm = hasattr(_sig, "SIGALRM")
+
+    class _Timeout(Exception):
+        pass
+
+    def _handler(signum, frame):
+        raise _Timeout()
+
+    if _use_alarm:
+        _sig.signal(_sig.SIGALRM, _handler)
+
+    t_start = _t.perf_counter()
+    slow_files = []
+
     for done, (fpath, content) in enumerate(items, 1):
+        t0 = _t.perf_counter()
         try:
+            if _use_alarm:
+                _sig.alarm(int(file_timeout) + 1)
             p = _P(fpath)
             rows = extract_lineage_from_sql(content, p.name, fpath, p.parent.name)
             all_rows.extend(rows)
+            if _use_alarm:
+                _sig.alarm(0)
+        except _Timeout:
+            msg = f"Timed out after {file_timeout:.0f}s"
+            parse_errors.append({'file': fpath, 'error': msg})
+            logger.warning(f"SLOW FILE SKIPPED: {fpath} ({msg})")
         except Exception as exc:
+            if _use_alarm:
+                _sig.alarm(0)
             parse_errors.append({'file': fpath, 'error': str(exc)})
+        else:
+            elapsed = _t.perf_counter() - t0
+            if elapsed > 5.0:
+                slow_files.append((fpath, elapsed))
+
         if done % 100 == 0:
-            print(f'  {done}/{n}...', end='\r')
+            elapsed_total = _t.perf_counter() - t_start
+            rate = done / elapsed_total
+            eta = (n - done) / rate if rate > 0 else 0
+            print(f'  {done}/{n}... ({rate:.0f} files/s, ETA {eta:.0f}s)', end='\r')
+
+    if slow_files:
+        logger.warning(f"Slow files (>5s each): "
+                       + ", ".join(f"{Path(f).name}:{t:.1f}s" for f, t in slow_files[:5]))
 
     print(f'  Done: {n} files parsed, {len(all_rows)} records, {len(parse_errors)} errors.      ')
     return all_rows, parse_errors
@@ -2829,45 +2872,124 @@ def _emit_cte_rows(
 # ===========================================================================
 
 def _fetch_sql_files_from_gitlab(token: str) -> Dict[str, str]:
-    import urllib.request, urllib.parse, json
+    """
+    Fetch all SQL files from GitLab using parallel HTTP requests with
+    retry/back-off for rate-limiting.  Uses a thread pool so all files
+    download concurrently while respecting GitLab's API limits.
+    """
+    import urllib.request, urllib.parse, json, time as _time
+    import concurrent.futures as _cf
 
-    base = GITLAB_URL.rstrip('/')
-    proj = urllib.parse.quote(IKG_PROJECT_PATH, safe='')
-    hdrs = {"PRIVATE-TOKEN": token}
+    # ── Try to use requests (connection pooling, better perf) ──────────────
+    try:
+        import requests as _req
+        _session = _req.Session()
+        _session.headers.update({"PRIVATE-TOKEN": token})
+
+        def _get(url: str, timeout: int = 20) -> bytes:
+            for attempt in range(5):
+                r = _session.get(url, timeout=timeout)
+                if r.status_code == 429:
+                    wait = int(r.headers.get("Retry-After", 2 ** attempt))
+                    logger.warning(f"Rate limited — waiting {wait}s …")
+                    _time.sleep(wait)
+                    continue
+                r.raise_for_status()
+                return r.content
+            raise RuntimeError("Max retries exceeded")
+
+        def _get_json(url: str) -> object:
+            return json.loads(_get(url))
+
+        def _get_text(url: str) -> str:
+            return _get(url).decode("utf-8", errors="replace")
+
+    except ImportError:
+        # Fall back to urllib
+        hdrs = {"PRIVATE-TOKEN": token}
+
+        def _get_raw(url: str, timeout: int = 20) -> bytes:
+            for attempt in range(5):
+                try:
+                    req = urllib.request.Request(url, headers=hdrs)
+                    with urllib.request.urlopen(req, timeout=timeout) as r:
+                        return r.read()
+                except Exception as exc:
+                    if "429" in str(exc):
+                        wait = 2 ** attempt
+                        logger.warning(f"Rate limited — waiting {wait}s …")
+                        _time.sleep(wait)
+                    else:
+                        raise
+            raise RuntimeError("Max retries exceeded")
+
+        def _get_json(url: str) -> object:
+            return json.loads(_get_raw(url))
+
+        def _get_text(url: str) -> str:
+            return _get_raw(url).decode("utf-8", errors="replace")
+
+    # ── Step 1: list all files (paginated, fast — usually 1-2 pages) ───────
+    base = GITLAB_URL.rstrip("/")
+    proj = urllib.parse.quote(IKG_PROJECT_PATH, safe="")
     all_items: List[dict] = []
     url: Optional[str] = (
         f"{base}/api/v4/projects/{proj}/repository/tree"
         f"?path={urllib.parse.quote(SQL_FOLDER_IN_REPO)}"
-        f"&ref={DEFAULT_BASE_BRANCH}&recursive=true&per_page=1000"
+        f"&ref={DEFAULT_BASE_BRANCH}&recursive=true&per_page=100"
     )
     while url:
-        req = urllib.request.Request(url, headers=hdrs)
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            all_items.extend(json.loads(resp.read().decode()))
-            link = resp.headers.get('Link', '')
-            url = None
-            if 'rel="next"' in link:
-                for part in link.split(','):
-                    if 'rel="next"' in part:
-                        url = part.split(';')[0].strip().strip('<>')
+        data = _get_json(url)
+        if isinstance(data, list):
+            all_items.extend(data)
+        link_hdr = ""
+        try:
+            import requests as _req2
+            r2 = _req2.Session()
+            r2.headers.update({"PRIVATE-TOKEN": token})
+            resp2 = r2.get(url, timeout=20)
+            link_hdr = resp2.headers.get("Link", "")
+        except Exception:
+            pass
+        url = None
+        if 'rel="next"' in link_hdr:
+            for part in link_hdr.split(","):
+                if 'rel="next"' in part:
+                    url = part.split(";")[0].strip().strip("<>")
+                    break
 
-    sql_files = [x for x in all_items if x['type'] == 'blob' and x['path'].endswith('.sql')]
+    sql_files = [
+        x for x in all_items
+        if x.get("type") == "blob" and x.get("path", "").endswith(".sql")
+        and Path(x["path"]).parent.name not in EXCLUDED_PROCESSES
+    ]
     logger.info(f"Found {len(sql_files)} SQL files on GitLab.")
 
-    file_contents: Dict[str, str] = {}
-    for item in sql_files:
-        fpath = item['path']
-        process = Path(fpath).parent.name
-        if process in EXCLUDED_PROCESSES:
-            continue
-        raw_url = (f"{base}/api/v4/projects/{proj}/repository/files"
-                   f"/{urllib.parse.quote(fpath, safe='')}/raw?ref={DEFAULT_BASE_BRANCH}")
+    # ── Step 2: fetch file contents in parallel ────────────────────────────
+    def _fetch_one(item: dict):
+        fpath = item["path"]
+        raw_url = (
+            f"{base}/api/v4/projects/{proj}/repository/files"
+            f"/{urllib.parse.quote(fpath, safe='')}/raw?ref={DEFAULT_BASE_BRANCH}"
+        )
         try:
-            req = urllib.request.Request(raw_url, headers=hdrs)
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                file_contents[fpath] = resp.read().decode('utf-8', errors='replace')
-        except Exception as e:
-            logger.warning(f"Could not fetch {fpath}: {e}")
+            return fpath, _get_text(raw_url)
+        except Exception as exc:
+            logger.warning(f"Could not fetch {fpath}: {exc}")
+            return fpath, None
+
+    # 16 threads balances GitLab throughput vs rate-limit pressure
+    n_threads = min(16, len(sql_files))
+    file_contents: Dict[str, str] = {}
+    done = 0
+    with _cf.ThreadPoolExecutor(max_workers=n_threads) as pool:
+        for fpath, content in pool.map(_fetch_one, sql_files):
+            if content is not None:
+                file_contents[fpath] = content
+            done += 1
+            if done % 100 == 0:
+                logger.info(f"  Fetched {done}/{len(sql_files)} files …")
+
     logger.info(f"Fetched {len(file_contents)} SQL files.")
     return file_contents
 
@@ -3016,15 +3138,37 @@ def run(private_token=None, pg_password=None, use_local_sql=False,
     items = list(file_dict.items())
     n = len(items)
     logger.info(f"Parsing {n} SQL files...")
+    import signal as _sig2, time as _t2
+
+    _use_alarm2 = hasattr(_sig2, "SIGALRM")
+    _FILE_TIMEOUT = 30  # seconds per file hard limit
+
+    class _T2(Exception): pass
+    if _use_alarm2:
+        _sig2.signal(_sig2.SIGALRM, lambda s, f: (_ for _ in ()).throw(_T2()))
+
+    t_run_start = _t2.perf_counter()
     for i, (fpath, content) in enumerate(items, 1):
         try:
+            if _use_alarm2:
+                _sig2.alarm(_FILE_TIMEOUT)
             rows = extract_lineage_from_sql(
                 content, Path(fpath).name, fpath, Path(fpath).parent.name)
             all_rows.extend(rows)
+            if _use_alarm2:
+                _sig2.alarm(0)
+        except _T2:
+            errors.append((fpath, f"Timed out after {_FILE_TIMEOUT}s"))
+            logger.warning(f"SLOW FILE SKIPPED: {Path(fpath).name}")
         except Exception as e:
+            if _use_alarm2:
+                _sig2.alarm(0)
             errors.append((fpath, str(e)))
-        if i % 200 == 0:
-            logger.info(f"  {i}/{n} files parsed...")
+        if i % 100 == 0:
+            elapsed = _t2.perf_counter() - t_run_start
+            rate = i / elapsed if elapsed > 0 else i
+            eta = (n - i) / rate if rate > 0 else 0
+            logger.info(f"  {i}/{n} files parsed ({rate:.0f}/s, ETA {eta:.0f}s)...")
 
     logger.info(f"Total records: {len(all_rows)}, Errors: {len(errors)}")
     if errors:
