@@ -2129,13 +2129,50 @@ def _parse_file_worker(args: tuple):
         return [], {'file': fpath, 'error': str(e)}
 
 
-def parse_lineage_parallel(file_dict: dict, n_workers: int = 0,
-                            file_timeout: float = 30.0) -> tuple:
-    """
-    Fast lineage parser. Runs serially so all lru_cache hits are shared
-    across all files (huge speedup for repeated SQL fragments).
+# ---------------------------------------------------------------------------
+# Log file helper — shared by parse_lineage_parallel and run()
+# ---------------------------------------------------------------------------
+import logging as _logging_mod
 
-    file_timeout: max seconds per file before skipping (default 30s).
+def _get_parse_logger(log_path: str = "parse_lineage.log") -> "_logging_mod.Logger":
+    """
+    Return a logger that writes to both the console and *log_path*.
+    Safe to call multiple times — handlers are only added once.
+    """
+    _plog = _logging_mod.getLogger("ikg_parse_lineage")
+    if _plog.handlers:          # already configured
+        return _plog
+    _plog.setLevel(_logging_mod.DEBUG)
+
+    fmt = _logging_mod.Formatter(
+        "%(asctime)s [%(levelname)-8s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    # File handler (always append so successive runs accumulate)
+    fh = _logging_mod.FileHandler(log_path, mode="a", encoding="utf-8")
+    fh.setLevel(_logging_mod.DEBUG)
+    fh.setFormatter(fmt)
+    _plog.addHandler(fh)
+
+    # Console handler
+    ch = _logging_mod.StreamHandler()
+    ch.setLevel(_logging_mod.INFO)
+    ch.setFormatter(fmt)
+    _plog.addHandler(ch)
+
+    return _plog
+
+
+def parse_lineage_parallel(file_dict: dict, n_workers: int = 0,
+                            file_timeout: float = 30.0,
+                            log_path: str = "parse_lineage.log") -> tuple:
+    """
+    Lineage parser with full diagnostic logging.
+
+    Every file is timed and logged to *log_path* (default: parse_lineage.log
+    in the current working directory).  Files that exceed *file_timeout*
+    seconds are skipped and flagged in the log so you can identify exactly
+    which file is causing the hang.
 
     Usage in notebook::
 
@@ -2144,13 +2181,16 @@ def parse_lineage_parallel(file_dict: dict, n_workers: int = 0,
     import signal as _sig
     from pathlib import Path as _P
     import time as _t
+    import os as _os
+
+    plog = _get_parse_logger(log_path)
 
     items = list(file_dict.items())
-    n = len(items)
-    all_rows: list = []
+    n     = len(items)
+    all_rows:    list = []
     parse_errors: list = []
 
-    # Per-file timeout via SIGALRM (Unix only); falls back to no-timeout on Windows
+    # ── SIGALRM per-file hard timeout (Unix only) ──────────────────────────
     _use_alarm = hasattr(_sig, "SIGALRM")
 
     class _Timeout(Exception):
@@ -2162,43 +2202,105 @@ def parse_lineage_parallel(file_dict: dict, n_workers: int = 0,
     if _use_alarm:
         _sig.signal(_sig.SIGALRM, _handler)
 
-    t_start = _t.perf_counter()
-    slow_files = []
+    # ── Header ─────────────────────────────────────────────────────────────
+    plog.info("=" * 72)
+    plog.info(f"parse_lineage_parallel  START")
+    plog.info(f"  Files to parse  : {n}")
+    plog.info(f"  Per-file timeout: {file_timeout}s")
+    plog.info(f"  Log file        : {_os.path.abspath(log_path)}")
+    plog.info(f"  SIGALRM timeout : {'enabled' if _use_alarm else 'disabled (Windows)'}")
+    plog.info("=" * 72)
+
+    t_start          = _t.perf_counter()
+    slow_threshold   = 2.0   # seconds — log a WARNING for any file above this
+    slow_files: list = []
 
     for done, (fpath, content) in enumerate(items, 1):
+        fname = _P(fpath).name
+        sql_bytes = len(content.encode("utf-8", errors="replace"))
+
+        plog.debug(f"[{done:04d}/{n}] START  {fname}  ({sql_bytes:,} bytes)")
         t0 = _t.perf_counter()
+
         try:
             if _use_alarm:
-                _sig.alarm(int(file_timeout) + 1)
-            p = _P(fpath)
+                _sig.alarm(int(file_timeout) + 1)   # +1 so 30s means exactly 30s
+
+            p    = _P(fpath)
             rows = extract_lineage_from_sql(content, p.name, fpath, p.parent.name)
             all_rows.extend(rows)
-            if _use_alarm:
-                _sig.alarm(0)
-        except _Timeout:
-            msg = f"Timed out after {file_timeout:.0f}s"
-            parse_errors.append({'file': fpath, 'error': msg})
-            logger.warning(f"SLOW FILE SKIPPED: {fpath} ({msg})")
-        except Exception as exc:
-            if _use_alarm:
-                _sig.alarm(0)
-            parse_errors.append({'file': fpath, 'error': str(exc)})
-        else:
-            elapsed = _t.perf_counter() - t0
-            if elapsed > 5.0:
-                slow_files.append((fpath, elapsed))
 
-        if done % 100 == 0:
+            if _use_alarm:
+                _sig.alarm(0)   # cancel alarm
+
+            elapsed = _t.perf_counter() - t0
+            plog.debug(
+                f"[{done:04d}/{n}] OK     {fname}  "
+                f"{elapsed*1000:.1f}ms  {len(rows)} rows"
+            )
+
+            if elapsed >= slow_threshold:
+                slow_files.append((fpath, elapsed))
+                plog.warning(
+                    f"SLOW FILE  {fname}  took {elapsed:.2f}s  "
+                    f"({sql_bytes:,} bytes, {len(rows)} rows)"
+                )
+
+        except _Timeout:
+            elapsed = _t.perf_counter() - t0
+            msg = f"TIMEOUT after {elapsed:.1f}s (limit={file_timeout}s)"
+            parse_errors.append({"file": fpath, "error": msg})
+            plog.error(f"[{done:04d}/{n}] TIMEOUT  {fname}  {msg}  {sql_bytes:,} bytes")
+            if _use_alarm:
+                _sig.alarm(0)
+
+        except Exception as exc:
+            elapsed = _t.perf_counter() - t0
+            if _use_alarm:
+                _sig.alarm(0)
+            parse_errors.append({"file": fpath, "error": str(exc)})
+            plog.error(
+                f"[{done:04d}/{n}] ERROR  {fname}  {elapsed*1000:.1f}ms  "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        # ── Progress every 10 files (INFO level) and every file (DEBUG) ──
+        if done % 10 == 0 or done == n:
             elapsed_total = _t.perf_counter() - t_start
-            rate = done / elapsed_total
-            eta = (n - done) / rate if rate > 0 else 0
-            print(f'  {done}/{n}... ({rate:.0f} files/s, ETA {eta:.0f}s)', end='\r')
+            rate  = done / elapsed_total if elapsed_total > 0 else 0
+            eta   = (n - done) / rate   if rate > 0           else 0
+            rows_so_far = len(all_rows)
+            plog.info(
+                f"Progress: {done}/{n} files  "
+                f"|  {rate:.0f} files/s  "
+                f"|  ETA {eta:.0f}s  "
+                f"|  {rows_so_far:,} rows  "
+                f"|  {len(parse_errors)} errors"
+            )
+
+    # ── Summary ────────────────────────────────────────────────────────────
+    total_elapsed = _t.perf_counter() - t_start
+    avg_ms = total_elapsed / n * 1000 if n > 0 else 0
+
+    plog.info("=" * 72)
+    plog.info("parse_lineage_parallel  COMPLETE")
+    plog.info(f"  Total time   : {total_elapsed:.2f}s")
+    plog.info(f"  Files parsed : {n}")
+    plog.info(f"  Avg per file : {avg_ms:.1f}ms")
+    plog.info(f"  Total rows   : {len(all_rows):,}")
+    plog.info(f"  Errors       : {len(parse_errors)}")
+
+    if parse_errors:
+        plog.info("  Error files:")
+        for e in parse_errors:
+            plog.info(f"    {e['file']}: {e['error']}")
 
     if slow_files:
-        logger.warning(f"Slow files (>5s each): "
-                       + ", ".join(f"{Path(f).name}:{t:.1f}s" for f, t in slow_files[:5]))
+        plog.info(f"  Slow files (>={slow_threshold}s):")
+        for fpath, t in sorted(slow_files, key=lambda x: -x[1]):
+            plog.info(f"    {_P(fpath).name}: {t:.2f}s")
 
-    print(f'  Done: {n} files parsed, {len(all_rows)} records, {len(parse_errors)} errors.      ')
+    plog.info("=" * 72)
     return all_rows, parse_errors
 
 
@@ -3137,38 +3239,17 @@ def run(private_token=None, pg_password=None, use_local_sql=False,
     all_rows, errors = [], []
     items = list(file_dict.items())
     n = len(items)
-    logger.info(f"Parsing {n} SQL files...")
-    import signal as _sig2, time as _t2
 
-    _use_alarm2 = hasattr(_sig2, "SIGALRM")
-    _FILE_TIMEOUT = 30  # seconds per file hard limit
-
-    class _T2(Exception): pass
-    if _use_alarm2:
-        _sig2.signal(_sig2.SIGALRM, lambda s, f: (_ for _ in ()).throw(_T2()))
-
-    t_run_start = _t2.perf_counter()
-    for i, (fpath, content) in enumerate(items, 1):
-        try:
-            if _use_alarm2:
-                _sig2.alarm(_FILE_TIMEOUT)
-            rows = extract_lineage_from_sql(
-                content, Path(fpath).name, fpath, Path(fpath).parent.name)
-            all_rows.extend(rows)
-            if _use_alarm2:
-                _sig2.alarm(0)
-        except _T2:
-            errors.append((fpath, f"Timed out after {_FILE_TIMEOUT}s"))
-            logger.warning(f"SLOW FILE SKIPPED: {Path(fpath).name}")
-        except Exception as e:
-            if _use_alarm2:
-                _sig2.alarm(0)
-            errors.append((fpath, str(e)))
-        if i % 100 == 0:
-            elapsed = _t2.perf_counter() - t_run_start
-            rate = i / elapsed if elapsed > 0 else i
-            eta = (n - i) / rate if rate > 0 else 0
-            logger.info(f"  {i}/{n} files parsed ({rate:.0f}/s, ETA {eta:.0f}s)...")
+    # Route run() through parse_lineage_parallel so we get the same
+    # detailed log file output (parse_lineage.log in the working directory).
+    pll_rows, pll_errors = parse_lineage_parallel(
+        file_dict,
+        file_timeout=30.0,
+        log_path="parse_lineage.log"
+    )
+    all_rows = pll_rows
+    errors   = [(e["file"], e["error"]) for e in pll_errors]
+    logger.info(f"Parsed {n} files → {len(all_rows):,} rows, {len(errors)} errors")
 
     logger.info(f"Total records: {len(all_rows)}, Errors: {len(errors)}")
     if errors:
