@@ -1983,7 +1983,7 @@ def _find_column_in_tables(col_name: str,
         logger.debug(f"pg_catalog column lookup failed for {col_name}: {e}")
 
     _FIND_COL_CACHE[_ck] = ('', '')
-    return '', 
+    return '', ''
 
 @lru_cache(maxsize=2048)
 def _split_union_branches(sql: str) -> List[str]:
