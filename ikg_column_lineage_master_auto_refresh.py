@@ -2190,6 +2190,48 @@ def _get_parse_logger(log_path: str = "parse_lineage.log") -> "_logging_mod.Logg
     return _plog
 
 
+
+
+def prewarm_schema_cache() -> int:
+    """
+    Bulk-fetch ALL column lists for ALL tables in _LOOKUP_SCHEMAS in ONE
+    pg_catalog query and store them in _INFO_SCHEMA_CACHE.
+
+    Call this once before parsing begins.  After this, every SELECT * expansion
+    and every bare-column resolution resolves from the in-memory cache with zero
+    additional DB round-trips.
+
+    Returns the number of (schema, table) pairs cached.
+    """
+    if _DB_ENGINE is None:
+        return 0
+    try:
+        import pandas as _pd
+        sch_in = ", ".join("'" + s.lower() + "'" for s in _LOOKUP_SCHEMAS)
+        q = (
+            "SELECT LOWER(n.nspname) AS schema, LOWER(c.relname) AS tbl, "
+            "LOWER(a.attname) AS col "
+            "FROM pg_catalog.pg_class c "
+            "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+            "JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid "
+            "WHERE LOWER(n.nspname) IN (" + sch_in + ") "
+            "AND a.attnum > 0 AND NOT a.attisdropped "
+            "AND c.relkind IN ('r','v','m') "
+            "ORDER BY n.nspname, c.relname, a.attnum"
+        )
+        df = _pd.read_sql(q, _DB_ENGINE)
+        count = 0
+        for (schema, tbl), grp in df.groupby(["schema", "tbl"]):
+            key = (schema, tbl)
+            _INFO_SCHEMA_CACHE[key] = grp["col"].tolist()
+            count += 1
+        logger.info(f"prewarm_schema_cache: cached {count} tables "
+                    f"({len(df)} columns) from {len(_LOOKUP_SCHEMAS)} schemas")
+        return count
+    except Exception as exc:
+        logger.warning(f"prewarm_schema_cache failed (non-fatal): {exc}")
+        return 0
+
 def parse_lineage_parallel(file_dict: dict, n_workers: int = 0,
                             file_timeout: float = 30.0,
                             log_path: str = "parse_lineage.log") -> tuple:
@@ -2211,6 +2253,14 @@ def parse_lineage_parallel(file_dict: dict, n_workers: int = 0,
     import os as _os
 
     plog = _get_parse_logger(log_path)
+
+    # Pre-warm column cache — one bulk DB query instead of
+    # thousands of per-column queries during parsing.
+    _pw_start = _t.perf_counter()
+    _pw_tables = prewarm_schema_cache()
+    _pw_elapsed = _t.perf_counter() - _pw_start
+    if _pw_tables:
+        plog.info(f"Schema cache pre-warmed: {_pw_tables} tables in {_pw_elapsed:.2f}s")
 
     items = list(file_dict.items())
     n     = len(items)
