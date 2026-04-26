@@ -1911,26 +1911,45 @@ def _find_column_in_tables(col_name: str,
                            strict_candidates_only: bool = False) -> Tuple[str, str]:
     """
     Use pg_catalog to find which table/view/MV among candidates owns col_name.
-    When strict_candidates_only=True, searches ONLY the provided candidate tables
-    (i.e. those in the current query's FROM clause) — no fallback to LOOKUP_SCHEMAS.
-    When False (default), also searches LOOKUP_SCHEMAS as a broader fallback.
+    When strict_candidates_only=True, searches ONLY the provided candidate tables.
+    Results are cached in _FIND_COL_CACHE to avoid repeated DB round-trips.
     Returns (schema, table) of the first match, or ('', '') if not found / no DB.
     """
     if not candidate_tables or _DB_ENGINE is None:
         return '', ''
+
+    # Build cache key upfront — needed for both lookup and every return path
+    _ck = (col_name.lower(), frozenset(candidate_tables), strict_candidates_only)
+    if _ck in _FIND_COL_CACHE:
+        return _FIND_COL_CACHE[_ck]
+
     try:
         import pandas as _pd
         _SKIP = {'SELECT', 'FROM', 'WHERE', 'JOIN', 'ON', 'AS', 'WITH'}
         tbl_list = list({t for s, t in candidate_tables
                          if t and t.upper() not in _SKIP})
         if not tbl_list:
+            _FIND_COL_CACHE[_ck] = ('', '')
             return '', ''
-        tbl_in = ', '.join("'" + t + "'" for t in tbl_list)
-        # For case-insensitive matching: compare LOWER(c.relname) to lowercased names
+
+        # Fast path: if _INFO_SCHEMA_CACHE already has this table's columns,
+        # resolve directly without a DB query.
+        col_lower = col_name.lower()
+        for _s, _t in candidate_tables:
+            if not _t or _t.upper() in _SKIP:
+                continue
+            _rs = _resolve_schema_label(_s) if _s else ''
+            _tkey = (_rs.lower(), _t.lower())
+            if _tkey in _INFO_SCHEMA_CACHE:
+                _cols = _INFO_SCHEMA_CACHE[_tkey]
+                if _cols and col_lower in [_c.lower() for _c in _cols]:
+                    _hit = (_rs, _t)
+                    _FIND_COL_CACHE[_ck] = _hit
+                    return _hit
+
         tbl_in_lower = ', '.join("'" + t.lower() + "'" for t in tbl_list)
 
-        # Collect schemas: always include candidate table schemas.
-        # Only add LOOKUP_SCHEMAS when strict_candidates_only is False.
+        # Collect schemas
         sch_set = set()
         for s, t in candidate_tables:
             rs = _resolve_schema_label(s) if s else ''
@@ -1940,7 +1959,6 @@ def _find_column_in_tables(col_name: str,
             for s in _LOOKUP_SCHEMAS:
                 sch_set.add(s.lower())
         if not sch_set:
-            # No schemas known — fall back to LOOKUP_SCHEMAS
             sch_set = {s.lower() for s in _LOOKUP_SCHEMAS}
         sch_in = ', '.join("'" + s + "'" for s in sch_set)
 
@@ -1963,8 +1981,9 @@ def _find_column_in_tables(col_name: str,
             return _found
     except Exception as e:
         logger.debug(f"pg_catalog column lookup failed for {col_name}: {e}")
+
     _FIND_COL_CACHE[_ck] = ('', '')
-    return '', ''
+    return '', 
 
 @lru_cache(maxsize=2048)
 def _split_union_branches(sql: str) -> List[str]:
