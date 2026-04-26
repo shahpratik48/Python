@@ -447,7 +447,7 @@ def _find_paren_end(text: str, start: int) -> int:
     return n - 1
 
 
-@lru_cache(maxsize=4096)
+@lru_cache(maxsize=16384)
 def _split_comma(text: str) -> List[str]:
     """Split by top-level commas (not inside parentheses/quotes)."""
     parts, cur, depth = [], [], 0
@@ -725,7 +725,7 @@ _RC_CTA_TBL_TOK = re.compile(
     re.IGNORECASE
 )
 
-@lru_cache(maxsize=4096)
+@lru_cache(maxsize=16384)
 def _extract_aliases(query: str) -> Dict[str, Tuple[str, str]]:
     """
     Scan FROM / JOIN for table references, including inline subqueries.
@@ -798,7 +798,7 @@ def _from_tables(query: str) -> List[Tuple[str, str]]:
 #  CTE PARSING
 # ===========================================================================
 
-@lru_cache(maxsize=4096)
+@lru_cache(maxsize=16384)
 def _extract_ctes(sql: str) -> Tuple[Dict[str, str], str]:
     """Extract WITH CTEs. Returns ({name: body}, remainder)."""
     ctes: Dict[str, str] = {}
@@ -827,7 +827,7 @@ def _extract_ctes(sql: str) -> Tuple[Dict[str, str], str]:
 #  SELECT LIST EXTRACTION
 # ===========================================================================
 
-@lru_cache(maxsize=4096)
+@lru_cache(maxsize=16384)
 def _extract_select_list(query: str) -> str:
     """Return column list between SELECT [DISTINCT [ON (...)]] and top-level FROM."""
     sel_m = _RC_SELECT.search(query)
@@ -1108,7 +1108,7 @@ def _analyse_expr(
     )]
 
 
-@lru_cache(maxsize=4096)
+@lru_cache(maxsize=32768)
 def _split_alias(expr: str) -> Tuple[str, str]:
     """
     Split 'logic [AS] alias' into (alias, logic).
@@ -1901,6 +1901,11 @@ _LOOKUP_SCHEMAS = (
 )
 
 
+# Cache for _find_column_in_tables results — avoids repeated pg_catalog
+# queries for the same (column, tables) combination across all files.
+_FIND_COL_CACHE: Dict[Tuple, Tuple[str, str]] = {}
+
+
 def _find_column_in_tables(col_name: str,
                            candidate_tables: List[Tuple[str, str]],
                            strict_candidates_only: bool = False) -> Tuple[str, str]:
@@ -1953,9 +1958,12 @@ def _find_column_in_tables(col_name: str,
         )
         result = _pd.read_sql(q, _DB_ENGINE)
         if not result.empty:
-            return result['source_schema'].iloc[0], result['source_table'].iloc[0]
+            _found = result['source_schema'].iloc[0], result['source_table'].iloc[0]
+            _FIND_COL_CACHE[_ck] = _found
+            return _found
     except Exception as e:
         logger.debug(f"pg_catalog column lookup failed for {col_name}: {e}")
+    _FIND_COL_CACHE[_ck] = ('', '')
     return '', ''
 
 @lru_cache(maxsize=2048)
@@ -2043,7 +2051,7 @@ def _extract_inline_subquery_aliases(query: str) -> Dict[str, Tuple[str, str, st
     return result
 
 
-@lru_cache(maxsize=4096)
+@lru_cache(maxsize=16384)
 def _from_tables_raw(query: str) -> List[Tuple[str, str]]:
     """Like _from_tables but skips registering aliases — direct FROM/JOIN table list."""
     seen, result = set(), []
