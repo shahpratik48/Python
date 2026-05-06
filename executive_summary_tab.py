@@ -1,103 +1,140 @@
-"""Executive Summary tab – allows the user to pick a month (from prod_release_date)
-and generate an LLM-powered executive summary, with an option to save it as a .txt file.
+"""Executive Summary tab – pick a month (from prod_release_date) and generate an
+LLM-powered executive summary, with an option to save it as a .txt file.
 
-Key changes vs. original
-─────────────────────────
-• Data is fetched directly from GP at generate-time (no store filtering).
-  Use get_exec_summary_data(month_value) to obtain (current_df, next_month_df).
-• "Top Feature" issues  → identified by the label  "Top Feature"  (not change_type).
-• "New Insight" issues  → identified by the label  "New Insight"  (not change_type).
-• Latest batch is resolved per-iteration (PARTITION BY iteration_end_date) so that
-  multiple batches per iteration are handled correctly.
-• Month dropdown is populated dynamically from GP on tab load / refresh.
+Environment detection
+─────────────────────
+The module detects its runtime context at import time:
 
-Callback wiring note (insights_release_dashboard.py)
-──────────────────────────────────────────────────────
-Replace the existing generate_exec_summary callback body with:
+  Production (Airflow / Dash)
+    Airflow packages are importable.  GP connection → PostgresHook via
+    Variable "GP_Dash_connect".  OpenAI credentials → Airflow Connection
+    "STAAT-DS-OPENAI-LLM".  Schema → Variable "IKG_DASHBOARD_SCHEMA".
 
-    df_month, df_next = get_exec_summary_data(selected_month)
-    if df_month.empty:
-        msg = f"No data found for the selected month ({selected_month})."
-        return msg, "", True
-    try:
-        summary = generate_summary(df_month, next_month_df=df_next)
-    except Exception as exc:
-        return f"Error generating summary: {exc}", "", True
-    return summary, summary, False
+  Local (Jupyter / script)
+    Airflow is not installed.  All credentials are read from environment
+    variables, which the notebook sets (via getpass) before importing this
+    module:
 
-The refresh_exec_summary_data callback should call get_month_options_from_db()
-instead of extract_month_options(latest).
+      GP_HOST, GP_PORT, GP_DB, GP_USER, GP_PASSWORD, GP_SCHEMA
+      OPENAI_API_KEY, OPENAI_BASE_URL
+
+The data/LLM functions behave identically in both environments.
+The Dash layout helpers are only wired when Dash is available.
 """
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
+from typing import Optional
 
 import pandas as pd
-from dash import dcc, html
-import dash_bootstrap_components as dbc
-
 from openai import OpenAI
-from styles import release_dashboard_styles
-
-# Airflow / GP imports (production only – kept identical to original)
-from airflow.models import Connection, Variable  # type: ignore
-from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
 
 
-# ── OpenAI / Azure configuration ─────────────────────────────────────────────
-# All connection variables kept the same as the original file.
+# ── Environment detection ─────────────────────────────────────────────────────
 
-MODEL_NAME = "gpt-4.1"
-MAX_TOKENS = 12000
+try:
+    from airflow.models import Connection, Variable          # type: ignore
+    from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
+    _AIRFLOW_AVAILABLE = True
+except ImportError:
+    _AIRFLOW_AVAILABLE = False
+
+# Dash / styles only needed inside the dashboard server.
+try:
+    from dash import dcc, html
+    import dash_bootstrap_components as dbc
+    from styles import release_dashboard_styles
+    _DASH_AVAILABLE = True
+except ImportError:
+    _DASH_AVAILABLE = False
+
+
+# ── OpenAI / Azure configuration ──────────────────────────────────────────────
+
+MODEL_NAME  = "gpt-4.1"
+MAX_TOKENS  = 12000
 TEMPERATURE = 0.1
 
-_client: OpenAI | None = None
+_client: Optional[OpenAI] = None
 
 
 def _get_openai_client() -> OpenAI:
-    """Lazily initialise and return the shared OpenAI client."""
+    """Return the shared OpenAI client, initialising it on first call.
+
+    Production : reads credentials from Airflow Connection "STAAT-DS-OPENAI-LLM".
+    Local      : reads OPENAI_API_KEY and OPENAI_BASE_URL from env vars.
+    """
     global _client
-    openai_conn = Connection.get_connection_from_secrets("STAAT-DS-OPENAI-LLM")
-    OPENAI_API_KEY = openai_conn.password
-    OPENAI_BASE_URL = openai_conn.host
-    if _client is None:
-        _client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
+    if _client is not None:
+        return _client
+
+    if _AIRFLOW_AVAILABLE:
+        conn     = Connection.get_connection_from_secrets("STAAT-DS-OPENAI-LLM")
+        api_key  = conn.password
+        base_url = conn.host
+    else:
+        api_key  = os.environ["OPENAI_API_KEY"]
+        base_url = os.environ.get(
+            "OPENAI_BASE_URL",
+            "https://cirruspl-staat-ste-dev-ai.openai.azure.com/openai/v1/",
+        )
+
+    _client = OpenAI(api_key=api_key, base_url=base_url)
     return _client
 
 
 # ── GP connection ─────────────────────────────────────────────────────────────
 
 def _get_gp_conn():
-    """Return a live GP connection via the Airflow PostgresHook."""
-    connect = Variable.get("GP_Dash_connect")
-    return PostgresHook(postgres_conn_id=connect).get_conn()
+    """Return a live database connection.
+
+    Production : PostgresHook via Airflow Variable "GP_Dash_connect".
+    Local      : psycopg2 direct connection using GP_* env vars.
+    """
+    if _AIRFLOW_AVAILABLE:
+        connect = Variable.get("GP_Dash_connect")
+        return PostgresHook(postgres_conn_id=connect).get_conn()
+
+    import psycopg2  # available locally; not required in the Airflow image
+    return psycopg2.connect(
+        host    =os.environ["GP_HOST"],
+        port    =int(os.environ.get("GP_PORT", 5432)),
+        dbname  =os.environ["GP_DB"],
+        user    =os.environ["GP_USER"],
+        password=os.environ["GP_PASSWORD"],
+    )
 
 
 def _get_schema() -> str:
-    return Variable.get("IKG_DASHBOARD_SCHEMA")
+    """Return the IKG schema name.
+
+    Production : Airflow Variable "IKG_DASHBOARD_SCHEMA".
+    Local      : env var GP_SCHEMA (default "core_ikg").
+    """
+    if _AIRFLOW_AVAILABLE:
+        return Variable.get("IKG_DASHBOARD_SCHEMA")
+    return os.environ.get("GP_SCHEMA", "core_ikg")
 
 
 # ── SQL helpers ───────────────────────────────────────────────────────────────
 
 def _build_month_query(month_value: str, schema: str) -> str:
-    """
-    Return a SQL query that fetches the latest batch per iteration whose
-    prod_release_date falls in *month_value* (e.g. '2025-01').
+    """Return SQL that selects the latest-batch rows from STAAT + ODM for *month_value*.
 
     Strategy
     --------
-    1. Find every iteration_end_date where at least one row in STAAT has a
-       prod_release_date in the target month.
-    2. For each such iteration take only the MAX(batch) rows from both STAAT
-       and ODM, then LEFT JOIN ODM onto STAAT.
+    1. Identify every ``iteration_end_date`` in STAAT whose ``prod_release_date``
+       falls in the target month (e.g. ``'2026-05'``).
+    2. For each such iteration take ``MAX(batch)`` rows from both STAAT and ODM.
+    3. LEFT JOIN ODM onto STAAT so stories without ODM rows are still included.
     """
     staat_table = f"{schema}.staat_insight_release"
     odm_table   = f"{schema}.odm_release_details"
 
     return f"""
     WITH target_iterations AS (
-        -- Iterations that have a prod_release_date in the selected month
         SELECT
             iteration_end_date,
             MAX(batch) AS max_batch
@@ -145,9 +182,8 @@ def _build_month_query(month_value: str, schema: str) -> str:
 
 def get_exec_summary_data(
     month_value: str,
-) -> tuple[pd.DataFrame, pd.DataFrame | None]:
-    """
-    Query GP and return ``(current_month_df, next_month_df)``.
+) -> tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+    """Query GP and return ``(current_month_df, next_month_df)``.
 
     Parameters
     ----------
@@ -157,9 +193,9 @@ def get_exec_summary_data(
     Returns
     -------
     current_month_df : pd.DataFrame
-        Rows for the selected month (latest batch per iteration).
-    next_month_df : pd.DataFrame | None
-        Rows for the following month, or ``None`` if no data exists.
+        Latest-batch rows for the selected month.
+    next_month_df : Optional[pd.DataFrame]
+        Latest-batch rows for the following month, or ``None`` if no data.
     """
     schema = _get_schema()
     conn   = _get_gp_conn()
@@ -167,12 +203,11 @@ def get_exec_summary_data(
     current_df = pd.read_sql_query(_build_month_query(month_value, schema), conn)
     current_df["change_type"] = current_df["change_type"].replace({"added": "new"})
 
-    # Derive next month
     try:
         next_period = str(pd.Period(month_value, "M") + 1)
-        next_df = pd.read_sql_query(_build_month_query(next_period, schema), conn)
+        next_df     = pd.read_sql_query(_build_month_query(next_period, schema), conn)
         next_df["change_type"] = next_df["change_type"].replace({"added": "new"})
-        next_month_df: pd.DataFrame | None = next_df if not next_df.empty else None
+        next_month_df: Optional[pd.DataFrame] = next_df if not next_df.empty else None
     except Exception:
         next_month_df = None
 
@@ -181,11 +216,7 @@ def get_exec_summary_data(
 
 
 def get_month_options_from_db() -> list[dict]:
-    """
-    Return sorted dropdown options derived from STAAT prod_release_date values.
-    Call this from the refresh_exec_summary_data callback instead of
-    extract_month_options().
-    """
+    """Return sorted dropdown options queried directly from GP."""
     schema = _get_schema()
     conn   = _get_gp_conn()
     sql    = f"""
@@ -207,20 +238,16 @@ def get_month_options_from_db() -> list[dict]:
     return options
 
 
-# ── Legacy helper (kept for backward compatibility with refresh callback) ─────
+# ── Legacy helpers (kept for backward compatibility) ──────────────────────────
 
 def extract_month_options(df: pd.DataFrame) -> list[dict]:
-    """Return sorted dropdown options from a pre-loaded DataFrame.
-
-    Prefer ``get_month_options_from_db()`` for fresh data.
-    """
+    """Return sorted dropdown options from a pre-loaded DataFrame."""
     if df is None or df.empty or "prod_release_date" not in df.columns:
         return []
     dates = pd.to_datetime(df["prod_release_date"], errors="coerce").dropna()
     if dates.empty:
         return []
-    months        = dates.dt.to_period("M").unique()
-    months_sorted = sorted(months, reverse=True)
+    months_sorted = sorted(dates.dt.to_period("M").unique(), reverse=True)
     return [
         {"label": p.to_timestamp().strftime("%B %Y"), "value": str(p)}
         for p in months_sorted
@@ -232,41 +259,41 @@ def filter_by_month(df: pd.DataFrame, month_value: str) -> pd.DataFrame:
     if df is None or df.empty or "prod_release_date" not in df.columns:
         return pd.DataFrame()
     dates = pd.to_datetime(df["prod_release_date"], errors="coerce")
-    mask  = dates.dt.to_period("M").astype(str) == month_value
-    return df.loc[mask]
+    return df.loc[dates.dt.to_period("M").astype(str) == month_value]
 
 
 # ── Label helpers ─────────────────────────────────────────────────────────────
 
 def _has_label(labels_value, target: str) -> bool:
-    """Return True if *target* appears as one of the comma-separated labels."""
+    """Return True if *target* is one of the comma-separated labels (case-insensitive)."""
     if not labels_value or not isinstance(labels_value, str):
         return False
-    parts = [lbl.strip().lower() for lbl in labels_value.split(",")]
-    return target.lower() in parts
+    return target.lower() in [lbl.strip().lower() for lbl in labels_value.split(",")]
 
 
 def _filter_by_label(df: pd.DataFrame, label: str) -> pd.DataFrame:
-    """Return rows whose *labels* column contains *label* (case-insensitive)."""
+    """Return rows whose labels column contains *label* exactly."""
     if df is None or df.empty or "labels" not in df.columns:
         return pd.DataFrame()
-    mask = df["labels"].apply(lambda v: _has_label(v, label))
-    return df.loc[mask]
+    return df.loc[df["labels"].apply(lambda v: _has_label(v, label))]
 
 
 # ── Prompt builder ────────────────────────────────────────────────────────────
 
-def _build_prompt(issues_df: pd.DataFrame, next_month_df: pd.DataFrame | None = None) -> str:
+def _build_prompt(
+    issues_df: pd.DataFrame,
+    next_month_df: Optional[pd.DataFrame] = None,
+) -> str:
     """Build the LLM prompt from the filtered insight-release data.
 
     Label conventions
     -----------------
-    * ``"Top Feature"`` label  → Section 2 (Top Feature of the Month).
-    * ``"New Insight"`` label  → Section 3 (New Insights ranked by impact).
-    All other issues feed Section 1 (Executive Summary context).
+    ``"Top Feature"`` label → Section 2 (Top Feature of the Month).
+    ``"New Insight"`` label → Section 3 (New Insights ranked by impact).
+    All stories feed Section 1 context regardless of label.
     """
 
-    # ── Section 1: All story/issue context ───────────────────────────────────
+    # ── Section 1: all stories ────────────────────────────────────────────────
     issues_lines: list[str] = []
     seen_ids: set = set()
 
@@ -285,8 +312,8 @@ def _build_prompt(issues_df: pd.DataFrame, next_month_df: pd.DataFrame | None = 
 
     issues_text = "\n\n".join(issues_lines[:20]) if issues_lines else "No issues data available."
 
-    # ── Section 2: Top Feature (label = "Top Feature") ────────────────────────
-    top_feature_df   = _filter_by_label(issues_df, "Top Feature")
+    # ── Section 2: Top Feature ────────────────────────────────────────────────
+    top_feature_df    = _filter_by_label(issues_df, "Top Feature")
     top_feature_lines: list[str] = []
     seen_top: set = set()
 
@@ -309,8 +336,8 @@ def _build_prompt(issues_df: pd.DataFrame, next_month_df: pd.DataFrame | None = 
         else "No issue labelled 'Top Feature' found for this period."
     )
 
-    # ── Section 3: New Insights (label = "New Insight") ───────────────────────
-    new_insight_df   = _filter_by_label(issues_df, "New Insight")
+    # ── Section 3: New Insights ───────────────────────────────────────────────
+    new_insight_df    = _filter_by_label(issues_df, "New Insight")
     new_insights_lines: list[str] = []
     seen_rules: set = set()
 
@@ -333,19 +360,18 @@ def _build_prompt(issues_df: pd.DataFrame, next_month_df: pd.DataFrame | None = 
         else "No issues labelled 'New Insight' found for this period."
     )
 
-    # ── Section 6: Looking Ahead – next-month data ────────────────────────────
+    # ── Section 6: Looking Ahead ──────────────────────────────────────────────
     next_month_lines: list[str] = []
     if next_month_df is not None and not next_month_df.empty:
         next_seen_rules: set = set()
         for _, row in next_month_df.iterrows():
-            rule   = row.get("rule_name", "")
-            change = row.get("change_type", "")
+            rule = row.get("rule_name", "")
             if rule and rule not in next_seen_rules:
                 next_seen_rules.add(rule)
                 next_month_lines.append(
                     f"- Rule Name:   {rule}\n"
                     f"  Target Type: {row.get('target_type', 'N/A')}\n"
-                    f"  Change Type: {change}\n"
+                    f"  Change Type: {row.get('change_type', 'N/A')}\n"
                     f"  Title:       {row.get('title', 'N/A')}\n"
                     f"  Labels:      {row.get('labels', 'N/A')}"
                 )
@@ -408,28 +434,31 @@ def _build_prompt(issues_df: pd.DataFrame, next_month_df: pd.DataFrame | None = 
     - Section 2 Top Feature: pick the single most impactful item from the "Top Feature" labelled issues
     - Section 3 New Insights: list each individual insight on a separate line, drawn from "New Insight" labelled issues
     - Section 6 Looking Ahead: if no next-month data is available, provide directional focus areas based on current trends
-    - Do NOT include the instruction notes in the final output
+    - Do NOT include instruction notes in the final output
     """
     return prompt.strip()
 
 
-# ── LLM call ─────────────────────────────────────────────────────────────────
+# ── LLM call ──────────────────────────────────────────────────────────────────
 
-def generate_summary(issues_df: pd.DataFrame, next_month_df: pd.DataFrame | None = None) -> str:
+def generate_summary(
+    issues_df: pd.DataFrame,
+    next_month_df: Optional[pd.DataFrame] = None,
+) -> str:
     """Call the LLM and return the executive summary text."""
-    client = _get_openai_client()
-    prompt = _build_prompt(issues_df, next_month_df=next_month_df)
+    client   = _get_openai_client()
+    prompt   = _build_prompt(issues_df, next_month_df=next_month_df)
     response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=MAX_TOKENS,
-        temperature=TEMPERATURE,
+        model       =MODEL_NAME,
+        messages    =[{"role": "user", "content": prompt}],
+        max_tokens  =MAX_TOKENS,
+        temperature =TEMPERATURE,
     )
     return response.choices[0].message.content.strip()
 
 
 def build_save_content(summary_text: str, month_label: str) -> str:
-    """Format the summary for saving to a text file."""
+    """Format the summary for saving to a .txt file."""
     header = (
         f"Executive Summary Report – {month_label}\n"
         f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
@@ -439,18 +468,21 @@ def build_save_content(summary_text: str, month_label: str) -> str:
     return header + summary_text
 
 
-# ── Layout ────────────────────────────────────────────────────────────────────
+# ── Dash layout (production only) ─────────────────────────────────────────────
+# layout() is only called from insights_release_dashboard.py when Dash is
+# running inside the server.  It is never called from the notebook.
 
 def layout(df: pd.DataFrame):
-    """Return the ``dcc.Tab`` component for the Executive Summary tab.
+    """Return the ``dcc.Tab`` component for the Executive Summary tab."""
+    if not _DASH_AVAILABLE:
+        raise RuntimeError(
+            "Dash is not installed in this environment. "
+            "layout() can only be called from the dashboard server."
+        )
 
-    ``df`` is accepted for backward compatibility but month options are now
-    driven from the DB via ``get_month_options_from_db()``.
-    """
     try:
         month_options = get_month_options_from_db()
     except Exception:
-        # Fallback to in-memory DataFrame if DB is unavailable at import time
         month_options = extract_month_options(df)
 
     default_month = month_options[0]["value"] if month_options else None
@@ -460,7 +492,6 @@ def layout(df: pd.DataFrame):
         value="tab-executive-summary",
         children=html.Div(
             [
-                # Hidden stores
                 dcc.Store(id="exec-summary-text-store", data=""),
 
                 html.H3(
@@ -468,7 +499,7 @@ def layout(df: pd.DataFrame):
                     style=release_dashboard_styles["section_header_style"],
                 ),
 
-                # Toolbar – controls panel
+                # Toolbar
                 html.Div(
                     [
                         html.Div(
@@ -532,17 +563,18 @@ def layout(df: pd.DataFrame):
                             children=html.Div(
                                 id="exec-summary-output",
                                 children=(
-                                    "Select a month and click 'Generate Executive Summary' to begin."
+                                    "Select a month and click "
+                                    "'Generate Executive Summary' to begin."
                                 ),
                                 style={
                                     **release_dashboard_styles.get("table_style", {}),
-                                    "padding": "20px",
-                                    "background": "#ffffff",
+                                    "padding"     : "20px",
+                                    "background"  : "#ffffff",
                                     "borderRadius": "8px",
-                                    "minHeight": "220px",
-                                    "whiteSpace": "pre-wrap",
-                                    "fontSize": "14px",
-                                    "lineHeight": "1.6",
+                                    "minHeight"   : "220px",
+                                    "whiteSpace"  : "pre-wrap",
+                                    "fontSize"    : "14px",
+                                    "lineHeight"  : "1.6",
                                 },
                             ),
                         ),
@@ -550,7 +582,7 @@ def layout(df: pd.DataFrame):
                     style={"marginTop": "18px"},
                 ),
 
-                # Toast for save feedback
+                # Toast
                 dbc.Toast(
                     id="exec-summary-save-toast",
                     header="Executive Summary",
@@ -561,9 +593,9 @@ def layout(df: pd.DataFrame):
                     dismissable=True,
                     style={
                         "position": "fixed",
-                        "top": 16,
-                        "right": 16,
-                        "zIndex": 9999,
+                        "top"     : 16,
+                        "right"   : 16,
+                        "zIndex"  : 9999,
                     },
                 ),
             ],
