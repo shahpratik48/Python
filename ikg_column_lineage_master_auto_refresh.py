@@ -345,7 +345,11 @@ def is_running_in_airflow() -> bool:
 
 def get_private_token(allow_prompt: bool = True) -> str:
     if is_running_in_airflow():
-        return Variable.get(GITLAB_TOKEN_VAR)
+        try:
+            return Variable.get(GITLAB_TOKEN_VAR)
+        except Exception as e:
+            logger.warning(f"Could not retrieve Airflow Variable '{GITLAB_TOKEN_VAR}': {e}. "
+                           "Falling back to environment variable.")
     token = os.environ.get(GITLAB_TOKEN_VAR)
     if token:
         return token
@@ -374,7 +378,12 @@ def get_greenplum_credentials() -> Optional[dict]:
         return None
     try:
         from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
-        conn_id = Variable.get(POSTGRES_CONN_ID_VAR)
+        try:
+            conn_id = Variable.get(POSTGRES_CONN_ID_VAR)
+        except Exception as e:
+            logger.warning(f"Could not retrieve Airflow Variable '{POSTGRES_CONN_ID_VAR}': {e}. "
+                           "Cannot resolve Greenplum credentials.")
+            return None
         hook = PostgresHook(postgres_conn_id=conn_id)
         conn = hook.get_connection(conn_id)
         return {"host": conn.host, "port": int(conn.port or GREENPLUM_PORT),
@@ -1851,6 +1860,20 @@ def _get_table_columns(schema: str, table: str) -> List[str]:
     if _DB_ENGINE is None:
         _INFO_SCHEMA_CACHE[key] = []
         return []
+
+    # Temporarily suspend SIGALRM while executing the DB query so that a
+    # per-file alarm does not fire inside the SQLAlchemy/psycopg2 connection
+    # pool and bubble up as an error in Airflow's secrets/metastore backend.
+    import signal as _sig_col
+    _use_alarm_col = hasattr(_sig_col, "SIGALRM")
+    _prev_col_handler = None
+    if _use_alarm_col:
+        try:
+            _prev_col_handler = _sig_col.signal(_sig_col.SIGALRM, _sig_col.SIG_IGN)
+            _sig_col.alarm(0)
+        except Exception:
+            _use_alarm_col = False
+
     try:
         import pandas as _pd
         if actual_schema:
@@ -1893,6 +1916,12 @@ def _get_table_columns(schema: str, table: str) -> List[str]:
         logger.debug(f"pg_catalog lookup failed for {actual_schema}.{table}: {e}")
         _INFO_SCHEMA_CACHE[key] = []
         return []
+    finally:
+        if _use_alarm_col and _prev_col_handler is not None:
+            try:
+                _sig_col.signal(_sig_col.SIGALRM, _prev_col_handler)
+            except Exception:
+                pass
 
 # Known canonical schemas for unresolved-column lookups
 _LOOKUP_SCHEMAS = (
@@ -2205,6 +2234,19 @@ def prewarm_schema_cache() -> int:
     """
     if _DB_ENGINE is None:
         return 0
+    import signal as _sig_pw
+    import time as _t_pw
+    # Temporarily disable SIGALRM (if active) so the DB connection during
+    # pre-warm is not interrupted by a per-file timeout signal.  The alarm
+    # is restored to its previous handler after the query completes.
+    _prev_handler = None
+    _use_alarm_pw = hasattr(_sig_pw, "SIGALRM")
+    if _use_alarm_pw:
+        try:
+            _prev_handler = _sig_pw.signal(_sig_pw.SIGALRM, _sig_pw.SIG_IGN)
+            _sig_pw.alarm(0)  # cancel any pending alarm
+        except Exception:
+            _use_alarm_pw = False
     try:
         import pandas as _pd
         sch_in = ", ".join("'" + s.lower() + "'" for s in _LOOKUP_SCHEMAS)
@@ -2231,6 +2273,13 @@ def prewarm_schema_cache() -> int:
     except Exception as exc:
         logger.warning(f"prewarm_schema_cache failed (non-fatal): {exc}")
         return 0
+    finally:
+        # Restore SIGALRM handler regardless of success/failure
+        if _use_alarm_pw and _prev_handler is not None:
+            try:
+                _sig_pw.signal(_sig_pw.SIGALRM, _prev_handler)
+            except Exception:
+                pass
 
 def parse_lineage_parallel(file_dict: dict, n_workers: int = 0,
                             file_timeout: float = 30.0,
@@ -3289,7 +3338,10 @@ def run(private_token=None, pg_password=None, use_local_sql=False,
                 _DB_ENGINE = _ce(
                     f"postgresql://{creds.get('user', GREENPLUM_USER)}:{pg_password}"
                     f"@{creds.get('host', GREENPLUM_HOST)}:{creds.get('port', GREENPLUM_PORT)}"
-                    f"/{creds.get('db', GREENPLUM_DB)}"
+                    f"/{creds.get('db', GREENPLUM_DB)}",
+                    connect_args={"connect_timeout": 10},
+                    pool_timeout=10,
+                    pool_pre_ping=True,
                 )
                 logger.info("DB engine ready for information_schema lookups.")
             except Exception as e:
@@ -3299,7 +3351,10 @@ def run(private_token=None, pg_password=None, use_local_sql=False,
             from sqlalchemy import create_engine as _ce
             _DB_ENGINE = _ce(
                 f"postgresql://{GREENPLUM_USER}:{pg_password}"
-                f"@{GREENPLUM_HOST}:{GREENPLUM_PORT}/{GREENPLUM_DB}"
+                f"@{GREENPLUM_HOST}:{GREENPLUM_PORT}/{GREENPLUM_DB}",
+                connect_args={"connect_timeout": 10},
+                pool_timeout=10,
+                pool_pre_ping=True,
             )
             logger.info("DB engine ready for information_schema lookups.")
         except Exception as e:
@@ -3321,7 +3376,7 @@ def run(private_token=None, pg_password=None, use_local_sql=False,
     # detailed log file output (parse_lineage.log in the working directory).
     pll_rows, pll_errors = parse_lineage_parallel(
         file_dict,
-        file_timeout=30.0,
+        file_timeout=120.0,
         log_path="parse_lineage.log"
     )
     all_rows = pll_rows
