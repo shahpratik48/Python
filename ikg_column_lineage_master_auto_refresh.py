@@ -3357,7 +3357,13 @@ def save_to_greenplum(df: pd.DataFrame, schema: str, password: str,
     except ImportError:
         logger.error("sqlalchemy/psycopg2 not installed."); return False
 
-    engine = create_engine(f"postgresql://{user}:{password}@{host}:{port}/{db}")
+    from urllib.parse import quote_plus as _qp
+    # URL-encode the password so special characters (@ # % : / ? = &)
+    # are not misinterpreted by SQLAlchemy's URL parser.  Greenplum uses
+    # LDAP authentication — it binds to the LDAP server with the username
+    # and the exact password; if the password arrives garbled due to URL
+    # mis-encoding the LDAP bind fails with "LDAP authentication failed".
+    engine = create_engine(f"postgresql://{_qp(user)}:{_qp(password)}@{host}:{port}/{db}")
     try:
         raw = engine.raw_connection()
         with raw.cursor() as cur:
@@ -3438,10 +3444,14 @@ def run(private_token=None, pg_password=None, use_local_sql=False,
             pg_password = creds.get('password')
             try:
                 from sqlalchemy import create_engine as _ce
+                from urllib.parse import quote_plus as _qp_run
+                _u = creds.get('user', GREENPLUM_USER)
+                _p = _qp_run(pg_password)
+                _h = creds.get('host', GREENPLUM_HOST)
+                _pt = creds.get('port', GREENPLUM_PORT)
+                _d = creds.get('db', GREENPLUM_DB)
                 _DB_ENGINE = _ce(
-                    f"postgresql://{creds.get('user', GREENPLUM_USER)}:{pg_password}"
-                    f"@{creds.get('host', GREENPLUM_HOST)}:{creds.get('port', GREENPLUM_PORT)}"
-                    f"/{creds.get('db', GREENPLUM_DB)}",
+                    f"postgresql://{_qp_run(_u)}:{_p}@{_h}:{_pt}/{_d}",
                     connect_args={"connect_timeout": 10},
                     pool_timeout=10,
                     pool_pre_ping=True,
@@ -3452,8 +3462,9 @@ def run(private_token=None, pg_password=None, use_local_sql=False,
     elif pg_password:
         try:
             from sqlalchemy import create_engine as _ce
+            from urllib.parse import quote_plus as _qp_run2
             _DB_ENGINE = _ce(
-                f"postgresql://{GREENPLUM_USER}:{pg_password}"
+                f"postgresql://{_qp_run2(GREENPLUM_USER)}:{_qp_run2(pg_password)}"
                 f"@{GREENPLUM_HOST}:{GREENPLUM_PORT}/{GREENPLUM_DB}",
                 connect_args={"connect_timeout": 10},
                 pool_timeout=10,
@@ -3512,11 +3523,23 @@ def run(private_token=None, pg_password=None, use_local_sql=False,
             creds = get_greenplum_credentials()
             if creds: pg_password = creds.get('password')
         if pg_password:
-            save_to_greenplum(df, schema, pg_password)
+            try:
+                save_to_greenplum(df, schema, pg_password)
+            except Exception as _gp_err:
+                # Log the Greenplum write failure (e.g. LDAP auth error) but do NOT
+                # re-raise — the Excel file is already saved and is the primary output.
+                # The task should succeed so the EmailOperator can attach it.
+                logger.error(
+                    "Greenplum write failed (Excel output is still available): %s",
+                    _gp_err
+                )
     elif allow_prompt:
         if input("Save to Greenplum? (yes/no): ").strip().lower() in ('yes', 'y'):
             pg_password = getpass.getpass("Password: ")
-            save_to_greenplum(df, schema, pg_password)
+            try:
+                save_to_greenplum(df, schema, pg_password)
+            except Exception as _gp_err:
+                logger.error("Greenplum write failed: %s", _gp_err)
 
     logger.info(f"✅ Done → {out}")
     return out
