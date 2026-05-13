@@ -49,6 +49,9 @@ EXCLUDED_PROCESSES = {
 
 # Cache for information_schema column lookups: {(schema, table): [col1, col2, ...]}
 _INFO_SCHEMA_CACHE: Dict[Tuple[str, str], List[str]] = {}
+# Reverse index: col_name_lower -> [(schema, table), ...] — built by prewarm_schema_cache.
+# Enables O(1) column-to-table lookups without any DB round-trip.
+_COL_TO_TABLES_INDEX: Dict[str, List[Tuple[str, str]]] = {}
 # Global DB engine for information_schema lookups (set during run)
 _DB_ENGINE = None
 
@@ -65,35 +68,59 @@ JINJA_SCHEMA_MAP: Dict[str, str] = {
     "IKG_WEALTHX_SCHEMA":   "sandbox_prj_smart_relationship",
 }
 
+# Cache for resolved schema names — populated once at startup so Variable.get
+# is never called repeatedly during the per-file parsing loop.
+_RESOLVED_SCHEMA_CACHE: Dict[str, str] = {}
+
+
 def _resolve_schema(jinja_param_name: str) -> str:
     """
     Resolve a Jinja parameter name like 'IKG_SCHEMA' to an actual schema.
-    In Airflow, attempts to read from Airflow Variables/props first.
-    Falls back to JINJA_SCHEMA_MAP for local runs.
+    Result is cached in _RESOLVED_SCHEMA_CACHE after the first lookup so
+    Airflow Variable.get is never called during the per-file parsing loop
+    (which runs under SIGALRM and can trigger MetastoreBackend timeouts).
     """
+    if jinja_param_name in _RESOLVED_SCHEMA_CACHE:
+        return _RESOLVED_SCHEMA_CACHE[jinja_param_name]
+
+    result = None
     if is_running_in_airflow():
         try:
             from ikg.scripts.python import props as ikg_props  # type: ignore
             airflow_vars = ikg_props.get_airflow_variables()
-            val = airflow_vars.get(jinja_param_name)
-            if val:
-                return val
+            result = airflow_vars.get(jinja_param_name)
         except Exception:
             pass
-        try:
-            if Variable is not None:
-                val = Variable.get(jinja_param_name, default_var=None)
-                if val:
-                    return val
-        except Exception:
-            pass
-    return JINJA_SCHEMA_MAP.get(jinja_param_name, jinja_param_name)
+        if not result:
+            try:
+                if Variable is not None:
+                    result = Variable.get(jinja_param_name, default_var=None)
+            except Exception:
+                pass
+
+    if not result:
+        result = JINJA_SCHEMA_MAP.get(jinja_param_name, jinja_param_name)
+
+    _RESOLVED_SCHEMA_CACHE[jinja_param_name] = result
+    return result
+
+
+def prewarm_schema_resolution() -> None:
+    """
+    Pre-resolve all known Jinja schema param names into _RESOLVED_SCHEMA_CACHE
+    at startup so Variable.get is never called during the parsing loop.
+    Call this once before parse_lineage_parallel().
+    """
+    for param_name in JINJA_SCHEMA_MAP:
+        _resolve_schema(param_name)
 
 
 def _resolve_schema_label(schema_label: str) -> str:
     """
     Convert a schema label (either a real schema name or a Jinja param name
     like 'IKG_SCHEMA') to an actual schema name for information_schema queries.
+    Results are cached via _resolve_schema so Variable.get is never called
+    during the per-file parsing loop.
     """
     if not schema_label:
         return ''
@@ -103,7 +130,11 @@ def _resolve_schema_label(schema_label: str) -> str:
     # Try stripping {{params.X}} to get X
     jm = _RC_JINJA_PARAM_LABEL.search(schema_label)
     if jm:
-        return _resolve_schema(jm.group(1).strip())
+        param = jm.group(1).strip()
+        # Also cache the {{params.X}} form directly to avoid re-parsing next time
+        if schema_label not in _RESOLVED_SCHEMA_CACHE:
+            _RESOLVED_SCHEMA_CACHE[schema_label] = _resolve_schema(param)
+        return _RESOLVED_SCHEMA_CACHE[schema_label]
     return schema_label
 
 COLUMN_ORDER = [
@@ -1944,37 +1975,80 @@ def _find_column_in_tables(col_name: str,
     Results are cached in _FIND_COL_CACHE to avoid repeated DB round-trips.
     Returns (schema, table) of the first match, or ('', '') if not found / no DB.
     """
-    if not candidate_tables or _DB_ENGINE is None:
+    if not candidate_tables:
         return '', ''
 
-    # Build cache key upfront — needed for both lookup and every return path
-    _ck = (col_name.lower(), frozenset(candidate_tables), strict_candidates_only)
+    col_lower = col_name.lower()
+
+    # ── Build cache key once ──────────────────────────────────────────────
+    _ck = (col_lower, frozenset(candidate_tables), strict_candidates_only)
     if _ck in _FIND_COL_CACHE:
         return _FIND_COL_CACHE[_ck]
 
+    _SKIP = {'SELECT', 'FROM', 'WHERE', 'JOIN', 'ON', 'AS', 'WITH'}
+
+    # ── Fast path 1: _INFO_SCHEMA_CACHE per-table lookup ────────────────
+    # (already populated by prewarm_schema_cache for known schemas)
+    for _s, _t in candidate_tables:
+        if not _t or _t.upper() in _SKIP:
+            continue
+        _rs = _resolve_schema_label(_s) if _s else ''
+        _tkey = (_rs.lower(), _t.lower())
+        if _tkey in _INFO_SCHEMA_CACHE:
+            _cols = _INFO_SCHEMA_CACHE[_tkey]
+            if _cols and col_lower in [_c.lower() for _c in _cols]:
+                _hit = (_rs, _t)
+                _FIND_COL_CACHE[_ck] = _hit
+                return _hit
+
+    # ── Fast path 2: reverse column index (built by prewarm_schema_cache) ─
+    # No DB call needed — look up col_name in the pre-built index and
+    # intersect with candidate table names.
+    if _COL_TO_TABLES_INDEX:
+        _matches = _COL_TO_TABLES_INDEX.get(col_lower, [])
+        if _matches:
+            # Build set of candidate table names (lower) for fast intersection
+            _cand_tbls = {_t.lower() for _s, _t in candidate_tables
+                          if _t and _t.upper() not in _SKIP}
+            for _ms, _mt in _matches:
+                if _mt in _cand_tbls:
+                    _hit = (_ms, _mt)
+                    _FIND_COL_CACHE[_ck] = _hit
+                    return _hit
+            # If strict_candidates_only, stop here — don't look in other schemas
+            if not strict_candidates_only:
+                # Return first match from any schema (not restricted to candidates)
+                if _matches:
+                    _hit = _matches[0]
+                    _FIND_COL_CACHE[_ck] = _hit
+                    return _hit
+        _FIND_COL_CACHE[_ck] = ('', '')
+        return '', ''
+
+    # ── Slow path: DB query (only if prewarm_schema_cache was skipped) ───
+    if _DB_ENGINE is None:
+        _FIND_COL_CACHE[_ck] = ('', '')
+        return '', ''
+
+    # ── Slow-path DB query (only reached when prewarm index misses) ───────
+    # Suspend SIGALRM during the DB call so a per-file alarm cannot fire
+    # inside the psycopg2 connection pool and surface in Airflow's metastore.
+    import signal as _sig_find
+    _use_alarm_find = hasattr(_sig_find, "SIGALRM")
+    _prev_find_handler = None
+    if _use_alarm_find:
+        try:
+            _prev_find_handler = _sig_find.signal(_sig_find.SIGALRM, _sig_find.SIG_IGN)
+            _sig_find.alarm(0)
+        except Exception:
+            _use_alarm_find = False
     try:
         import pandas as _pd
-        _SKIP = {'SELECT', 'FROM', 'WHERE', 'JOIN', 'ON', 'AS', 'WITH'}
         tbl_list = list({t for s, t in candidate_tables
                          if t and t.upper() not in _SKIP})
         if not tbl_list:
             _FIND_COL_CACHE[_ck] = ('', '')
             return '', ''
-
-        # Fast path: if _INFO_SCHEMA_CACHE already has this table's columns,
-        # resolve directly without a DB query.
-        col_lower = col_name.lower()
-        for _s, _t in candidate_tables:
-            if not _t or _t.upper() in _SKIP:
-                continue
-            _rs = _resolve_schema_label(_s) if _s else ''
-            _tkey = (_rs.lower(), _t.lower())
-            if _tkey in _INFO_SCHEMA_CACHE:
-                _cols = _INFO_SCHEMA_CACHE[_tkey]
-                if _cols and col_lower in [_c.lower() for _c in _cols]:
-                    _hit = (_rs, _t)
-                    _FIND_COL_CACHE[_ck] = _hit
-                    return _hit
 
         tbl_in_lower = ', '.join("'" + t.lower() + "'" for t in tbl_list)
 
@@ -2005,11 +2079,23 @@ def _find_column_in_tables(col_name: str,
         )
         result = _pd.read_sql(q, _DB_ENGINE)
         if not result.empty:
-            _found = result['source_schema'].iloc[0], result['source_table'].iloc[0]
+            # Also warm the cache for this table so future calls are free
+            _tbl_result = result['source_table'].iloc[0]
+            _sch_result = result['source_schema'].iloc[0]
+            _tkey_result = (_sch_result.lower(), _tbl_result.lower())
+            if _tkey_result not in _INFO_SCHEMA_CACHE:
+                _INFO_SCHEMA_CACHE[_tkey_result] = []
+            _found = (_sch_result, _tbl_result)
             _FIND_COL_CACHE[_ck] = _found
             return _found
     except Exception as e:
         logger.debug(f"pg_catalog column lookup failed for {col_name}: {e}")
+    finally:
+        if _use_alarm_find and _prev_find_handler is not None:
+            try:
+                _sig_find.signal(_sig_find.SIGALRM, _prev_find_handler)
+            except Exception:
+                pass
 
     _FIND_COL_CACHE[_ck] = ('', '')
     return '', ''
@@ -2265,10 +2351,19 @@ def prewarm_schema_cache() -> int:
         count = 0
         for (schema, tbl), grp in df.groupby(["schema", "tbl"]):
             key = (schema, tbl)
-            _INFO_SCHEMA_CACHE[key] = grp["col"].tolist()
+            cols = grp["col"].tolist()
+            _INFO_SCHEMA_CACHE[key] = cols
+            # Build reverse index: column_name -> [(schema, table), ...]
+            # This lets _find_column_in_tables resolve without any DB query.
+            for col in cols:
+                col_lower = col.lower()
+                if col_lower not in _COL_TO_TABLES_INDEX:
+                    _COL_TO_TABLES_INDEX[col_lower] = []
+                _COL_TO_TABLES_INDEX[col_lower].append((schema, tbl))
             count += 1
         logger.info(f"prewarm_schema_cache: cached {count} tables "
-                    f"({len(df)} columns) from {len(_LOOKUP_SCHEMAS)} schemas")
+                    f"({len(df)} columns, {len(_COL_TO_TABLES_INDEX)} unique columns) "
+                    f"from {len(_LOOKUP_SCHEMAS)} schemas")
         return count
     except Exception as exc:
         logger.warning(f"prewarm_schema_cache failed (non-fatal): {exc}")
@@ -2303,13 +2398,21 @@ def parse_lineage_parallel(file_dict: dict, n_workers: int = 0,
 
     plog = _get_parse_logger(log_path)
 
+    # ── Pre-warm schema name resolution (resolve all Jinja params once) ─
+    # Must happen before prewarm_schema_cache so Variable.get is never
+    # called under SIGALRM during the per-file parsing loop.
+    prewarm_schema_resolution()
+    plog.info("Schema param names pre-resolved: %d entries", len(_RESOLVED_SCHEMA_CACHE))
+
     # Pre-warm column cache — one bulk DB query instead of
     # thousands of per-column queries during parsing.
     _pw_start = _t.perf_counter()
     _pw_tables = prewarm_schema_cache()
     _pw_elapsed = _t.perf_counter() - _pw_start
     if _pw_tables:
-        plog.info(f"Schema cache pre-warmed: {_pw_tables} tables in {_pw_elapsed:.2f}s")
+        plog.info(f"Schema cache pre-warmed: {_pw_tables} tables, "
+                  f"{len(_COL_TO_TABLES_INDEX)} unique columns "
+                  f"in {_pw_elapsed:.2f}s")
 
     items = list(file_dict.items())
     n     = len(items)
@@ -3395,7 +3498,13 @@ def run(private_token=None, pg_password=None, use_local_sql=False,
     df['current_date_time'] = pd.to_datetime(df['current_date_time'])
 
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    out = f"ikg_column_lineage_master_auto_refresh_{ts}.xlsx"
+    # Use an absolute path so save_to_excel never fails with
+    # "Cannot save file into a non-existent directory: '.'"
+    # on Airflow pods where CWD may not physically exist as a real directory.
+    _cwd = os.getcwd()
+    if not os.path.isdir(_cwd):
+        _cwd = os.path.dirname(os.path.abspath(__file__))
+    out = os.path.join(_cwd, f"ikg_column_lineage_master_auto_refresh_{ts}.xlsx")
     save_to_excel(df, out)
 
     if pg_password or is_running_in_airflow():
