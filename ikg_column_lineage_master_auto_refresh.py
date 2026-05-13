@@ -3437,21 +3437,29 @@ def run(private_token=None, pg_password=None, use_local_sql=False,
 
     schema = ensure_greenplum_schema()
 
+    # _gp_creds holds the FULL connection dict from the Airflow connection object
+    # (host, port, db, user, password). It is stored at function scope so that
+    # save_to_greenplum() always uses the Airflow-sourced values — never the
+    # hardcoded module-level fallback constants (GREENPLUM_HOST, GREENPLUM_USER…).
+    _gp_creds: Optional[dict] = None
+    from urllib.parse import quote_plus as _qp_url
+
     # Resolve DB password early so information_schema lookups work during parsing
     if pg_password is None and is_running_in_airflow():
-        creds = get_greenplum_credentials()
-        if creds:
-            pg_password = creds.get('password')
+        _gp_creds = get_greenplum_credentials()
+        if _gp_creds:
+            pg_password = _gp_creds.get('password')
             try:
                 from sqlalchemy import create_engine as _ce
-                from urllib.parse import quote_plus as _qp_run
-                _u = creds.get('user', GREENPLUM_USER)
-                _p = _qp_run(pg_password)
-                _h = creds.get('host', GREENPLUM_HOST)
-                _pt = creds.get('port', GREENPLUM_PORT)
-                _d = creds.get('db', GREENPLUM_DB)
+                _u  = _gp_creds.get('user', GREENPLUM_USER)
+                _h  = _gp_creds.get('host', GREENPLUM_HOST)
+                _pt = _gp_creds.get('port', GREENPLUM_PORT)
+                _d  = _gp_creds.get('db',   GREENPLUM_DB)
+                logger.info(
+                    "Greenplum connection: host=%s port=%s db=%s user=%s", _h, _pt, _d, _u
+                )
                 _DB_ENGINE = _ce(
-                    f"postgresql://{_qp_run(_u)}:{_p}@{_h}:{_pt}/{_d}",
+                    f"postgresql://{_qp_url(_u)}:{_qp_url(pg_password)}@{_h}:{_pt}/{_d}",
                     connect_args={"connect_timeout": 10},
                     pool_timeout=10,
                     pool_pre_ping=True,
@@ -3462,9 +3470,8 @@ def run(private_token=None, pg_password=None, use_local_sql=False,
     elif pg_password:
         try:
             from sqlalchemy import create_engine as _ce
-            from urllib.parse import quote_plus as _qp_run2
             _DB_ENGINE = _ce(
-                f"postgresql://{_qp_run2(GREENPLUM_USER)}:{_qp_run2(pg_password)}"
+                f"postgresql://{_qp_url(GREENPLUM_USER)}:{_qp_url(pg_password)}"
                 f"@{GREENPLUM_HOST}:{GREENPLUM_PORT}/{GREENPLUM_DB}",
                 connect_args={"connect_timeout": 10},
                 pool_timeout=10,
@@ -3519,16 +3526,34 @@ def run(private_token=None, pg_password=None, use_local_sql=False,
     save_to_excel(df, out)
 
     if pg_password or is_running_in_airflow():
-        if not pg_password:
-            creds = get_greenplum_credentials()
-            if creds: pg_password = creds.get('password')
+        # Ensure we have creds — use the ones already fetched at the top of run()
+        # (_gp_creds) so we never fall back to hardcoded module constants.
+        if not pg_password or _gp_creds is None:
+            _gp_creds = get_greenplum_credentials()
+            if _gp_creds:
+                pg_password = pg_password or _gp_creds.get('password')
         if pg_password:
+            # Always pass ALL connection fields from the Airflow connection so
+            # save_to_greenplum never silently falls back to GREENPLUM_HOST /
+            # GREENPLUM_USER module-level constants.
+            _gp_kwargs: dict = {}
+            if _gp_creds:
+                _gp_kwargs = {
+                    'host': _gp_creds.get('host', GREENPLUM_HOST),
+                    'port': _gp_creds.get('port', GREENPLUM_PORT),
+                    'db':   _gp_creds.get('db',   GREENPLUM_DB),
+                    'user': _gp_creds.get('user',  GREENPLUM_USER),
+                }
+                logger.info(
+                    "Saving to Greenplum: host=%s port=%s db=%s user=%s schema=%s",
+                    _gp_kwargs['host'], _gp_kwargs['port'],
+                    _gp_kwargs['db'],   _gp_kwargs['user'], schema,
+                )
             try:
-                save_to_greenplum(df, schema, pg_password)
+                save_to_greenplum(df, schema, pg_password, **_gp_kwargs)
             except Exception as _gp_err:
-                # Log the Greenplum write failure (e.g. LDAP auth error) but do NOT
-                # re-raise — the Excel file is already saved and is the primary output.
-                # The task should succeed so the EmailOperator can attach it.
+                # Log the Greenplum write failure but do NOT re-raise —
+                # the Excel file is already saved and is the primary output.
                 logger.error(
                     "Greenplum write failed (Excel output is still available): %s",
                     _gp_err
