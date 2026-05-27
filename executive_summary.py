@@ -1,47 +1,49 @@
-"""executive_summary_tab.py
-Executive Summary – shared logic for the Dash UI and the monthly DAG.
+# dags/ikg/sprint_report/scripts/executive_summary.py
+# -*- coding: utf-8 -*-
+"""Executive Summary – shared logic for the Dash UI and the monthly DAG.
 
-Environment auto-detection
-──────────────────────────
-At import time the module tries to import Airflow.  The result drives every
-connection helper:
+Environment detection
+─────────────────────
+The module uses the same two-phase detection pattern as the other scripts
+in this folder:
 
-  Production / DAG  (_AIRFLOW_AVAILABLE = True)
-    GP         → PostgresHook  via Variable  "GP_Dash_connect"
-    Schema     → Variable                    "IKG_DASHBOARD_SCHEMA"
-    OpenAI     → Connection                  "STAAT-DS-OPENAI-LLM"
-    Run month  → datetime.now() (current year / month)
+  1. _HAS_AIRFLOW  – True when the Airflow package is importable.
+  2. is_running_in_airflow()  – True only when _HAS_AIRFLOW AND the
+     AIRFLOW_CTX_DAG_ID env var is set (Airflow injects this at run-time).
 
-  Local / Jupyter  (_AIRFLOW_AVAILABLE = False)
-    GP         → psycopg2 using env vars:
-                   GP_HOST  GP_PORT  GP_DB  GP_USER  GP_PASSWORD  GP_SCHEMA
-    OpenAI     → env vars:
-                   OPENAI_API_KEY   OPENAI_BASE_URL
-    Run month  → user input (handled in the notebook / caller)
+This distinction matters when a developer has Airflow installed locally:
+_HAS_AIRFLOW would be True, but is_running_in_airflow() returns False so
+credentials are still read from env vars / prompts rather than Airflow
+Connections / Variables.
+
+  Production / DAG  (is_running_in_airflow() = True)
+    GP         →  PostgresHook  via  Variable.get("GP_Dash_connect")
+    Schema     →  Variable.get("IKG_DASHBOARD_SCHEMA")
+    OpenAI     →  Connection.get_connection_from_secrets("STAAT-DS-OPENAI-LLM")
+    Run month  →  datetime.now()  (no user input)
+
+  Local / Jupyter  (is_running_in_airflow() = False)
+    GP         →  psycopg2 using env vars or getpass prompt:
+                    GP_HOST  GP_PORT  GP_DB  GP_USER  GP_PASSWORD  GP_SCHEMA
+    OpenAI     →  env vars:  OPENAI_API_KEY   OPENAI_BASE_URL
+    Run month  →  user input (handled in notebook / __main__ block)
 
 DAG entry point
 ───────────────
-generate_executive_summary() is the callable registered in the DAG.
-It resolves the current month automatically and saves the output to a .txt
-file alongside this script.
+generate_executive_summary(**kwargs) is the callable registered in the DAG.
+It resolves the current month automatically and saves the output to
+  <this_script_dir>/output/executive_summary_YYYY-MM.txt
 
 Dash layout
 ───────────
 layout() is only wired when Dash / styles are importable (production UI).
 It is never called from the DAG or the notebook.
-
-Callback update note (insights_release_dashboard.py)
-─────────────────────────────────────────────────────
-get_exec_summary_data() now returns a 3-tuple:
-    (current_df, next_month_df, reactivated_df)
-Update the generate_exec_summary callback to:
-    df_month, df_next, df_react = get_exec_summary_data(selected_month)
-    summary = generate_summary(df_month, next_month_df=df_next, reactivated_df=df_react)
 """
 
 from __future__ import annotations
 
 import os
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -49,16 +51,36 @@ from typing import Optional
 import pandas as pd
 from openai import OpenAI
 
+from config import (
+    GREENPLUM_HOST,
+    GREENPLUM_PORT,
+    GREENPLUM_DB,
+    GREENPLUM_USER,
+)
 
-# ── Environment detection ─────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Airflow detection  (mirrors swat_issues_report.py convention)
+# ---------------------------------------------------------------------------
 
 try:
     from airflow.models import Connection, Variable                       # type: ignore
-    from airflow.providers.postgres.hooks.postgres import PostgresHook   # type: ignore
-    _AIRFLOW_AVAILABLE = True
-except ImportError:
-    _AIRFLOW_AVAILABLE = False
+    from airflow.configuration import conf                                # type: ignore
+    _HAS_AIRFLOW = True
+except Exception:
+    Variable   = None   # type: ignore
+    Connection = None   # type: ignore
+    _HAS_AIRFLOW = False
 
+
+def is_running_in_airflow() -> bool:
+    """True only when Airflow is installed AND we are inside a DAG run."""
+    return _HAS_AIRFLOW and bool(os.environ.get("AIRFLOW_CTX_DAG_ID"))
+
+
+# Dash / styles only exist inside the dashboard server.
 try:
     from dash import dcc, html
     import dash_bootstrap_components as dbc
@@ -68,76 +90,95 @@ except ImportError:
     _DASH_AVAILABLE = False
 
 
-# ── Model constants ───────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Model constants
+# ---------------------------------------------------------------------------
 
 MODEL_NAME  = "gpt-4.1"
 MAX_TOKENS  = 12000
 TEMPERATURE = 0.1
 
+POSTGRES_CONN_ID_VAR    = "GP_Dash_connect"
+IKG_SCHEMA_VAR          = "IKG_DASHBOARD_SCHEMA"
+OPENAI_CONN_ID          = "STAAT-DS-OPENAI-LLM"
+DEFAULT_OPENAI_BASE_URL = "https://cirruspl-staat-ste-dev-ai.openai.azure.com/openai/v1/"
+DEFAULT_GP_SCHEMA       = "core_ikg"
+
 _client: Optional[OpenAI] = None
 
 
-# ── Connection helpers ────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Connection helpers
+# ---------------------------------------------------------------------------
 
 def _get_openai_client() -> OpenAI:
-    """Lazily initialise and return the shared OpenAI client.
+    """Return the shared OpenAI client, initialised lazily.
 
-    Production : Airflow Connection "STAAT-DS-OPENAI-LLM"
-    Local      : env vars  OPENAI_API_KEY  /  OPENAI_BASE_URL
+    Production : Airflow Connection  STAAT-DS-OPENAI-LLM
+    Local      : env vars  OPENAI_API_KEY / OPENAI_BASE_URL
     """
     global _client
     if _client is not None:
         return _client
-    if _AIRFLOW_AVAILABLE:
-        conn     = Connection.get_connection_from_secrets("STAAT-DS-OPENAI-LLM")
+    if is_running_in_airflow():
+        conn     = Connection.get_connection_from_secrets(OPENAI_CONN_ID)
         api_key  = conn.password
         base_url = conn.host
     else:
         api_key  = os.environ["OPENAI_API_KEY"]
-        base_url = os.environ.get(
-            "OPENAI_BASE_URL",
-            "https://cirruspl-staat-ste-dev-ai.openai.azure.com/openai/v1/",
-        )
+        base_url = os.environ.get("OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL)
     _client = OpenAI(api_key=api_key, base_url=base_url)
     return _client
 
 
-def _get_gp_conn():
-    """Return a live GP connection.
+def _get_gp_conn(allow_prompt: bool = True):
+    """Return a live psycopg2 connection to Greenplum.
 
-    Production : PostgresHook via Airflow Variable "GP_Dash_connect"
-    Local      : psycopg2 using GP_* env vars
+    Production : PostgresHook via Airflow Variable  GP_Dash_connect
+    Local      : env vars  GP_HOST / GP_PORT / GP_DB / GP_USER / GP_PASSWORD
+                 (falls back to getpass when allow_prompt=True)
     """
-    if _AIRFLOW_AVAILABLE:
-        connect = Variable.get("GP_Dash_connect")
-        return PostgresHook(postgres_conn_id=connect).get_conn()
+    if is_running_in_airflow():
+        from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
+        conn_id = Variable.get(POSTGRES_CONN_ID_VAR)
+        return PostgresHook(postgres_conn_id=conn_id).get_conn()
+
     import psycopg2
+    host     = os.environ.get("GP_HOST", GREENPLUM_HOST)
+    port     = int(os.environ.get("GP_PORT", GREENPLUM_PORT))
+    dbname   = os.environ.get("GP_DB", GREENPLUM_DB)
+    user     = os.environ.get("GP_USER", GREENPLUM_USER)
+    password = os.environ.get("GP_PASSWORD")
+    if not password:
+        if allow_prompt:
+            import getpass
+            password = getpass.getpass("Enter Greenplum password: ")
+        else:
+            raise RuntimeError("GP_PASSWORD env var is required for non-interactive runs.")
     return psycopg2.connect(
-        host    =os.environ["GP_HOST"],
-        port    =int(os.environ.get("GP_PORT", 5432)),
-        dbname  =os.environ["GP_DB"],
-        user    =os.environ["GP_USER"],
-        password=os.environ["GP_PASSWORD"],
+        host=host, port=port, dbname=dbname, user=user, password=password,
     )
 
 
 def _get_schema() -> str:
     """Return the IKG schema name.
 
-    Production : Airflow Variable "IKG_DASHBOARD_SCHEMA"
-    Local      : env var GP_SCHEMA  (default "core_ikg")
+    Production : Airflow Variable  IKG_DASHBOARD_SCHEMA
+    Local      : env var  GP_SCHEMA  (default "core_ikg")
     """
-    if _AIRFLOW_AVAILABLE:
-        return Variable.get("IKG_DASHBOARD_SCHEMA")
-    return os.environ.get("GP_SCHEMA", "core_ikg")
+    if is_running_in_airflow():
+        return Variable.get(IKG_SCHEMA_VAR)
+    return os.environ.get("GP_SCHEMA", DEFAULT_GP_SCHEMA)
 
 
-# ── SQL helpers ───────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# SQL helpers
+# ---------------------------------------------------------------------------
 
 def _build_month_query(month_value: str, schema: str) -> str:
     """SQL for the latest batch per iteration whose prod_release_date is in *month_value*.
 
-    1. Identify all iteration_end_dates in STAAT with prod_release_date in the month.
+    1. Identify every iteration_end_date in STAAT with prod_release_date in the month.
     2. For each iteration take MAX(batch) from both STAAT and ODM.
     3. LEFT JOIN ODM onto STAAT so stories with no ODM rows are still returned.
     """
@@ -189,15 +230,13 @@ def _build_month_query(month_value: str, schema: str) -> str:
 
 
 def _build_reactivated_query(insight_types: list, schema: str) -> str:
-    """SQL that fetches story details for reactivated insight types.
+    """SQL for story details of reactivated insight types.
 
-    For each rule_name (= insight_type) in *insight_types*:
-      - Gets the latest batch per iteration_end_date from ODM.
-      - LEFT JOINs STAAT on issue_id = id_x, iteration_end_date, batch
-        to pull title and description.
+    - Latest batch per iteration_end_date from ODM for the given rule_names.
+    - LEFT JOIN staat_insight_release on issue_id = id_x, iteration_end_date, batch.
     """
-    staat = f"{schema}.staat_insight_release"
-    odm   = f"{schema}.odm_release_details"
+    staat     = f"{schema}.staat_insight_release"
+    odm       = f"{schema}.odm_release_details"
     in_clause = ", ".join(f"'{t}'" for t in insight_types)
     return f"""
     WITH odm_ranked AS (
@@ -233,7 +272,9 @@ def _build_reactivated_query(insight_types: list, schema: str) -> str:
     """
 
 
-# ── Reactivated insight helpers ───────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Reactivated insight helpers
+# ---------------------------------------------------------------------------
 
 def get_reactivated_insights(
     schema: str,
@@ -243,18 +284,15 @@ def get_reactivated_insights(
 ) -> pd.DataFrame:
     """Find insight types reactivated in *year*/*month* and return their story details.
 
-    Step 1 – Query odm_exclusion_insight_type for rows where:
-               is_curr = 0  (was excluded; now re-enabled)
-               last_upd_dte falls in the given year/month.
+    Step 1 – Query odm_exclusion_insight_type for rows where is_curr=0
+              (was excluded; now re-enabled) and last_upd_dte is in the given month.
     Step 2 – For each reactivated insight_type (= rule_name in ODM), fetch
-               the latest-batch rows from odm_release_details and join with
-               staat_insight_release for title and description.
-    Step 3 – Bundle: multiple iterations / stories for the same rule are
-               returned in the same DataFrame; callers group by rule_name.
-
+              the latest-batch rows from odm_release_details and join
+              staat_insight_release for title + description.
+    Multiple iterations / stories for the same rule are bundled in the
+    returned DataFrame (group by rule_name to process them together).
     Returns an empty DataFrame if no reactivated types are found.
     """
-    # Step 1: which insight types were reactivated this month?
     sql_reactivated = f"""
         SELECT DISTINCT insight_type
         FROM {schema}.odm_exclusion_insight_type
@@ -265,17 +303,16 @@ def get_reactivated_insights(
     try:
         reactivated_df = pd.read_sql_query(sql_reactivated, conn)
     except Exception as exc:
-        print(f"[reactivated] Warning – could not query exclusion table: {exc}")
+        logger.warning("[reactivated] exclusion table query failed: %s", exc)
         return pd.DataFrame()
 
     if reactivated_df.empty:
+        logger.info("[reactivated] No reactivated insight types found for %s-%02d.", year, month)
         return pd.DataFrame()
 
     insight_types = reactivated_df["insight_type"].dropna().str.strip().tolist()
-    if not insight_types:
-        return pd.DataFrame()
+    logger.info("[reactivated] Found %d reactivated type(s): %s", len(insight_types), insight_types)
 
-    # Step 2 & 3: fetch story details bundled by rule_name
     try:
         details_df = pd.read_sql_query(
             _build_reactivated_query(insight_types, schema), conn
@@ -283,20 +320,25 @@ def get_reactivated_insights(
         details_df["change_type"] = details_df["change_type"].replace({"added": "new"})
         return details_df
     except Exception as exc:
-        print(f"[reactivated] Warning – could not fetch story details: {exc}")
+        logger.warning("[reactivated] story detail query failed: %s", exc)
         return pd.DataFrame()
 
 
-# ── Public data helpers ───────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Public data helpers
+# ---------------------------------------------------------------------------
 
 def get_exec_summary_data(
     month_value: str,
+    allow_prompt: bool = True,
 ) -> tuple:
     """Query GP and return (current_df, next_month_df, reactivated_df).
 
     Parameters
     ----------
-    month_value : str  –  'YYYY-MM'  e.g. '2026-05'
+    month_value   : 'YYYY-MM'  e.g. '2026-05'
+    allow_prompt  : when False (DAG runs), missing credentials raise an error
+                    instead of prompting interactively.
 
     Returns
     -------
@@ -309,19 +351,15 @@ def get_exec_summary_data(
     Unpack as:
         df_month, df_next, df_react = get_exec_summary_data(selected_month)
     """
-    schema = _get_schema()
-    conn   = _get_gp_conn()
-
+    schema  = _get_schema()
+    conn    = _get_gp_conn(allow_prompt=allow_prompt)
     year, month_num = (int(x) for x in month_value.split("-"))
 
-    # Current month – main release data
     current_df = pd.read_sql_query(_build_month_query(month_value, schema), conn)
     current_df["change_type"] = current_df["change_type"].replace({"added": "new"})
 
-    # Reactivated insights for this month
     reactivated_df = get_reactivated_insights(schema, conn, year, month_num)
 
-    # Next month – for "Coming Soon" section
     try:
         next_period = str(pd.Period(month_value, "M") + 1)
         next_df     = pd.read_sql_query(_build_month_query(next_period, schema), conn)
@@ -356,10 +394,12 @@ def get_month_options_from_db() -> list:
     return options
 
 
-# ── Legacy helpers (kept for backward compatibility) ──────────────────────────
+# ---------------------------------------------------------------------------
+# Legacy helpers (kept for backward compatibility with Dash callbacks)
+# ---------------------------------------------------------------------------
 
 def extract_month_options(df: pd.DataFrame) -> list:
-    """Fallback: sorted options from a pre-loaded DataFrame."""
+    """Return sorted options from a pre-loaded DataFrame."""
     if df is None or df.empty or "prod_release_date" not in df.columns:
         return []
     dates = pd.to_datetime(df["prod_release_date"], errors="coerce").dropna()
@@ -380,7 +420,9 @@ def filter_by_month(df: pd.DataFrame, month_value: str) -> pd.DataFrame:
     return df.loc[dates.dt.to_period("M").astype(str) == month_value]
 
 
-# ── Label helpers ─────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Label helpers
+# ---------------------------------------------------------------------------
 
 def _has_label(labels_value, target: str) -> bool:
     """True if *target* is one of the comma-separated labels (case-insensitive)."""
@@ -396,19 +438,30 @@ def _filter_by_label(df: pd.DataFrame, label: str) -> pd.DataFrame:
     return df.loc[df["labels"].apply(lambda v: _has_label(v, label))]
 
 
-# ── Prompt helpers ────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Prompt helpers
+# ---------------------------------------------------------------------------
 
-def _build_reactivated_text(reactivated_df: pd.DataFrame) -> str:
+def _build_reactivated_text(
+    reactivated_df: pd.DataFrame,
+    skip_rules: set = None,
+) -> str:
     """Format reactivated-insight rows into a prompt-ready string.
 
-    Stories for the same rule_name are bundled together under one header.
+    Stories for the same rule_name are bundled under one header.
+    Any rule_name present in *skip_rules* is omitted so each insight
+    appears only once across the full prompt.
     """
     if reactivated_df is None or reactivated_df.empty:
         return "No reactivated insights found for this period."
 
+    skip     = skip_rules or set()
     lines: list = []
     rule_num = 0
+
     for rule_name, group in reactivated_df.groupby("rule_name", sort=True):
+        if rule_name in skip:
+            continue   # already listed in the New Insights section
         rule_num += 1
         lines.append(f"Reactivated Insight #{rule_num}: {rule_name}")
         seen_ids: set = set()
@@ -421,9 +474,9 @@ def _build_reactivated_text(reactivated_df: pd.DataFrame) -> str:
                 lines.append(f"  Story #{story_num}:")
                 lines.append(f"    Title:   {row.get('title', 'N/A')}")
                 lines.append(f"    Summary: {row.get('issue_summary', 'N/A')}")
-        lines.append("")  # blank line between rules
+        lines.append("")
 
-    return "\n".join(lines).strip()
+    return "\n".join(lines).strip() if lines else "No reactivated insights found for this period."
 
 
 def _build_prompt(
@@ -436,8 +489,8 @@ def _build_prompt(
     Label conventions
     -----------------
     "Top Feature" label  →  Section 2
-    "New Insight"  label  →  Section 3
-    Reactivated insights  →  also included in Section 3 data
+    "New Insight"  label  →  Section 3  (also deduped against reactivated)
+    Reactivated insights  →  appended to Section 3 data
     All stories           →  Section 1 context
     """
 
@@ -482,7 +535,7 @@ def _build_prompt(
     # ── Section 3: New Insights (label-based) ─────────────────────────────────
     ni_df    = _filter_by_label(issues_df, "New Insight")
     ni_lines: list = []
-    seen_rules: set = set()
+    seen_rules: set = set()   # carried into reactivated block for dedup
     for _, row in ni_df.iterrows():
         rule = row.get("rule_name", "")
         if rule and rule not in seen_rules:
@@ -500,8 +553,8 @@ def _build_prompt(
         else "No issues labelled 'New Insight' found for this period."
     )
 
-    # ── Reactivated insights ──────────────────────────────────────────────────
-    reactivated_text = _build_reactivated_text(reactivated_df)
+    # ── Reactivated insights (deduped against seen_rules) ─────────────────────
+    reactivated_text = _build_reactivated_text(reactivated_df, skip_rules=seen_rules)
 
     # ── Section 6: Coming Soon – next month New Insight titles only ───────────
     next_lines: list = []
@@ -517,7 +570,7 @@ def _build_prompt(
                 next_lines.append(f"- {row.get('title', rule)}")
     next_month_text = (
         "\n".join(next_lines[:10]) if next_lines
-        else "No next-month data found – provide directional focus areas based on current trends."
+        else "No next-month data found \u2013 provide directional focus areas based on current trends."
     )
 
     prompt = f"""
@@ -566,7 +619,7 @@ def _build_prompt(
     - Maintenance, fixes, or technical improvements: <answer>
     - Why this matters (risk reduction, performance, cost control): <answer>
 
-    6. New Insights – Coming Soon:
+    6. New Insights \u2013 Coming Soon:
     Use the following next-month data (if available):
     {next_month_text}
     - Focus areas (2-4 items max): list Insight Title only, limited to "New Insight" labelled items
@@ -581,13 +634,15 @@ def _build_prompt(
     - Section 1 Executive Summary: 2 sentences per question
     - Section 2 Top Feature: pick the single most impactful item from the "Top Feature" labelled issues
     - Section 3 New Insights: list each insight on a separate line; include reactivated insights at the end, marked as "Reactivated". Bundle multiple stories for the same reactivated rule under one entry
-    - Section 6 New Insights – Coming Soon: simple list of Insight Titles only. If no next-month data, provide directional focus areas based on current trends
+    - Section 6 New Insights \u2013 Coming Soon: simple list of Insight Titles only. If no next-month data, provide directional focus areas based on current trends
     - Do NOT include instruction notes in the final output
     """
     return prompt.strip()
 
 
-# ── LLM call ──────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# LLM call
+# ---------------------------------------------------------------------------
 
 def generate_summary(
     issues_df: pd.DataFrame,
@@ -616,34 +671,46 @@ def build_save_content(summary_text: str, month_label: str) -> str:
     return header + summary_text
 
 
-# ── DAG entry point ───────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# DAG entry point
+# ---------------------------------------------------------------------------
 
 def generate_executive_summary(**kwargs) -> str:
     """Generate and save the executive summary for the current month.
 
     This is the callable registered in the monthly DAG (PythonOperator).
-    Month is derived from datetime.now() – no user input required.
+    Month is derived from datetime.now() \u2013 no user input required.
     Output is saved to  <script_dir>/output/executive_summary_YYYY-MM.txt.
     """
     now         = datetime.now()
     month_value = now.strftime("%Y-%m")
     month_label = now.strftime("%B %Y")
 
-    print(f"[exec_summary] Generating executive summary for {month_label} ...")
+    logger.info("[exec_summary] Generating executive summary for %s ...", month_label)
 
-    df_current, df_next, df_reactivated = get_exec_summary_data(month_value)
+    df_current, df_next, df_reactivated = get_exec_summary_data(
+        month_value, allow_prompt=False
+    )
 
     if df_current.empty and (df_reactivated is None or df_reactivated.empty):
         msg = f"[exec_summary] No data found for {month_label}. Skipping."
-        print(msg)
+        logger.warning(msg)
         return msg
 
-    print(f"[exec_summary] Current month rows : {len(df_current)}")
-    print(f"[exec_summary] Reactivated rules  : {0 if df_reactivated is None or df_reactivated.empty else df_reactivated['rule_name'].nunique()}")
-    print(f"[exec_summary] Next month rows    : {0 if df_next is None else len(df_next)}")
+    logger.info("[exec_summary] Current month rows : %d", len(df_current))
+    logger.info(
+        "[exec_summary] Reactivated rules  : %d",
+        0 if df_reactivated is None or df_reactivated.empty
+        else df_reactivated["rule_name"].nunique(),
+    )
+    logger.info("[exec_summary] Next month rows    : %d", 0 if df_next is None else len(df_next))
 
-    summary_text = generate_summary(df_current, next_month_df=df_next, reactivated_df=df_reactivated)
-    content      = build_save_content(summary_text, month_label)
+    summary_text = generate_summary(
+        df_current,
+        next_month_df  =df_next,
+        reactivated_df =df_reactivated if (df_reactivated is not None and not df_reactivated.empty) else None,
+    )
+    content = build_save_content(summary_text, month_label)
 
     output_dir = Path(__file__).resolve().parent / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -652,11 +719,13 @@ def generate_executive_summary(**kwargs) -> str:
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write(content)
 
-    print(f"[exec_summary] Saved \u2192 {out_path}")
+    logger.info("[exec_summary] Saved \u2192 %s", out_path)
     return summary_text
 
 
-# ── Dash layout (production UI only) ─────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Dash layout (production UI only)
+# ---------------------------------------------------------------------------
 
 def layout(df: pd.DataFrame):
     """Return the dcc.Tab component for the Executive Summary tab.
@@ -782,3 +851,22 @@ def layout(df: pd.DataFrame):
             style=release_dashboard_styles["table_container_style"],
         ),
     )
+
+
+if __name__ == "__main__":
+    # Local quick-test: prompt for month, then generate.
+    import getpass
+    month_raw = input("Month to summarise (e.g. '2026-05' or 'May 2026'): ").strip()
+    try:
+        MONTH = str(pd.Period(month_raw, "M"))
+    except Exception:
+        MONTH = datetime.strptime(
+            month_raw.replace("-", " ").replace("/", " "), "%B %Y"
+        ).strftime("%Y-%m")
+    label = pd.Period(MONTH, "M").to_timestamp().strftime("%B %Y")
+    df_c, df_n, df_r = get_exec_summary_data(MONTH, allow_prompt=True)
+    text = generate_summary(df_c, next_month_df=df_n, reactivated_df=df_r if not df_r.empty else None)
+    print("\n" + "=" * 80)
+    print(f"Executive Summary \u2013 {label}")
+    print("=" * 80 + "\n")
+    print(text)
