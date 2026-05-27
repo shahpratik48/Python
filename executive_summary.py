@@ -5,44 +5,38 @@
 Environment detection
 ─────────────────────
 The module uses the same two-phase detection pattern as the other scripts
-in this folder:
+in this folder (swat_issues_report.py, release_gitlab_report.py):
 
   1. _HAS_AIRFLOW  – True when the Airflow package is importable.
-  2. is_running_in_airflow()  – True only when _HAS_AIRFLOW AND the
-     AIRFLOW_CTX_DAG_ID env var is set (Airflow injects this at run-time).
-
-This distinction matters when a developer has Airflow installed locally:
-_HAS_AIRFLOW would be True, but is_running_in_airflow() returns False so
-credentials are still read from env vars / prompts rather than Airflow
-Connections / Variables.
+  2. is_running_in_airflow()  – True only when _HAS_AIRFLOW AND
+     AIRFLOW_CTX_DAG_ID env var is set (injected by Airflow at run-time).
 
   Production / DAG  (is_running_in_airflow() = True)
     GP         →  PostgresHook  via  Variable.get("GP_Dash_connect")
     Schema     →  Variable.get("IKG_DASHBOARD_SCHEMA")
     OpenAI     →  Connection.get_connection_from_secrets("STAAT-DS-OPENAI-LLM")
-    Run month  →  datetime.now()  (no user input)
+    Run month  →  datetime.now()
+    Email to   →  Variable "staat_monthly_executive_summary_email" (UAT/Prod)
+               →  LOCAL_EMAIL_RECIPIENTS list (Dev/local Airflow)
 
   Local / Jupyter  (is_running_in_airflow() = False)
-    GP         →  psycopg2 using env vars or getpass prompt:
-                    GP_HOST  GP_PORT  GP_DB  GP_USER  GP_PASSWORD  GP_SCHEMA
-    OpenAI     →  env vars:  OPENAI_API_KEY   OPENAI_BASE_URL
-    Run month  →  user input (handled in notebook / __main__ block)
+    GP         →  psycopg2 via GP_* env vars or getpass
+    OpenAI     →  env vars OPENAI_API_KEY / OPENAI_BASE_URL
+    Run month  →  user input
+    Email      →  not sent (summary saved to file only)
 
-DAG entry point
-───────────────
-generate_executive_summary(**kwargs) is the callable registered in the DAG.
-It resolves the current month automatically and saves the output to
-  <this_script_dir>/output/executive_summary_YYYY-MM.txt
-
-Dash layout
-───────────
-layout() is only wired when Dash / styles are importable (production UI).
-It is never called from the DAG or the notebook.
+Email
+─────
+  Subject: "Executive Summary – <Month Year> – <Environment>"
+  Body   : richly styled HTML; the full summary is in the email body
+           (no attachments).
+  Sending: airflow.utils.email.send_email (only when in Airflow).
 """
 
 from __future__ import annotations
 
 import os
+import re
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -62,7 +56,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Airflow detection  (mirrors swat_issues_report.py convention)
+# Airflow detection  (mirrors swat_issues_report.py / release_gitlab_report.py)
 # ---------------------------------------------------------------------------
 
 try:
@@ -72,6 +66,7 @@ try:
 except Exception:
     Variable   = None   # type: ignore
     Connection = None   # type: ignore
+    conf       = None   # type: ignore
     _HAS_AIRFLOW = False
 
 
@@ -91,7 +86,7 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Model constants
+# Constants
 # ---------------------------------------------------------------------------
 
 MODEL_NAME  = "gpt-4.1"
@@ -104,6 +99,11 @@ OPENAI_CONN_ID          = "STAAT-DS-OPENAI-LLM"
 DEFAULT_OPENAI_BASE_URL = "https://cirruspl-staat-ste-dev-ai.openai.azure.com/openai/v1/"
 DEFAULT_GP_SCHEMA       = "core_ikg"
 
+# Email
+EMAIL_RECIPIENTS_VAR  = "staat_monthly_executive_summary_email"
+LOCAL_EMAIL_RECIPIENTS = ["pratik.shah.2@ubs.com"]
+EMAIL_FROM_ADDR        = "staat-insights@ubs.com"
+
 _client: Optional[OpenAI] = None
 
 
@@ -112,11 +112,7 @@ _client: Optional[OpenAI] = None
 # ---------------------------------------------------------------------------
 
 def _get_openai_client() -> OpenAI:
-    """Return the shared OpenAI client, initialised lazily.
-
-    Production : Airflow Connection  STAAT-DS-OPENAI-LLM
-    Local      : env vars  OPENAI_API_KEY / OPENAI_BASE_URL
-    """
+    """Production: Airflow Connection.  Local: env vars."""
     global _client
     if _client is not None:
         return _client
@@ -132,17 +128,11 @@ def _get_openai_client() -> OpenAI:
 
 
 def _get_gp_conn(allow_prompt: bool = True):
-    """Return a live psycopg2 connection to Greenplum.
-
-    Production : PostgresHook via Airflow Variable  GP_Dash_connect
-    Local      : env vars  GP_HOST / GP_PORT / GP_DB / GP_USER / GP_PASSWORD
-                 (falls back to getpass when allow_prompt=True)
-    """
+    """Production: PostgresHook.  Local: psycopg2 + env vars / getpass."""
     if is_running_in_airflow():
         from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
         conn_id = Variable.get(POSTGRES_CONN_ID_VAR)
         return PostgresHook(postgres_conn_id=conn_id).get_conn()
-
     import psycopg2
     host     = os.environ.get("GP_HOST", GREENPLUM_HOST)
     port     = int(os.environ.get("GP_PORT", GREENPLUM_PORT))
@@ -155,20 +145,55 @@ def _get_gp_conn(allow_prompt: bool = True):
             password = getpass.getpass("Enter Greenplum password: ")
         else:
             raise RuntimeError("GP_PASSWORD env var is required for non-interactive runs.")
-    return psycopg2.connect(
-        host=host, port=port, dbname=dbname, user=user, password=password,
-    )
+    return psycopg2.connect(host=host, port=port, dbname=dbname, user=user, password=password)
 
 
 def _get_schema() -> str:
-    """Return the IKG schema name.
-
-    Production : Airflow Variable  IKG_DASHBOARD_SCHEMA
-    Local      : env var  GP_SCHEMA  (default "core_ikg")
-    """
     if is_running_in_airflow():
         return Variable.get(IKG_SCHEMA_VAR)
     return os.environ.get("GP_SCHEMA", DEFAULT_GP_SCHEMA)
+
+
+# ---------------------------------------------------------------------------
+# Environment & email helpers
+# ---------------------------------------------------------------------------
+
+def _get_environment() -> str:
+    """Return 'Dev', 'UAT', or 'Prod' by comparing Airflow webserver URL.
+    Follows the same pattern as swat_issues_report.py and release_gitlab_report.py.
+    """
+    if not is_running_in_airflow():
+        return "Dev"
+    try:
+        base_url = conf.get("webserver", "base_url")
+        if base_url == Variable.get("AIRFLOW_UAT_URL", default_var=""):
+            return "Dev"   # UAT Airflow instance → Dev label (matches existing convention)
+        if base_url == Variable.get("AIRFLOW_PROD_URL", default_var=""):
+            return "Prod"
+    except Exception as exc:
+        logger.warning("Could not determine environment: %s", exc)
+    return "Dev"
+
+
+def get_email_recipients() -> list:
+    """Return the list of email recipients.
+
+    Dev / local Airflow  →  LOCAL_EMAIL_RECIPIENTS  (pratik.shah.2@ubs.com only)
+    UAT / Prod           →  Airflow Variable  staat_monthly_executive_summary_email
+    Not in Airflow       →  empty list  (email not sent outside Airflow)
+    """
+    if not is_running_in_airflow():
+        return []
+    env = _get_environment()
+    if env != "Prod":          # Dev (UAT-mapped) → local list only
+        return LOCAL_EMAIL_RECIPIENTS
+    try:
+        raw        = Variable.get(EMAIL_RECIPIENTS_VAR, default_var="")
+        recipients = [r.strip() for r in raw.split(",") if r.strip()]
+        return recipients if recipients else LOCAL_EMAIL_RECIPIENTS
+    except Exception as exc:
+        logger.warning("Could not read %s: %s", EMAIL_RECIPIENTS_VAR, exc)
+        return LOCAL_EMAIL_RECIPIENTS
 
 
 # ---------------------------------------------------------------------------
@@ -176,19 +201,11 @@ def _get_schema() -> str:
 # ---------------------------------------------------------------------------
 
 def _build_month_query(month_value: str, schema: str) -> str:
-    """SQL for the latest batch per iteration whose prod_release_date is in *month_value*.
-
-    1. Identify every iteration_end_date in STAAT with prod_release_date in the month.
-    2. For each iteration take MAX(batch) from both STAAT and ODM.
-    3. LEFT JOIN ODM onto STAAT so stories with no ODM rows are still returned.
-    """
     staat = f"{schema}.staat_insight_release"
     odm   = f"{schema}.odm_release_details"
     return f"""
     WITH target_iterations AS (
-        SELECT
-            iteration_end_date,
-            MAX(batch) AS max_batch
+        SELECT iteration_end_date, MAX(batch) AS max_batch
         FROM {staat}
         WHERE TO_CHAR(prod_release_date::date, 'YYYY-MM') = '{month_value}'
         GROUP BY iteration_end_date
@@ -208,19 +225,9 @@ def _build_month_query(month_value: str, schema: str) -> str:
             AND o.batch              = ti.max_batch
     )
     SELECT
-        s.id_x,
-        s.title,
-        s.labels,
-        s.issue_summary,
-        s.state,
-        s.weight,
-        s.prod_release_date,
-        s.iteration_end_date,
-        s.iteration_start_date,
-        s.batch,
-        o.rule_name,
-        o.target_type,
-        o.change_type
+        s.id_x, s.title, s.labels, s.issue_summary, s.state, s.weight,
+        s.prod_release_date, s.iteration_end_date, s.iteration_start_date, s.batch,
+        o.rule_name, o.target_type, o.change_type
     FROM staat_latest s
     LEFT JOIN odm_latest o
         ON  s.id_x               = o.issue_id
@@ -230,39 +237,22 @@ def _build_month_query(month_value: str, schema: str) -> str:
 
 
 def _build_reactivated_query(insight_types: list, schema: str) -> str:
-    """SQL for story details of reactivated insight types.
-
-    - Latest batch per iteration_end_date from ODM for the given rule_names.
-    - LEFT JOIN staat_insight_release on issue_id = id_x, iteration_end_date, batch.
-    """
     staat     = f"{schema}.staat_insight_release"
     odm       = f"{schema}.odm_release_details"
     in_clause = ", ".join(f"'{t}'" for t in insight_types)
     return f"""
     WITH odm_ranked AS (
-        SELECT
-            o.*,
-            MAX(o.batch) OVER (PARTITION BY o.iteration_end_date) AS max_batch
+        SELECT o.*,
+               MAX(o.batch) OVER (PARTITION BY o.iteration_end_date) AS max_batch
         FROM {odm} o
         WHERE o.rule_name IN ({in_clause})
     ),
-    odm_latest AS (
-        SELECT * FROM odm_ranked WHERE batch = max_batch
-    )
+    odm_latest AS (SELECT * FROM odm_ranked WHERE batch = max_batch)
     SELECT
-        o.issue_id          AS id_x,
-        o.iteration_end_date,
-        o.batch,
-        o.rule_name,
-        o.target_type,
-        o.change_type,
-        s.title,
-        s.issue_summary,
-        s.labels,
-        s.state,
-        s.weight,
-        s.prod_release_date,
-        s.iteration_start_date
+        o.issue_id AS id_x, o.iteration_end_date, o.batch,
+        o.rule_name, o.target_type, o.change_type,
+        s.title, s.issue_summary, s.labels, s.state, s.weight,
+        s.prod_release_date, s.iteration_start_date
     FROM odm_latest o
     LEFT JOIN {staat} s
         ON  o.issue_id           = s.id_x
@@ -273,27 +263,11 @@ def _build_reactivated_query(insight_types: list, schema: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Reactivated insight helpers
+# Data helpers
 # ---------------------------------------------------------------------------
 
-def get_reactivated_insights(
-    schema: str,
-    conn,
-    year: int,
-    month: int,
-) -> pd.DataFrame:
-    """Find insight types reactivated in *year*/*month* and return their story details.
-
-    Step 1 – Query odm_exclusion_insight_type for rows where is_curr=0
-              (was excluded; now re-enabled) and last_upd_dte is in the given month.
-    Step 2 – For each reactivated insight_type (= rule_name in ODM), fetch
-              the latest-batch rows from odm_release_details and join
-              staat_insight_release for title + description.
-    Multiple iterations / stories for the same rule are bundled in the
-    returned DataFrame (group by rule_name to process them together).
-    Returns an empty DataFrame if no reactivated types are found.
-    """
-    sql_reactivated = f"""
+def get_reactivated_insights(schema: str, conn, year: int, month: int) -> pd.DataFrame:
+    sql = f"""
         SELECT DISTINCT insight_type
         FROM {schema}.odm_exclusion_insight_type
         WHERE EXTRACT(YEAR  FROM last_upd_dte::date) = {year}
@@ -301,65 +275,31 @@ def get_reactivated_insights(
           AND is_curr = 0
     """
     try:
-        reactivated_df = pd.read_sql_query(sql_reactivated, conn)
+        df = pd.read_sql_query(sql, conn)
     except Exception as exc:
         logger.warning("[reactivated] exclusion table query failed: %s", exc)
         return pd.DataFrame()
-
-    if reactivated_df.empty:
-        logger.info("[reactivated] No reactivated insight types found for %s-%02d.", year, month)
+    if df.empty:
         return pd.DataFrame()
-
-    insight_types = reactivated_df["insight_type"].dropna().str.strip().tolist()
+    insight_types = df["insight_type"].dropna().str.strip().tolist()
     logger.info("[reactivated] Found %d reactivated type(s): %s", len(insight_types), insight_types)
-
     try:
-        details_df = pd.read_sql_query(
-            _build_reactivated_query(insight_types, schema), conn
-        )
-        details_df["change_type"] = details_df["change_type"].replace({"added": "new"})
-        return details_df
+        details = pd.read_sql_query(_build_reactivated_query(insight_types, schema), conn)
+        details["change_type"] = details["change_type"].replace({"added": "new"})
+        return details
     except Exception as exc:
         logger.warning("[reactivated] story detail query failed: %s", exc)
         return pd.DataFrame()
 
 
-# ---------------------------------------------------------------------------
-# Public data helpers
-# ---------------------------------------------------------------------------
-
-def get_exec_summary_data(
-    month_value: str,
-    allow_prompt: bool = True,
-) -> tuple:
-    """Query GP and return (current_df, next_month_df, reactivated_df).
-
-    Parameters
-    ----------
-    month_value   : 'YYYY-MM'  e.g. '2026-05'
-    allow_prompt  : when False (DAG runs), missing credentials raise an error
-                    instead of prompting interactively.
-
-    Returns
-    -------
-    current_df     Latest-batch STAAT+ODM rows for the selected month.
-    next_month_df  Latest-batch rows for the following month, or None.
-    reactivated_df Story details for insight types reactivated this month.
-
-    Note for insights_release_dashboard.py callback
-    ────────────────────────────────────────────────
-    Unpack as:
-        df_month, df_next, df_react = get_exec_summary_data(selected_month)
-    """
+def get_exec_summary_data(month_value: str, allow_prompt: bool = True) -> tuple:
+    """Return (current_df, next_month_df, reactivated_df)."""
     schema  = _get_schema()
     conn    = _get_gp_conn(allow_prompt=allow_prompt)
     year, month_num = (int(x) for x in month_value.split("-"))
-
     current_df = pd.read_sql_query(_build_month_query(month_value, schema), conn)
     current_df["change_type"] = current_df["change_type"].replace({"added": "new"})
-
     reactivated_df = get_reactivated_insights(schema, conn, year, month_num)
-
     try:
         next_period = str(pd.Period(month_value, "M") + 1)
         next_df     = pd.read_sql_query(_build_month_query(next_period, schema), conn)
@@ -367,22 +307,20 @@ def get_exec_summary_data(
         next_month_df: Optional[pd.DataFrame] = next_df if not next_df.empty else None
     except Exception:
         next_month_df = None
-
     conn.close()
     return current_df, next_month_df, reactivated_df
 
 
 def get_month_options_from_db() -> list:
-    """Return sorted dropdown options queried from GP (used by the Dash refresh callback)."""
     schema = _get_schema()
     conn   = _get_gp_conn()
-    sql    = f"""
-        SELECT DISTINCT TO_CHAR(prod_release_date::date, 'YYYY-MM') AS month_val
-        FROM {schema}.staat_insight_release
-        WHERE prod_release_date IS NOT NULL
-        ORDER BY month_val DESC
-    """
-    df = pd.read_sql_query(sql, conn)
+    df = pd.read_sql_query(
+        f"""SELECT DISTINCT TO_CHAR(prod_release_date::date, 'YYYY-MM') AS month_val
+            FROM {schema}.staat_insight_release
+            WHERE prod_release_date IS NOT NULL
+            ORDER BY month_val DESC""",
+        conn,
+    )
     conn.close()
     options = []
     for val in df["month_val"]:
@@ -395,25 +333,22 @@ def get_month_options_from_db() -> list:
 
 
 # ---------------------------------------------------------------------------
-# Legacy helpers (kept for backward compatibility with Dash callbacks)
+# Legacy helpers (Dash compatibility)
 # ---------------------------------------------------------------------------
 
 def extract_month_options(df: pd.DataFrame) -> list:
-    """Return sorted options from a pre-loaded DataFrame."""
     if df is None or df.empty or "prod_release_date" not in df.columns:
         return []
     dates = pd.to_datetime(df["prod_release_date"], errors="coerce").dropna()
     if dates.empty:
         return []
-    months_sorted = sorted(dates.dt.to_period("M").unique(), reverse=True)
     return [
         {"label": p.to_timestamp().strftime("%B %Y"), "value": str(p)}
-        for p in months_sorted
+        for p in sorted(dates.dt.to_period("M").unique(), reverse=True)
     ]
 
 
 def filter_by_month(df: pd.DataFrame, month_value: str) -> pd.DataFrame:
-    """Filter df by prod_release_date month (kept for compatibility)."""
     if df is None or df.empty or "prod_release_date" not in df.columns:
         return pd.DataFrame()
     dates = pd.to_datetime(df["prod_release_date"], errors="coerce")
@@ -425,14 +360,12 @@ def filter_by_month(df: pd.DataFrame, month_value: str) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def _has_label(labels_value, target: str) -> bool:
-    """True if *target* is one of the comma-separated labels (case-insensitive)."""
     if not labels_value or not isinstance(labels_value, str):
         return False
     return target.lower() in [lbl.strip().lower() for lbl in labels_value.split(",")]
 
 
 def _filter_by_label(df: pd.DataFrame, label: str) -> pd.DataFrame:
-    """Return rows whose labels column contains *label* exactly."""
     if df is None or df.empty or "labels" not in df.columns:
         return pd.DataFrame()
     return df.loc[df["labels"].apply(lambda v: _has_label(v, label))]
@@ -446,22 +379,14 @@ def _build_reactivated_text(
     reactivated_df: pd.DataFrame,
     skip_rules: set = None,
 ) -> str:
-    """Format reactivated-insight rows into a prompt-ready string.
-
-    Stories for the same rule_name are bundled under one header.
-    Any rule_name present in *skip_rules* is omitted so each insight
-    appears only once across the full prompt.
-    """
     if reactivated_df is None or reactivated_df.empty:
         return "No reactivated insights found for this period."
-
-    skip     = skip_rules or set()
+    skip  = skip_rules or set()
     lines: list = []
     rule_num = 0
-
     for rule_name, group in reactivated_df.groupby("rule_name", sort=True):
         if rule_name in skip:
-            continue   # already listed in the New Insights section
+            continue
         rule_num += 1
         lines.append(f"Reactivated Insight #{rule_num}: {rule_name}")
         seen_ids: set = set()
@@ -475,7 +400,6 @@ def _build_reactivated_text(
                 lines.append(f"    Title:   {row.get('title', 'N/A')}")
                 lines.append(f"    Summary: {row.get('issue_summary', 'N/A')}")
         lines.append("")
-
     return "\n".join(lines).strip() if lines else "No reactivated insights found for this period."
 
 
@@ -484,17 +408,7 @@ def _build_prompt(
     next_month_df: Optional[pd.DataFrame] = None,
     reactivated_df: Optional[pd.DataFrame] = None,
 ) -> str:
-    """Build the LLM prompt.
-
-    Label conventions
-    -----------------
-    "Top Feature" label  →  Section 2
-    "New Insight"  label  →  Section 3  (also deduped against reactivated)
-    Reactivated insights  →  appended to Section 3 data
-    All stories           →  Section 1 context
-    """
-
-    # ── Section 1: all stories ────────────────────────────────────────────────
+    # Section 1 – all stories
     issues_lines: list = []
     seen_ids: set = set()
     for _, row in issues_df.iterrows():
@@ -511,7 +425,7 @@ def _build_prompt(
             )
     issues_text = "\n\n".join(issues_lines[:20]) if issues_lines else "No issues data available."
 
-    # ── Section 2: Top Feature ────────────────────────────────────────────────
+    # Section 2 – Top Feature
     top_df    = _filter_by_label(issues_df, "Top Feature")
     top_lines: list = []
     seen_top: set = set()
@@ -532,10 +446,10 @@ def _build_prompt(
         else "No issue labelled 'Top Feature' found for this period."
     )
 
-    # ── Section 3: New Insights (label-based) ─────────────────────────────────
+    # Section 3 – New Insights
     ni_df    = _filter_by_label(issues_df, "New Insight")
     ni_lines: list = []
-    seen_rules: set = set()   # carried into reactivated block for dedup
+    seen_rules: set = set()
     for _, row in ni_df.iterrows():
         rule = row.get("rule_name", "")
         if rule and rule not in seen_rules:
@@ -553,10 +467,10 @@ def _build_prompt(
         else "No issues labelled 'New Insight' found for this period."
     )
 
-    # ── Reactivated insights (deduped against seen_rules) ─────────────────────
+    # Reactivated (deduped)
     reactivated_text = _build_reactivated_text(reactivated_df, skip_rules=seen_rules)
 
-    # ── Section 6: Coming Soon – next month New Insight titles only ───────────
+    # Section 6 – Coming Soon
     next_lines: list = []
     if next_month_df is not None and not next_month_df.empty:
         next_ni_df  = _filter_by_label(next_month_df, "New Insight")
@@ -570,7 +484,7 @@ def _build_prompt(
                 next_lines.append(f"- {row.get('title', rule)}")
     next_month_text = (
         "\n".join(next_lines[:10]) if next_lines
-        else "No next-month data found \u2013 provide directional focus areas based on current trends."
+        else "No next-month data \u2013 provide directional focus areas based on current trends."
     )
 
     prompt = f"""
@@ -633,8 +547,8 @@ def _build_prompt(
     - Ensure all answers are data-driven based on the provided information
     - Section 1 Executive Summary: 2 sentences per question
     - Section 2 Top Feature: pick the single most impactful item from the "Top Feature" labelled issues
-    - Section 3 New Insights: list each insight on a separate line; include reactivated insights at the end, marked as "Reactivated". Bundle multiple stories for the same reactivated rule under one entry
-    - Section 6 New Insights \u2013 Coming Soon: simple list of Insight Titles only. If no next-month data, provide directional focus areas based on current trends
+    - Section 3 New Insights: list each insight on a separate line; include reactivated insights at the end, marked as "Reactivated". Bundle multiple stories for the same rule under one entry
+    - Section 6 New Insights \u2013 Coming Soon: simple list of Insight Titles only. If no next-month data, provide directional focus areas
     - Do NOT include instruction notes in the final output
     """
     return prompt.strip()
@@ -649,20 +563,18 @@ def generate_summary(
     next_month_df: Optional[pd.DataFrame] = None,
     reactivated_df: Optional[pd.DataFrame] = None,
 ) -> str:
-    """Call the LLM and return the executive summary text."""
     client   = _get_openai_client()
     prompt   = _build_prompt(issues_df, next_month_df=next_month_df, reactivated_df=reactivated_df)
     response = client.chat.completions.create(
-        model       =MODEL_NAME,
-        messages    =[{"role": "user", "content": prompt}],
-        max_tokens  =MAX_TOKENS,
-        temperature =TEMPERATURE,
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=MAX_TOKENS,
+        temperature=TEMPERATURE,
     )
     return response.choices[0].message.content.strip()
 
 
 def build_save_content(summary_text: str, month_label: str) -> str:
-    """Format the summary for saving to a .txt file."""
     header = (
         f"Executive Summary Report \u2013 {month_label}\n"
         f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
@@ -672,21 +584,324 @@ def build_save_content(summary_text: str, month_label: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Email – HTML formatter
+# ---------------------------------------------------------------------------
+
+# One accent colour per section number (1-indexed)
+_SECTION_COLORS = [
+    "#002060",  # 1  Executive Summary   – dark navy
+    "#0072CE",  # 2  Top Feature         – UBS blue
+    "#006341",  # 3  New Insights        – green
+    "#C55A11",  # 4  Process Improvement – burnt orange
+    "#7B2D8B",  # 5  Stability           – purple
+    "#156082",  # 6  Coming Soon         – teal
+]
+
+
+def _format_summary_as_html(summary_text: str) -> str:
+    """Convert the plain-text LLM summary into styled inner HTML.
+
+    Handles:
+    • Numbered section headers  (N. Title  or  N. Title:)
+    • Bullet key-value pairs    (- Key: Value)
+    • Plain bullets             (- text)
+    • Status badges             (Status: New | Reactivated)
+    • Prose / sub-headings
+    """
+    lines   = summary_text.strip().split("\n")
+    parts: list = []
+    in_ul      = False
+    in_section = False
+    cur_color  = _SECTION_COLORS[0]
+
+    def _close_ul() -> None:
+        nonlocal in_ul
+        if in_ul:
+            parts.append("</ul>")
+            in_ul = False
+
+    def _close_section() -> None:
+        nonlocal in_section
+        if in_section:
+            _close_ul()
+            parts.append("  </div>")   # inner padding div
+            parts.append("</div>")     # section card
+            in_section = False
+
+    def _open_ul() -> None:
+        nonlocal in_ul
+        if not in_ul:
+            parts.append(
+                '<ul style="margin:8px 0 4px 0;padding:0;list-style:none;">'
+            )
+            in_ul = True
+
+    def _status_badge(value: str) -> str:
+        v_lower = value.lower()
+        if "reactivated" in v_lower:
+            bg, fg = "#fff3e0", "#c55a11"
+        elif "new" in v_lower:
+            bg, fg = "#e8f5e9", "#2e7d32"
+        else:
+            bg, fg = "#e3f2fd", "#0072ce"
+        return (
+            f'<span style="background:{bg};color:{fg};padding:2px 10px;'
+            f'border-radius:12px;font-size:11px;font-weight:700;'
+            f'letter-spacing:0.5px;border:1px solid {fg}40;">{value}</span>'
+        )
+
+    for line in lines:
+        s = line.rstrip()
+
+        # ── Empty line ─────────────────────────────────────────────────────
+        if not s:
+            _close_ul()
+            continue
+
+        # ── Section header:  "N. Title"  or  "N. Title:" ──────────────────
+        m = re.match(r"^(\d+)\.\s+(.+)", s)
+        if m:
+            _close_section()
+            num   = int(m.group(1))
+            title = m.group(2).rstrip(":").strip()
+            color = _SECTION_COLORS[(num - 1) % len(_SECTION_COLORS)]
+            cur_color = color
+            parts.append(
+                f'<div style="margin-bottom:20px;border-left:4px solid {color};'
+                f'background:#ffffff;border-radius:0 8px 8px 0;'
+                f'box-shadow:0 1px 4px rgba(0,0,0,0.06);">'
+            )
+            parts.append(
+                f'  <div style="background:linear-gradient(to right,{color}14,transparent);'
+                f'padding:11px 20px;border-bottom:1px solid {color}22;">'
+            )
+            parts.append(
+                f'    <h2 style="margin:0;font-size:15px;font-weight:700;'
+                f'color:{color};line-height:1.3;">'
+                f'<span style="background:{color};color:#fff;border-radius:50%;'
+                f'display:inline-flex;align-items:center;justify-content:center;'
+                f'width:24px;height:24px;font-size:12px;font-weight:800;'
+                f'margin-right:10px;flex-shrink:0;">{num}</span>'
+                f'{title}</h2>'
+            )
+            parts.append("  </div>")
+            parts.append('  <div style="padding:12px 20px 8px 20px;">')
+            in_section = True
+            continue
+
+        # ── Bullet line ─────────────────────────────────────────────────────
+        bm = re.match(r"^[-\u2022\u25b8]\s+(.+)", s)
+        if bm:
+            content = bm.group(1).strip()
+            _open_ul()
+            kv = re.match(r"^([^:]+?):\s*(.+)", content)
+            if kv:
+                key = kv.group(1).strip()
+                val = kv.group(2).strip()
+                if key.lower() == "status":
+                    val_html = _status_badge(val)
+                else:
+                    val_html = f'<span style="color:#444;line-height:1.5;">{val}</span>'
+                parts.append(
+                    f'<li style="padding:6px 0;border-bottom:1px solid #f4f4f4;'
+                    f'font-size:13.5px;display:flex;align-items:flex-start;gap:4px;">'
+                    f'<strong style="color:#222;min-width:190px;flex-shrink:0;'
+                    f'padding-right:8px;">{key}:</strong>'
+                    f'{val_html}</li>'
+                )
+            else:
+                parts.append(
+                    f'<li style="padding:6px 0;font-size:13.5px;color:#333;'
+                    f'line-height:1.5;display:flex;align-items:flex-start;">'
+                    f'<span style="color:{cur_color};margin-right:8px;font-size:11px;'
+                    f'padding-top:3px;">&#9658;</span>'
+                    f'<span>{content}</span></li>'
+                )
+            continue
+
+        # ── Prose / sub-heading ─────────────────────────────────────────────
+        _close_ul()
+        parts.append(
+            f'<p style="margin:6px 0 4px 0;font-size:13px;color:#666;'
+            f'font-style:italic;">{s}</p>'
+        )
+
+    _close_section()
+    return "\n".join(parts)
+
+
+def build_email_html(summary_text: str, month_label: str, environment: str) -> str:
+    """Return a complete styled HTML email body."""
+    env_badge_colors = {
+        "Prod": ("#c41e3a", "#ffffff"),
+        "UAT" : ("#e07b00", "#ffffff"),
+        "Dev" : ("#28a745", "#ffffff"),
+    }
+    badge_bg, badge_fg = env_badge_colors.get(environment, ("#003087", "#ffffff"))
+    generated_at = datetime.now().strftime("%B %d, %Y at %H:%M")
+    summary_html = _format_summary_as_html(summary_text)
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Executive Summary \u2013 {month_label}</title>
+</head>
+<body style="margin:0;padding:0;background-color:#eef1f6;
+     font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;">
+
+<table width="100%" cellpadding="0" cellspacing="0" border="0"
+       style="background:#eef1f6;">
+  <tr><td align="center" style="padding:28px 12px;">
+
+    <table width="660" cellpadding="0" cellspacing="0" border="0"
+           style="max-width:660px;width:100%;background:#ffffff;
+                  border-radius:10px;overflow:hidden;
+                  box-shadow:0 4px 18px rgba(0,0,0,0.12);">
+
+      <!-- ═══════════════════ HEADER ═══════════════════ -->
+      <tr>
+        <td style="background:linear-gradient(135deg,#001a4d 0%,#002e6e 55%,#00529b 100%);
+                   padding:30px 36px 26px 36px;">
+          <table width="100%" cellpadding="0" cellspacing="0" border="0">
+            <tr>
+              <td>
+                <div style="font-size:10.5px;font-weight:600;color:#7eb3e0;
+                            letter-spacing:2px;text-transform:uppercase;
+                            margin-bottom:8px;">
+                  STAAT Insights &nbsp;|&nbsp; Monthly Report
+                </div>
+                <h1 style="margin:0 0 6px 0;font-size:26px;font-weight:800;
+                           color:#ffffff;letter-spacing:-0.5px;line-height:1.2;">
+                  Executive Summary
+                </h1>
+                <div style="font-size:16px;color:#a8cef0;font-weight:400;
+                            margin-top:4px;">
+                  {month_label}
+                </div>
+              </td>
+              <td style="text-align:right;vertical-align:top;padding-left:16px;">
+                <span style="background:{badge_bg};color:{badge_fg};
+                             padding:5px 14px;border-radius:20px;
+                             font-size:11px;font-weight:700;
+                             letter-spacing:1px;text-transform:uppercase;
+                             white-space:nowrap;">
+                  {environment}
+                </span>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+
+      <!-- ═══════════════════ INTRO ═══════════════════ -->
+      <tr>
+        <td style="background:#f7f9fc;padding:16px 36px;
+                   border-bottom:1px solid #e4e9f0;">
+          <p style="margin:0;font-size:13.5px;color:#555;line-height:1.5;">
+            Hi Team,<br>
+            Please find below the <strong style="color:#002e6e;">
+            {month_label} Executive Summary</strong> for the IKG Insights
+            Release. This report is auto-generated by the STAAT Insights
+            platform.
+          </p>
+        </td>
+      </tr>
+
+      <!-- ═══════════════════ SUMMARY BODY ═══════════════════ -->
+      <tr>
+        <td style="padding:28px 36px 20px 36px;">
+          {summary_html}
+        </td>
+      </tr>
+
+      <!-- ═══════════════════ DIVIDER ═══════════════════ -->
+      <tr>
+        <td style="padding:0 36px;">
+          <div style="height:2px;
+                      background:linear-gradient(to right,#002e6e,#7eb3e0,#eef1f6);">
+          </div>
+        </td>
+      </tr>
+
+      <!-- ═══════════════════ FOOTER ═══════════════════ -->
+      <tr>
+        <td style="padding:20px 36px 24px 36px;background:#f7f9fc;">
+          <table width="100%" cellpadding="0" cellspacing="0" border="0">
+            <tr>
+              <td style="vertical-align:top;">
+                <div style="font-size:13px;font-weight:700;color:#002e6e;
+                            margin-bottom:3px;">
+                  STAAT Insights Team
+                </div>
+                <div style="font-size:12px;color:#8a9bb5;line-height:1.6;">
+                  Generated on {generated_at}<br>
+                  Environment:&nbsp;
+                  <span style="color:{badge_bg};font-weight:600;">
+                    {environment}
+                  </span>
+                </div>
+              </td>
+              <td style="text-align:right;vertical-align:top;
+                         font-size:11px;color:#b0bec5;line-height:1.6;">
+                This is an automated report.<br>
+                Please do not reply to this email.
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+
+    </table><!-- /main card -->
+  </td></tr>
+</table><!-- /outer table -->
+
+</body>
+</html>"""
+
+
+# ---------------------------------------------------------------------------
+# Email – send helper  (mirrors swat_issues_report._send_email_with_attachments)
+# ---------------------------------------------------------------------------
+
+def _send_exec_summary_email(
+    recipients: list,
+    subject: str,
+    html_body: str,
+) -> None:
+    """Send the executive summary email via Airflow's email utility.
+
+    Only called when is_running_in_airflow() is True.
+    """
+    if not recipients:
+        logger.warning("No recipients provided for email, skipping send.")
+        return
+    try:
+        from airflow.utils.email import send_email  # type: ignore
+        send_email(to=recipients, subject=subject, html_content=html_body, files=[])
+        logger.info("Email sent to: %s", ", ".join(recipients))
+    except Exception as exc:
+        logger.error("Failed to send email via airflow.utils.email.send_email: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # DAG entry point
 # ---------------------------------------------------------------------------
 
 def generate_executive_summary(**kwargs) -> str:
-    """Generate and save the executive summary for the current month.
+    """Generate the executive summary for the current month, save it, and email it.
 
-    This is the callable registered in the monthly DAG (PythonOperator).
-    Month is derived from datetime.now() \u2013 no user input required.
-    Output is saved to  <script_dir>/output/executive_summary_YYYY-MM.txt.
+    Callable for the monthly DAG PythonOperator.
+    Month is derived from datetime.now() – no user input required.
     """
     now         = datetime.now()
     month_value = now.strftime("%Y-%m")
     month_label = now.strftime("%B %Y")
+    environment = _get_environment()
 
-    logger.info("[exec_summary] Generating executive summary for %s ...", month_label)
+    logger.info("[exec_summary] Generating executive summary for %s (%s)…",
+                month_label, environment)
 
     df_current, df_next, df_reactivated = get_exec_summary_data(
         month_value, allow_prompt=False
@@ -703,23 +918,37 @@ def generate_executive_summary(**kwargs) -> str:
         0 if df_reactivated is None or df_reactivated.empty
         else df_reactivated["rule_name"].nunique(),
     )
-    logger.info("[exec_summary] Next month rows    : %d", 0 if df_next is None else len(df_next))
+    logger.info("[exec_summary] Next month rows    : %d",
+                0 if df_next is None else len(df_next))
 
     summary_text = generate_summary(
         df_current,
         next_month_df  =df_next,
-        reactivated_df =df_reactivated if (df_reactivated is not None and not df_reactivated.empty) else None,
+        reactivated_df =df_reactivated if (df_reactivated is not None
+                                            and not df_reactivated.empty) else None,
     )
-    content = build_save_content(summary_text, month_label)
 
+    # ── Save to file ──────────────────────────────────────────────────────
+    content    = build_save_content(summary_text, month_label)
     output_dir = Path(__file__).resolve().parent / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
-    out_path = output_dir / f"executive_summary_{month_value}.txt"
-
+    out_path   = output_dir / f"executive_summary_{month_value}.txt"
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write(content)
-
     logger.info("[exec_summary] Saved \u2192 %s", out_path)
+
+    # ── Send email (Airflow only) ─────────────────────────────────────────
+    if is_running_in_airflow():
+        timestamp  = now.strftime("%Y%m%d_%H%M%S")
+        subject    = (
+            f"Executive Summary \u2013 {month_label} \u2013 {environment}"
+        )
+        html_body  = build_email_html(summary_text, month_label, environment)
+        recipients = get_email_recipients()
+        logger.info("[exec_summary] Sending email (%s) to: %s",
+                    environment, ", ".join(recipients))
+        _send_exec_summary_email(recipients, subject, html_body)
+
     return summary_text
 
 
@@ -728,22 +957,14 @@ def generate_executive_summary(**kwargs) -> str:
 # ---------------------------------------------------------------------------
 
 def layout(df: pd.DataFrame):
-    """Return the dcc.Tab component for the Executive Summary tab.
-
-    Only callable when Dash and styles are installed (production dashboard).
-    Never called from the DAG or the notebook.
-    """
     if not _DASH_AVAILABLE:
         raise RuntimeError(
-            "Dash is not installed in this environment. "
-            "layout() can only be called from the dashboard server."
+            "Dash is not installed. layout() can only be called from the dashboard server."
         )
-
     try:
         month_options = get_month_options_from_db()
     except Exception:
         month_options = extract_month_options(df)
-
     default_month = month_options[0]["value"] if month_options else None
 
     return dcc.Tab(
@@ -752,101 +973,48 @@ def layout(df: pd.DataFrame):
         children=html.Div(
             [
                 dcc.Store(id="exec-summary-text-store", data=""),
-
-                html.H3(
-                    "Executive Summary Generator",
-                    style=release_dashboard_styles["section_header_style"],
-                ),
-
-                # Toolbar
-                html.Div(
-                    [
-                        html.Div(
-                            [
-                                html.Span(
-                                    "Controls",
-                                    style=release_dashboard_styles["panel_section_label_style"],
-                                ),
-                                html.Div(
-                                    [
-                                        html.Button(
-                                            "Generate Executive Summary",
-                                            id="exec-summary-generate-btn",
-                                            n_clicks=0,
-                                            style=release_dashboard_styles["btn_primary_style"],
-                                        ),
-                                        html.Div(style=release_dashboard_styles["btn_divider_style"]),
-                                        html.Button(
-                                            "Save as TXT",
-                                            id="exec-summary-save-btn",
-                                            n_clicks=0,
-                                            style=release_dashboard_styles["btn_export_style"],
-                                            disabled=True,
-                                        ),
-                                    ],
-                                    style=release_dashboard_styles["btn_group_style"],
-                                ),
-                                html.Div(
-                                    [
-                                        html.Span(
-                                            "Month",
-                                            style=release_dashboard_styles["dropdown_label_style"],
-                                        ),
-                                        dcc.Dropdown(
-                                            id="exec-summary-month-filter",
-                                            options=month_options,
-                                            value=default_month,
-                                            placeholder="Select month\u2026",
-                                            clearable=True,
-                                            style=release_dashboard_styles["dropdown_style"],
-                                        ),
-                                    ],
-                                    style=release_dashboard_styles["dropdown_container_style"],
-                                ),
-                            ],
-                            style=release_dashboard_styles["panel_left_style"],
-                        ),
-                    ],
-                    style=release_dashboard_styles["toolbar_style"],
-                ),
-
-                # Output card
-                html.Div(
-                    [
-                        dcc.Download(id="exec-summary-download"),
-                        dcc.Loading(
-                            id="exec-summary-loading",
-                            type="default",
-                            children=html.Div(
-                                id="exec-summary-output",
-                                children="Select a month and click 'Generate Executive Summary' to begin.",
-                                style={
-                                    **release_dashboard_styles.get("table_style", {}),
-                                    "padding"     : "20px",
-                                    "background"  : "#ffffff",
-                                    "borderRadius": "8px",
-                                    "minHeight"   : "220px",
-                                    "whiteSpace"  : "pre-wrap",
-                                    "fontSize"    : "14px",
-                                    "lineHeight"  : "1.6",
-                                },
-                            ),
-                        ),
-                    ],
-                    style={"marginTop": "18px"},
-                ),
-
-                # Toast
-                dbc.Toast(
-                    id="exec-summary-save-toast",
-                    header="Executive Summary",
-                    children="",
-                    is_open=False,
-                    duration=4000,
-                    icon="success",
-                    dismissable=True,
-                    style={"position": "fixed", "top": 16, "right": 16, "zIndex": 9999},
-                ),
+                html.H3("Executive Summary Generator",
+                        style=release_dashboard_styles["section_header_style"]),
+                html.Div([
+                    html.Div([
+                        html.Span("Controls",
+                                  style=release_dashboard_styles["panel_section_label_style"]),
+                        html.Div([
+                            html.Button("Generate Executive Summary",
+                                        id="exec-summary-generate-btn", n_clicks=0,
+                                        style=release_dashboard_styles["btn_primary_style"]),
+                            html.Div(style=release_dashboard_styles["btn_divider_style"]),
+                            html.Button("Save as TXT",
+                                        id="exec-summary-save-btn", n_clicks=0,
+                                        style=release_dashboard_styles["btn_export_style"],
+                                        disabled=True),
+                        ], style=release_dashboard_styles["btn_group_style"]),
+                        html.Div([
+                            html.Span("Month",
+                                      style=release_dashboard_styles["dropdown_label_style"]),
+                            dcc.Dropdown(id="exec-summary-month-filter",
+                                         options=month_options, value=default_month,
+                                         placeholder="Select month\u2026", clearable=True,
+                                         style=release_dashboard_styles["dropdown_style"]),
+                        ], style=release_dashboard_styles["dropdown_container_style"]),
+                    ], style=release_dashboard_styles["panel_left_style"]),
+                ], style=release_dashboard_styles["toolbar_style"]),
+                html.Div([
+                    dcc.Download(id="exec-summary-download"),
+                    dcc.Loading(id="exec-summary-loading", type="default",
+                                children=html.Div(
+                                    id="exec-summary-output",
+                                    children="Select a month and click 'Generate Executive Summary' to begin.",
+                                    style={**release_dashboard_styles.get("table_style", {}),
+                                           "padding": "20px", "background": "#ffffff",
+                                           "borderRadius": "8px", "minHeight": "220px",
+                                           "whiteSpace": "pre-wrap", "fontSize": "14px",
+                                           "lineHeight": "1.6"})),
+                ], style={"marginTop": "18px"}),
+                dbc.Toast(id="exec-summary-save-toast", header="Executive Summary",
+                          children="", is_open=False, duration=4000, icon="success",
+                          dismissable=True,
+                          style={"position": "fixed", "top": 16, "right": 16, "zIndex": 9999}),
             ],
             style=release_dashboard_styles["table_container_style"],
         ),
@@ -854,19 +1022,27 @@ def layout(df: pd.DataFrame):
 
 
 if __name__ == "__main__":
-    # Local quick-test: prompt for month, then generate.
-    import getpass
-    month_raw = input("Month to summarise (e.g. '2026-05' or 'May 2026'): ").strip()
+    import getpass as _gp
+    _raw = input("Month to summarise (e.g. '2026-05' or 'May 2026'): ").strip()
     try:
-        MONTH = str(pd.Period(month_raw, "M"))
+        _MONTH = str(pd.Period(_raw, "M"))
     except Exception:
-        MONTH = datetime.strptime(
-            month_raw.replace("-", " ").replace("/", " "), "%B %Y"
+        _MONTH = datetime.strptime(
+            _raw.replace("-", " ").replace("/", " "), "%B %Y"
         ).strftime("%Y-%m")
-    label = pd.Period(MONTH, "M").to_timestamp().strftime("%B %Y")
-    df_c, df_n, df_r = get_exec_summary_data(MONTH, allow_prompt=True)
-    text = generate_summary(df_c, next_month_df=df_n, reactivated_df=df_r if not df_r.empty else None)
+    _label   = pd.Period(_MONTH, "M").to_timestamp().strftime("%B %Y")
+    _dfc, _dfn, _dfr = get_exec_summary_data(_MONTH, allow_prompt=True)
+    _text = generate_summary(
+        _dfc,
+        next_month_df=_dfn,
+        reactivated_df=_dfr if not _dfr.empty else None,
+    )
     print("\n" + "=" * 80)
-    print(f"Executive Summary \u2013 {label}")
+    print(f"Executive Summary \u2013 {_label}")
     print("=" * 80 + "\n")
-    print(text)
+    print(_text)
+    # Save HTML preview locally for inspection
+    _html = build_email_html(_text, _label, "Dev")
+    _out  = Path(f"exec_summary_preview_{_MONTH}.html")
+    _out.write_text(_html, encoding="utf-8")
+    print(f"\nHTML preview saved \u2192 {_out}")
