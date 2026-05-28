@@ -514,13 +514,13 @@ def _build_prompt(
 
     2. Top Feature (or Insight) of the Month:
     - Insight name: <answer>
-    - Brief description / example of narrative: <answer>
+    - Brief description: <answer>
     - Main benefit / value: <answer>
 
     3. New Insights (ranked by importance/impact, including reactivated insights):
     For each new or reactivated insight:
     - Insight name: <answer>
-    - Brief description / example of narrative: <answer>
+    - Brief description: <answer>
     - Main benefit / value: <answer>
     - Status: New | Reactivated
 
@@ -539,6 +539,7 @@ def _build_prompt(
     - Focus areas (2-4 items max): list Insight Title only, limited to "New Insight" labelled items
 
     === INSTRUCTIONS ===
+    - Always include a single space after every colon (:) in your response
     - Be concise and business-focused
     - Rank insights by business impact and value
     - Use clear, non-technical language where possible
