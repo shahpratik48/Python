@@ -136,6 +136,7 @@ class InsightsMetaDashApp:
             Output("col-insights-search", "search_value", allow_duplicate=True),
             Input("url", "search"),
             State("tabs-main", "value"),
+            prevent_initial_call="initial_duplicate",
         )
         def navigate_on_url_params(search, current_tab):
             if not search:
