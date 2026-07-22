@@ -133,5 +133,5 @@ class SrcIndex:
         names = []
         for r in self.resources_for_target_type(target_type):
             if r.tag == "insight_type":
-                names.append(posixpath.basename(r.path)[len("si_"):].rsplit(".", 1)[0])
+                names.append(posixpath.basename(r.path))
         return sorted(set(names))
