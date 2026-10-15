@@ -15,7 +15,7 @@ Three features, each can be run or skipped independently:
   (4) rebuild - read the restored txt files and recreate every real file, with its
                 original name and content, in the original folder structure under
                 REBUILD_DIR/<ikg|odm|nlg>/...   e.g. rebuilt/ikg/dags/ikg/test/test.sql
-                then zips each project folder to OUTPUT_DIR/ikg.zip, odm.zip, nlg.zip
+                then zips each project folder to REBUILD_DIR/ikg.zip, odm.zip, nlg.zip
                 (ZIP_REBUILT in config)
   (5) verify  - compare i.txt / o.txt / n.txt with i_restored.txt / o_restored.txt /
                 n_restored.txt byte by byte, and (if present) every rebuilt file with
@@ -290,7 +290,13 @@ def rebuild_files(projects=None, source="restored"):
     """
     source: "restored" -> read i_restored.txt / o_restored.txt / n_restored.txt
             "original" -> read i.txt / o.txt / n.txt
-    Writes REBUILD_DIR/<ikg|odm|nlg>/<path inside repo>, creating folders as needed.
+    Writes REBUILD_DIR/<ikg|odm|nlg>/<path inside repo>, creating folders as needed,
+    and REBUILD_DIR/<ikg|odm|nlg>.zip next to each folder:
+        rebuilt/
+          ikg/        <- everything from ikg-dags (dags/..., README.md, ...)
+          ikg.zip
+          odm/  odm.zip
+          nlg/  nlg.zip
     The leading project folder in the dump path (e.g. "ikg-dags/") is replaced by the
     project key folder (ikg/, odm/, nlg/).
     """
@@ -322,7 +328,7 @@ def rebuild_files(projects=None, source="restored"):
         print(msg)
 
         if getattr(config, "ZIP_REBUILT", True) and written:
-            zip_path = _zip_folder(os.path.join(root, key), os.path.join(config.OUTPUT_DIR, key))
+            zip_path = _zip_folder(os.path.join(root, key), os.path.join(root, key))
             print(f"      zipped -> {zip_path}")
 
 

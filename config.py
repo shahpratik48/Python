@@ -40,6 +40,9 @@ RESTORED_SUFFIX = "_restored"
 # and under each the original repo folder structure, e.g. rebuilt/ikg/dags/ikg/test/test.sql
 REBUILD_DIR = "rebuilt"
 
+# After rebuild, zip each project folder to REBUILD_DIR/ikg.zip, odm.zip, nlg.zip (next to the folders).
+ZIP_REBUILT = True
+
 # Separator line between files in the txt output
 SEPARATOR = "-" * 127
 
