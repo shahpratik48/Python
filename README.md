@@ -14,13 +14,15 @@ txt files, masks them, restores masked files, and rebuilds the real files from t
 | export | GitLab (token asked)       | i.txt, o.txt, n.txt                       |
 | mask   | i.txt, o.txt, n.txt        | i_masked.txt, o_masked.txt, n_masked.txt  |
 | unmask | *_masked.txt (same folder) | i_restored.txt, o_restored.txt, n_restored.txt (or i/o/n.txt with restore_to_original=True) |
-| rebuild | *_restored.txt (or i/o/n.txt with rebuild_source="original") | real files under rebuilt/ikg/, rebuilt/odm/, rebuilt/nlg/ in the original folder structure, e.g. rebuilt/ikg/dags/ikg/test/test.sql |
+| rebuild | *_restored.txt (or i/o/n.txt with rebuild_source="original") | real files under rebuilt/ikg/, rebuilt/odm/, rebuilt/nlg/ in the original folder structure, e.g. rebuilt/ikg/dags/ikg/test/test.sql, plus ikg.zip / odm.zip / nlg.zip in the output folder |
+| verify | i/o/n.txt, *_restored.txt, rebuilt/ | report: byte-by-byte comparison of original vs restored txt, and of every rebuilt file vs the original txt; first difference shown with line/column |
 
     pip install requests
     python gitlab_dump.py                 # asks y/n for each step
     python gitlab_dump.py export mask     # run only these
     python gitlab_dump.py unmask
-    python gitlab_dump.py unmask rebuild
+    python gitlab_dump.py unmask rebuild verify
+    python gitlab_dump.py verify
 
 ## txt format
     ****test.sql******

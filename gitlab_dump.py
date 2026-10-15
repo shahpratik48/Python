@@ -15,12 +15,18 @@ Three features, each can be run or skipped independently:
   (4) rebuild - read the restored txt files and recreate every real file, with its
                 original name and content, in the original folder structure under
                 REBUILD_DIR/<ikg|odm|nlg>/...   e.g. rebuilt/ikg/dags/ikg/test/test.sql
+                then zips each project folder to OUTPUT_DIR/ikg.zip, odm.zip, nlg.zip
+                (ZIP_REBUILT in config)
+  (5) verify  - compare i.txt / o.txt / n.txt with i_restored.txt / o_restored.txt /
+                n_restored.txt byte by byte, and (if present) every rebuilt file with
+                the content in the original txt. Reports the first difference found.
 
 Usage (command line):
     python gitlab_dump.py                       # asks which steps to run
     python gitlab_dump.py export mask           # run only these steps
     python gitlab_dump.py unmask
     python gitlab_dump.py rebuild
+    python gitlab_dump.py verify
 
 Usage (notebook / import):
     from gitlab_dump import run
@@ -35,6 +41,7 @@ Dependencies: requests   (pip install requests)
 
 import getpass
 import os
+import shutil
 import sys
 from urllib.parse import quote
 
@@ -314,11 +321,106 @@ def rebuild_files(projects=None, source="restored"):
         msg += f", {skipped} binary placeholder(s) skipped)" if skipped else ")"
         print(msg)
 
+        if getattr(config, "ZIP_REBUILT", True) and written:
+            zip_path = _zip_folder(os.path.join(root, key), os.path.join(config.OUTPUT_DIR, key))
+            print(f"      zipped -> {zip_path}")
+
+
+def _zip_folder(folder, zip_base):
+    """Zip `folder` to `zip_base`.zip; the zip contains the folder itself as top level
+    (e.g. ikg.zip -> ikg/dags/ikg/...). An existing zip is replaced."""
+    if os.path.exists(zip_base + ".zip"):
+        os.remove(zip_base + ".zip")
+    return shutil.make_archive(
+        zip_base, "zip",
+        root_dir=os.path.dirname(os.path.abspath(folder)),
+        base_dir=os.path.basename(folder),
+    )
+
+
+# =========================================================================== #
+# Feature 5: verify original vs restored (and rebuilt)
+# =========================================================================== #
+def _first_diff(a, b):
+    """Describe the first difference between two byte strings (line number + position)."""
+    n = min(len(a), len(b))
+    i = next((k for k in range(n) if a[k] != b[k]), n)
+    if i == n and len(a) == len(b):
+        return None
+    line = a[:i].count(b"\n") + 1
+    col = i - (a[:i].rfind(b"\n") + 1) + 1
+    if i == n:
+        return f"line {line}: one side is longer ({len(a)} vs {len(b)} bytes)"
+    return f"line {line}, column {col}: {a[i:i+20]!r} vs {b[i:i+20]!r}"
+
+
+def _read_bytes(path):
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
+def verify_files(projects=None):
+    """
+    1. <prefix>.txt  vs  <prefix>_restored.txt   - must be byte-identical
+    2. every file under REBUILD_DIR/<key>/      vs its content in <prefix>.txt - must be byte-identical
+    Returns True when everything matches.
+    """
+    projects = projects or config.PROJECTS
+    root = os.path.join(config.OUTPUT_DIR, config.REBUILD_DIR)
+    all_ok = True
+
+    for key, (_path, prefix) in projects.items():
+        orig = _out_path(prefix)
+        rest = _out_path(prefix, config.RESTORED_SUFFIX)
+        if not os.path.isfile(orig):
+            print(f"[{key}] skip - {orig} not found")
+            continue
+        orig_bytes = _read_bytes(orig)
+
+        # 1. txt vs restored txt
+        if os.path.isfile(rest):
+            diff = _first_diff(orig_bytes, _read_bytes(rest))
+            if diff:
+                all_ok = False
+                print(f"[{key}] MISMATCH  {os.path.basename(orig)} vs {os.path.basename(rest)}: {diff}")
+            else:
+                print(f"[{key}] OK        {os.path.basename(orig)} == {os.path.basename(rest)}  ({len(orig_bytes):,} bytes)")
+        else:
+            print(f"[{key}] skip      {rest} not found")
+
+        # 2. rebuilt files vs content inside the original txt
+        rebuilt_dir = os.path.join(root, key)
+        if not os.path.isdir(rebuilt_dir):
+            continue
+        entries = parse_dump(orig_bytes.decode(config.ENCODING))
+        checked = mismatched = missing = 0
+        for name, full_path, code in entries:
+            if code.startswith(BINARY_PLACEHOLDER):
+                continue
+            rel = full_path.split("/", 1)[1] if "/" in full_path else full_path
+            dest = os.path.join(rebuilt_dir, *rel.split("/"))
+            if not os.path.isfile(dest):
+                missing += 1
+                all_ok = False
+                print(f"[{key}]   MISSING  {rel}")
+                continue
+            checked += 1
+            diff = _first_diff(code.encode(config.ENCODING), _read_bytes(dest))
+            if diff:
+                mismatched += 1
+                all_ok = False
+                print(f"[{key}]   MISMATCH {rel}: {diff}")
+        status = "OK" if not (mismatched or missing) else "FAILED"
+        print(f"[{key}] {status:9} rebuilt files: {checked} compared, {mismatched} mismatched, {missing} missing")
+
+    print("\nVERIFY RESULT:", "all files identical" if all_ok else "DIFFERENCES FOUND (see above)")
+    return all_ok
+
 
 # =========================================================================== #
 # Runner
 # =========================================================================== #
-STEPS = ("export", "mask", "unmask", "rebuild")
+STEPS = ("export", "mask", "unmask", "rebuild", "verify")
 
 
 def _ask_steps():
@@ -333,8 +435,8 @@ def _ask_steps():
 
 def run(steps=None, token=None, restore_to_original=False, rebuild_source="restored"):
     """
-    steps: list of any of "export", "mask", "unmask", "rebuild"
-           (order is fixed: export -> mask -> unmask -> rebuild). None = ask interactively.
+    steps: list of any of "export", "mask", "unmask", "rebuild", "verify"
+           (order is fixed: export -> mask -> unmask -> rebuild -> verify). None = ask interactively.
     token: GitLab token (only needed for "export"; asked if missing).
     restore_to_original: unmask writes i.txt/o.txt/n.txt instead of i_restored.txt/...
     rebuild_source: "restored" (default) rebuilds from *_restored.txt, "original" from i/o/n.txt
@@ -365,6 +467,9 @@ def run(steps=None, token=None, restore_to_original=False, rebuild_source="resto
         if restore_to_original and rebuild_source == "restored":
             rebuild_source = "original"   # unmask wrote into i/o/n.txt, so read those
         rebuild_files(source=rebuild_source)
+    if "verify" in steps:
+        print("\n=== (5) verify original vs restored ===")
+        verify_files()
     print("\nDone.")
 
 
