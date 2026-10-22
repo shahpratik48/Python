@@ -1,0 +1,177 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<title>Agile Dev Assist Git Mechanics</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+  /* layout: reading column, one diagram band per scenario; engineering-document tone */
+  :root {
+    --bg: #f7f6f2; --fg: #1d2129; --muted: #5b6270; --line: #d9d6cc; --panel: #ffffff;
+    --accent: #0f5c6e; --accent-soft: #dcebee; --warn: #9a5b00; --warn-soft: #f6ead4; --ok: #2f6b3a; --ok-soft: #e1efe3;
+    --user: #e8edf7; --shared: #fbf1dc; --ext: #ece6f5;
+    --body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif; --mono: "IBM Plex Mono", Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg: #14171c; --fg: #e6e8ec; --muted: #a2a8b4; --line: #2f343c; --panel: #1c2026;
+    --accent: #6cc3d6; --accent-soft: #15333b; --warn: #e3a94f; --warn-soft: #3a2d12; --ok: #7fc48d; --ok-soft: #17301c; --user: #1e2738; --shared: #332a16; --ext: #2a2436; color-scheme: dark } }
+  :root[data-theme="dark"] { --bg: #14171c; --fg: #e6e8ec; --muted: #a2a8b4; --line: #2f343c; --panel: #1c2026;
+    --accent: #6cc3d6; --accent-soft: #15333b; --warn: #e3a94f; --warn-soft: #3a2d12; --ok: #7fc48d; --ok-soft: #17301c; --user: #1e2738; --shared: #332a16; --ext: #2a2436; color-scheme: dark }
+  body { background: var(--bg); color: var(--fg); font-family: var(--body); font-size: 15.5px; line-height: 1.55;
+    padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 28px 60px; }
+  main { max-width: 920px; margin: 0 auto; }
+  h1 { font-size: clamp(26px, 4vw, 34px); line-height: 1.15; margin: 0 0 6px; text-wrap: balance; letter-spacing: -.01em; }
+  .sub { color: var(--muted); margin: 0 0 24px; max-width: 72ch; }
+  h2 { font-size: 20px; margin: 40px 0 10px; padding-top: 14px; border-top: 1px solid var(--line); text-wrap: balance; }
+  h3 { font-size: 16px; margin: 18px 0 6px; }
+  p, ul, ol { max-width: 74ch; margin: 0 0 12px; } ul, ol { padding-left: 22px; } li { margin-bottom: 5px; }
+  code { font-family: var(--mono); font-size: 13px; background: var(--accent-soft); padding: 1px 5px; border-radius: 4px; }
+  pre { font-family: var(--mono); font-size: 12.5px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; overflow-x: auto; max-width: 100%; }
+  .eyebrow { font-size: 11.5px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+  .diagram { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px; margin: 12px 0 6px; overflow-x: auto; }
+  .diagram svg { display: block; width: 100%; height: auto; min-width: 640px; }
+  .cap { font-size: 13px; color: var(--muted); margin: 0 0 16px; max-width: 80ch; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; margin: 8px 0 16px; }
+  th, td { text-align: left; vertical-align: top; padding: 7px 10px; border-bottom: 1px solid var(--line); }
+  th { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 600; }
+  .tbl { overflow-x: auto; }
+  .key { background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--accent); padding: 10px 14px; border-radius: 4px; max-width: 74ch; margin: 0 0 14px; }
+  .svgtxt { font-family: var(--body); font-size: 12.5px; fill: var(--fg); } .svgsm { font-family: var(--body); font-size: 11px; fill: var(--muted); } .svgmono { font-family: var(--mono); font-size: 11px; fill: var(--fg); }
+  .box { stroke: var(--line); stroke-width: 1; } .lane { stroke: var(--line); stroke-width: 1; stroke-dasharray: 3 3; }
+  .arrow { stroke: var(--muted); stroke-width: 1.4; fill: none; marker-end: url(#ah); } .arrow.strong { stroke: var(--accent); stroke-width: 1.8; marker-end: url(#ah2); }
+  .arrow.back { marker-end: url(#ah); marker-start: none; }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+<main>
+  <div class="eyebrow">Agile Dev Assist · git mechanics for the engineering review</div>
+  <h1>Fetch, checkout and push: what actually happens for each developer</h1>
+  <p class="sub">The tool keeps two things strictly apart: <b>reading</b> the repository (so the agents know the existing code) and <b>writing</b> a branch (push). Reading uses read-only snapshots; writing uses the GitLab API with the developer's own token. There is no writable working copy on the server, so simultaneous developers cannot step on each other's checkout.</p>
+
+  <div class="key"><b>Key fact.</b> The server never runs <code>git checkout</code> on a shared working tree and never runs <code>git push</code>. Reads are shallow read-only clones (or the nightly pack snapshot); writes are three REST calls to GitLab: create branch → commit files → open merge request.</div>
+
+  <h2>Scenario 1 — Developer starts from the IKG template (knowledge pack)</h2>
+  <p>No git traffic at all during the session. The nightly Airflow job already cloned <code>ikg-dags@develop</code>, analysed it and packed the repository copy into <code>ikg_pack.zip</code>. The server unpacks that zip once per content hash and every chat reads the same folder.</p>
+  <div class="diagram" aria-label="Scenario 1">
+    <svg viewBox="0 0 900 230" role="img">
+      <defs>
+        <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker>
+        <marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="var(--accent)"/></marker>
+      </defs>
+      <rect x="20" y="30" width="150" height="54" rx="6" fill="var(--ext)" class="box"/><text x="95" y="52" text-anchor="middle" class="svgtxt">GitLab</text><text x="95" y="70" text-anchor="middle" class="svgsm">ikg-dags @ develop</text>
+      <rect x="230" y="30" width="190" height="54" rx="6" fill="var(--ext)" class="box"/><text x="325" y="52" text-anchor="middle" class="svgtxt">Airflow, 19:00 Mon–Fri</text><text x="325" y="70" text-anchor="middle" class="svgsm">git clone --depth 1 (service read token)</text>
+      <path class="arrow" d="M170 57 L 228 57"/>
+      <rect x="480" y="30" width="170" height="54" rx="6" fill="var(--shared)" class="box"/><text x="565" y="52" text-anchor="middle" class="svgtxt">ikg_pack.zip</text><text x="565" y="70" text-anchor="middle" class="svgsm">raw/repo + facts + index</text>
+      <path class="arrow" d="M420 57 L 478 57"/>
+      <rect x="710" y="30" width="170" height="54" rx="6" fill="var(--shared)" class="box"/><text x="795" y="52" text-anchor="middle" class="svgtxt">server, unpacked once</text><text x="795" y="70" text-anchor="middle" class="svgsm">data/packs/unzipped/ikg_pack_&lt;sha&gt;/</text>
+      <path class="arrow" d="M650 57 L 708 57"/>
+      <rect x="230" y="140" width="130" height="54" rx="6" fill="var(--user)" class="box"/><text x="295" y="162" text-anchor="middle" class="svgtxt">user1 · chat A</text><text x="295" y="180" text-anchor="middle" class="svgsm">reads, indexes, never writes</text>
+      <rect x="400" y="140" width="130" height="54" rx="6" fill="var(--user)" class="box"/><text x="465" y="162" text-anchor="middle" class="svgtxt">user2 · chat B</text><text x="465" y="180" text-anchor="middle" class="svgsm">same folder, read-only</text>
+      <rect x="570" y="140" width="130" height="54" rx="6" fill="var(--user)" class="box"/><text x="635" y="162" text-anchor="middle" class="svgtxt">user1 · chat C</text><text x="635" y="180" text-anchor="middle" class="svgsm">same folder, read-only</text>
+      <path class="arrow" d="M760 84 C 700 110, 340 110, 295 138"/><path class="arrow" d="M780 84 C 740 115, 500 115, 465 138"/><path class="arrow" d="M800 84 C 780 115, 660 115, 635 138"/>
+      <text x="450" y="222" text-anchor="middle" class="svgsm">one copy on disk, N readers; a new pack version = a new folder, old chats keep pointing at theirs</text>
+    </svg>
+  </div>
+  <p class="cap">Processes involved: Airflow task (<code>git clone --depth 1 --filter=blob:none --sparse</code>, service read token) → zip; server (<code>zipfile.extractall</code>, BM25/identifier index built once and cached as <code>.agiledev_index.pkl</code>). No git process runs during a chat.</p>
+
+  <h2>Scenario 2 — Developer adds a live repository (Code repo icon)</h2>
+  <p>Needed when the story targets a branch the pack doesn't cover (<code>ikg-master</code> vs the pack's <code>develop</code>), a repository without a pack, or commits made today. The clone is private to the user and keyed by branch.</p>
+  <div class="diagram" aria-label="Scenario 2">
+    <svg viewBox="0 0 900 300" role="img">
+      <line x1="120" y1="40" x2="120" y2="280" class="lane"/><line x1="450" y1="40" x2="450" y2="280" class="lane"/><line x1="780" y1="40" x2="780" y2="280" class="lane"/>
+      <rect x="40" y="14" width="160" height="26" rx="5" fill="var(--user)" class="box"/><text x="120" y="31" text-anchor="middle" class="svgtxt">user1 (browser)</text>
+      <rect x="370" y="14" width="160" height="26" rx="5" fill="var(--panel)" class="box"/><text x="450" y="31" text-anchor="middle" class="svgtxt">server (job thread)</text>
+      <rect x="700" y="14" width="160" height="26" rx="5" fill="var(--ext)" class="box"/><text x="780" y="31" text-anchor="middle" class="svgtxt">GitLab</text>
+      <path class="arrow" d="M120 70 L 448 70"/><text x="285" y="64" text-anchor="middle" class="svgsm">① URL + branch (+ token; else the read token given at launch)</text>
+      <path class="arrow" d="M450 100 L 778 100"/><text x="615" y="94" text-anchor="middle" class="svgsm">② git clone --depth 1 --filter=blob:none --sparse  (user's token)</text>
+      <path class="arrow" d="M780 130 L 452 130"/><text x="615" y="124" text-anchor="middle" class="svgsm">③ sub-folder only, e.g. dags/ikg</text>
+      <rect x="300" y="150" width="300" height="56" rx="5" fill="var(--user)" class="box"/>
+      <text x="450" y="170" text-anchor="middle" class="svgmono">data/cache/repos/user1@ubs.com/ikg-dags@ikg-master/</text>
+      <text x="450" y="188" text-anchor="middle" class="svgsm">④ code files copied out of .git_checkout; index built; marker .agiledev_ref</text>
+      <path class="arrow" d="M450 230 L 778 230"/><text x="615" y="224" text-anchor="middle" class="svgsm">⑤ later "re-sync": git fetch --depth 1 + checkout (incremental, seconds)</text>
+      <path class="arrow" d="M450 262 L 122 262"/><text x="285" y="256" text-anchor="middle" class="svgsm">⑥ "ikg-dags@ikg-master: 1 127 files indexed"</text>
+    </svg>
+  </div>
+  <p class="cap">Technically: <code>git clone</code> runs as a subprocess under the server account with the token passed through an in-memory credential helper (never written to disk). The checkout under <code>.git_checkout/</code> is only used to copy files out; the index reads the copies. user2 adding the same repository gets a separate clone under <code>…/user2@ubs.com/…</code>: nobody's re-sync changes what another user is indexed against. Reused for <code>cache_hours</code> (24 h) unless "re-sync" is ticked.</p>
+
+  <h2>Scenario 3 — Push: feature branch + merge request</h2>
+  <p>Generated files live in the chat folder until the developer presses Push and types their personal token. The server then talks to GitLab's API; it does not use any clone.</p>
+  <div class="diagram" aria-label="Scenario 3">
+    <svg viewBox="0 0 900 330" role="img">
+      <line x1="120" y1="40" x2="120" y2="310" class="lane"/><line x1="450" y1="40" x2="450" y2="310" class="lane"/><line x1="780" y1="40" x2="780" y2="310" class="lane"/>
+      <rect x="40" y="14" width="160" height="26" rx="5" fill="var(--user)" class="box"/><text x="120" y="31" text-anchor="middle" class="svgtxt">user1 (push form)</text>
+      <rect x="370" y="14" width="160" height="26" rx="5" fill="var(--panel)" class="box"/><text x="450" y="31" text-anchor="middle" class="svgtxt">server</text>
+      <rect x="700" y="14" width="160" height="26" rx="5" fill="var(--ext)" class="box"/><text x="780" y="31" text-anchor="middle" class="svgtxt">GitLab API</text>
+      <path class="arrow" d="M120 66 L 448 66"/><text x="285" y="60" text-anchor="middle" class="svgsm">branch 2400-ikg-beneficiary-enrichment · from ikg-master · MR → ikg-dev · token</text>
+      <path class="arrow" d="M450 96 L 778 96"/><text x="615" y="90" text-anchor="middle" class="svgsm">① GET /user  (who is this token?) → author name/e-mail</text>
+      <path class="arrow" d="M450 126 L 778 126"/><text x="615" y="120" text-anchor="middle" class="svgsm">② GET /repository/branches/&lt;branch&gt;  exists?</text>
+      <path class="arrow strong" d="M450 156 L 778 156"/><text x="615" y="150" text-anchor="middle" class="svgsm">③ POST /repository/branches {branch, ref: ikg-master}  (only if absent; from the CURRENT tip)</text>
+      <path class="arrow strong" d="M450 186 L 778 186"/><text x="615" y="180" text-anchor="middle" class="svgsm">④ POST /repository/commits {branch, message "agile_dev_assist: 2400 …", actions:[create|update file …]}</text>
+      <path class="arrow strong" d="M450 216 L 778 216"/><text x="615" y="210" text-anchor="middle" class="svgsm">⑤ GET open MR source→target; else POST /merge_requests {source, target: ikg-dev, title, description}</text>
+      <path class="arrow" d="M780 246 L 452 246"/><text x="615" y="240" text-anchor="middle" class="svgsm">commit sha, branch URL, MR !iid</text>
+      <path class="arrow" d="M450 276 L 122 276"/><text x="285" y="270" text-anchor="middle" class="svgsm">"Pushed 4 files to 2400-ikg-… as user1 · MR !57 → ikg-dev"  (recorded in publish.json)</text>
+      <text x="450" y="304" text-anchor="middle" class="svgsm">one commit per push; a second push to the same branch adds a commit (action = update), it never force-pushes</text>
+    </svg>
+  </div>
+  <p class="cap">Equivalent to the manual sequence <code>git checkout -b 2400-ikg-… ikg-master && git add … && git commit && git push -u origin … </code> + "New merge request", done server-side through the API in one go, authored by the developer. GitLab serialises commits on a branch, so two simultaneous pushes never corrupt it.</p>
+
+  <h2>Scenario 4 — Two developers, two stories, same base</h2>
+  <div class="diagram" aria-label="Scenario 4">
+    <svg viewBox="0 0 900 200" role="img">
+      <text x="12" y="48" class="svgsm">ikg-master</text><line x1="110" y1="44" x2="880" y2="44" stroke="var(--line)" stroke-width="2"/>
+      <circle cx="200" cy="44" r="6" fill="var(--panel)" stroke="var(--muted)" stroke-width="2"/><text x="200" y="30" text-anchor="middle" class="svgsm">tip at 10:00</text>
+      <circle cx="420" cy="44" r="6" fill="var(--panel)" stroke="var(--muted)" stroke-width="2"/><text x="420" y="30" text-anchor="middle" class="svgsm">tip at 10:20 (someone merged)</text>
+      <path class="arrow strong" d="M206 50 C 240 60, 250 100, 290 104"/>
+      <rect x="290" y="90" width="230" height="30" rx="5" fill="var(--accent-soft)" class="box"/><text x="405" y="109" text-anchor="middle" class="svgmono">user1: 2400-ikg-beneficiary-enrichment</text>
+      <path class="arrow strong" d="M426 50 C 460 60, 470 150, 510 154"/>
+      <rect x="510" y="140" width="230" height="30" rx="5" fill="var(--accent-soft)" class="box"/><text x="625" y="159" text-anchor="middle" class="svgmono">user2: 2415-ikg-household-art-flag</text>
+      <text x="630" y="110" text-anchor="middle" class="svgsm">each branch is cut from the tip AT ITS OWN PUSH TIME</text>
+      <text x="450" y="192" text-anchor="middle" class="svgsm">two branches, two MRs to ikg-dev, reviewed independently — identical to today's manual flow</text>
+    </svg>
+  </div>
+
+  <h2>Scenario 5 — Two developers push the same story</h2>
+  <div class="diagram" aria-label="Scenario 5">
+    <svg viewBox="0 0 900 190" role="img">
+      <text x="12" y="48" class="svgsm">ikg-master</text><line x1="110" y1="44" x2="880" y2="44" stroke="var(--line)" stroke-width="2"/>
+      <circle cx="200" cy="44" r="6" fill="var(--panel)" stroke="var(--muted)" stroke-width="2"/>
+      <path class="arrow strong" d="M206 50 C 240 60, 250 100, 290 104"/>
+      <text x="12" y="128" class="svgsm">2400-ikg-…</text><line x1="110" y1="124" x2="880" y2="124" stroke="var(--accent)" stroke-width="2" stroke-dasharray="4 3"/>
+      <circle cx="330" cy="124" r="6" fill="var(--accent)"/><text x="330" y="150" text-anchor="middle" class="svgsm">user1 push: branch created + commit 1</text>
+      <circle cx="560" cy="124" r="6" fill="var(--accent)"/><text x="560" y="150" text-anchor="middle" class="svgsm">user2 push: branch exists → commit 2 (update actions)</text>
+      <text x="560" y="166" text-anchor="middle" class="svgsm">MR already open → reused, not duplicated</text>
+      <text x="760" y="100" text-anchor="middle" class="svgsm">want separate work? edit the name: 2400-ikg-…-v2</text>
+    </svg>
+  </div>
+  <p class="cap">The branch name is derived from the story id, so the tool finds the existing branch (step ② in scenario 3) and appends; the second developer's files replace the first's only for files both generated, visible as a normal diff in the MR. No force-push, nothing lost from history.</p>
+
+  <h2>Scenario 6 — Base branch moved on / same file changed by two stories</h2>
+  <div class="diagram" aria-label="Scenario 6">
+    <svg viewBox="0 0 900 210" role="img">
+      <text x="12" y="48" class="svgsm">ikg-master</text><line x1="110" y1="44" x2="880" y2="44" stroke="var(--line)" stroke-width="2"/>
+      <circle cx="200" cy="44" r="6" fill="var(--panel)" stroke="var(--muted)" stroke-width="2"/><text x="200" y="30" text-anchor="middle" class="svgsm">chat started, repo read here</text>
+      <circle cx="470" cy="44" r="6" fill="var(--panel)" stroke="var(--muted)" stroke-width="2"/><text x="470" y="30" text-anchor="middle" class="svgsm">ikg_data_refresh.py changed by story 2399</text>
+      <path class="arrow strong" d="M476 50 C 510 60, 520 100, 560 104"/>
+      <rect x="560" y="90" width="230" height="30" rx="5" fill="var(--accent-soft)" class="box"/><text x="675" y="109" text-anchor="middle" class="svgmono">2400-ikg-… cut from the NEW tip at push</text>
+      <text x="450" y="150" text-anchor="middle" class="svgsm">the generated file content is committed on top of the new tip → the MR diff shows both changes;</text>
+      <text x="450" y="168" text-anchor="middle" class="svgsm">if the tool's version was built from the old file, the developer sees it in the diff and can: re-sync repository → "regenerate" → push again (new commit)</text>
+      <text x="450" y="196" text-anchor="middle" class="svgsm">a true conflict appears in the MR exactly as with manual branches, and is resolved in GitLab; the tool never merges</text>
+    </svg>
+  </div>
+
+  <h2>Scenario 7 — Re-sync and caches, side by side</h2>
+  <div class="tbl"><table>
+    <tr><th>Action</th><th>git / API process</th><th>Where it lands</th><th>Who is affected</th></tr>
+    <tr><td>Load IKG template</td><td>none (zip unpack)</td><td><code>data/packs/unzipped/ikg_pack_&lt;sha&gt;/</code></td><td>shared by all, read-only</td></tr>
+    <tr><td>Add live repository</td><td><code>git clone --depth 1 --filter=blob:none --sparse</code> (user's token)</td><td><code>data/cache/repos/&lt;user&gt;/&lt;project&gt;@&lt;branch&gt;/</code></td><td>that user only</td></tr>
+    <tr><td>Re-sync ticked</td><td><code>git fetch --depth 1</code> + <code>git checkout</code> in that user's clone</td><td>same folder, index rebuilt</td><td>that user only; other chats of the user see it on their next run</td></tr>
+    <tr><td>Run (generate)</td><td>none</td><td><code>data/users/&lt;user&gt;/chats/&lt;chat&gt;/files/</code></td><td>that chat only</td></tr>
+    <tr><td>Push</td><td>REST: branches → commits → merge_requests (user's token)</td><td>GitLab</td><td>the feature branch; base and target untouched</td></tr>
+    <tr><td>Nightly pack build</td><td><code>git clone --depth 1</code> (service token) in Airflow</td><td><code>packs/ikg_pack.zip</code></td><td>every new chat from the next morning; running chats keep their pack version</td></tr>
+  </table></div>
+
+  <h3>Why this holds up with many simultaneous developers</h3>
+  <ul>
+    <li>No shared mutable git state on the server: packs are immutable per version, live clones are per user, generated files per chat.</li>
+    <li>All writes go through GitLab's API under the developer's identity, so permissions, protected branches and MR approvals apply exactly as for a manual push; the service token cannot push.</li>
+    <li>Branch creation uses the base tip at push time, so the tool never "re-opens" an old state of the base branch.</li>
+    <li>One run per chat at a time; chats and users run in parallel without touching each other's data.</li>
+  </ul>
+</main>
+
+</body></html>
