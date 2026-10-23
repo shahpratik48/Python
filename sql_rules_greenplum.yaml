@@ -1,0 +1,214 @@
+# Greenplum / IKG SQL rules - the checkable subset of sql_rules.yaml
+# Version: 1.0   (replaces the generic multi-database sql_rules.yaml: oracle / sql_server / postgresql sections,
+#                 EXPLAIN-plan analysis, index suggestions and scoring are NOT rules a file check can apply)
+#
+# Every rule here has a regex `pattern` and is enforced mechanically on each generated file by the Knowledge Pack
+# (derived/knowledge.rules) and the Agile Dev Assist validator. Semantics:
+#   pattern + must_match: false  -> the pattern is FORBIDDEN in the file (a hit = finding)
+#   pattern + must_match: true   -> the pattern is REQUIRED in the file (no hit = finding)
+# `languages` limits the rule to file types; `exempt` = path globs the rule does not apply to.
+# Severities: critical (blocks), high (blocks), medium, low - severity_mapping.yaml may override by rule_id.
+
+greenplum_rules:
+
+  # ---------------------------------------------------------------- distribution
+  - rule_id: "OPT-DIST-001"
+    name: "create_table_needs_distribution_key"
+    description: "Every CREATE TABLE must declare DISTRIBUTED BY (key used in downstream joins) or DISTRIBUTED RANDOMLY on purpose"
+    enabled: true
+    pattern: "DISTRIBUTED\\s+(BY\\s*\\(|RANDOMLY|REPLICATED)|\\A(?![\\s\\S]*CREATE\\s+TABLE)"   # satisfied when there is no CREATE TABLE at all
+    must_match: true
+    severity: "high"
+    languages: [sql]
+    exempt: ["**/*_view*.sql", "**/ikg_datasets_validation/**"]
+    message: "Add DISTRIBUTED BY (<join key>) - a table without a distribution key defaults to the first column and causes redistribute motion"
+    example_correct: "CREATE TABLE {{params.IKG_SCHEMA}}.x_ikg AS SELECT ... DISTRIBUTED BY (acc_mhh_n);"
+
+  - rule_id: "OPT-DIST-002"
+    name: "no_distributed_randomly_for_joined_tables"
+    description: "DISTRIBUTED RANDOMLY forces redistribute motion on every join; use it only for tables that are never joined"
+    enabled: true
+    pattern: "DISTRIBUTED\\s+RANDOMLY"
+    must_match: false
+    severity: "medium"
+    languages: [sql]
+    message: "DISTRIBUTED RANDOMLY - prefer the entity key the table is joined on (acc_mhh_n / ip_cli_i / acc_i / fa_i)"
+
+  - rule_id: "OPT-DIST-003"
+    name: "distribution_key_should_be_entity_key"
+    description: "IKG tables distribute on the entity key of their grain (household acc_mhh_n, client ip_cli_i, account acc_i / acc_n, advisor fa_i / fa_gpn, prospect main_prospect_id)"
+    enabled: true
+    pattern: "DISTRIBUTED\\s+BY\\s*\\(\\s*(profile_date|ikg_key|row_id|id|seq|load_dt)\\s*\\)"
+    must_match: false
+    severity: "medium"
+    languages: [sql]
+    message: "Distribution key is a date / surrogate column - joins on the entity key will redistribute; use the entity key"
+
+  # ---------------------------------------------------------------- query patterns
+  - rule_id: "OPT-PAT-001"
+    name: "no_select_star_in_create_or_insert"
+    description: "SELECT * inside CREATE TABLE AS / INSERT breaks when source columns change and hides the column list"
+    enabled: true
+    pattern: "(CREATE\\s+TABLE[\\s\\S]{0,200}?AS\\s*SELECT\\s+\\*|INSERT\\s+INTO[\\s\\S]{0,200}?SELECT\\s+\\*)"
+    must_match: false
+    severity: "high"
+    languages: [sql]
+    message: "List the columns explicitly instead of SELECT *"
+
+  - rule_id: "OPT-PAT-002"
+    name: "no_cross_join"
+    description: "CROSS JOIN / comma joins produce cartesian products"
+    enabled: true
+    pattern: "\\bCROSS\\s+JOIN\\b"
+    must_match: false
+    severity: "high"
+    languages: [sql]
+    message: "CROSS JOIN - if intended (e.g. a one-row parameter table) add a comment '-- cross join intended'"
+
+  - rule_id: "OPT-PAT-003"
+    name: "join_needs_on_condition"
+    description: "A JOIN without ON / USING is a cartesian product"
+    enabled: true
+    pattern: "\\b(INNER|LEFT|RIGHT|FULL)?\\s*(OUTER\\s+)?JOIN\\s+[\\w.{}\\s]+?\\s+(AS\\s+)?\\w+\\s*(WHERE|GROUP|ORDER|LEFT|RIGHT|INNER|FULL|JOIN|;|$)"
+    must_match: false
+    severity: "critical"
+    languages: [sql]
+    message: "JOIN without ON condition"
+
+  - rule_id: "OPT-PAT-004"
+    name: "no_natural_join"
+    description: "NATURAL JOIN silently changes meaning when columns are added"
+    enabled: true
+    pattern: "\\bNATURAL\\s+(INNER\\s+|LEFT\\s+|RIGHT\\s+|FULL\\s+)?(OUTER\\s+)?JOIN\\b"
+    must_match: false
+    severity: "high"
+    languages: [sql]
+    message: "Use an explicit ON condition instead of NATURAL JOIN"
+
+  - rule_id: "OPT-PAT-005"
+    name: "no_delete_or_update_without_where"
+    description: "DELETE / UPDATE on a whole table"
+    enabled: true
+    pattern: "\\b(DELETE\\s+FROM|UPDATE)\\s+[\\w.{}]+\\s*(SET[\\s\\S]*?)?;\\s*$"
+    must_match: false
+    severity: "critical"
+    languages: [sql]
+    message: "DELETE / UPDATE without WHERE - use DROP TABLE IF EXISTS + CREATE TABLE AS (IKG pattern) or add WHERE"
+
+  - rule_id: "OPT-PAT-006"
+    name: "no_distinct_as_dedup_bandaid"
+    description: "SELECT DISTINCT over a join usually hides a bad join grain; dedupe with the key or ROW_NUMBER"
+    enabled: true
+    pattern: "SELECT\\s+DISTINCT\\s+\\*"
+    must_match: false
+    severity: "low"
+    languages: [sql]
+    message: "SELECT DISTINCT * - fix the join grain or use ROW_NUMBER() OVER (PARTITION BY <key>)"
+
+  - rule_id: "OPT-PAT-007"
+    name: "no_function_on_profile_date_filter"
+    description: "A function around profile_date in WHERE prevents partition pruning"
+    enabled: true
+    pattern: "WHERE[\\s\\S]{0,120}?(TO_DATE|CAST|SUBSTR|SUBSTRING|TO_CHAR|DATE_TRUNC)\\s*\\(\\s*\\w*\\.?profile_date"
+    must_match: false
+    severity: "medium"
+    languages: [sql]
+    message: "Compare profile_date to the parameter directly ({{params.IKG_PROFILE_DATE}}); do not wrap the column in a function"
+
+  - rule_id: "OPT-PAT-008"
+    name: "no_order_by_in_ctas"
+    description: "ORDER BY inside CREATE TABLE AS / INSERT SELECT costs a sort for nothing (Greenplum tables are unordered)"
+    enabled: true
+    pattern: "(CREATE\\s+TABLE|INSERT\\s+INTO)[\\s\\S]*?\\bORDER\\s+BY\\b[\\s\\S]*?(DISTRIBUTED|;)"
+    must_match: false
+    severity: "low"
+    languages: [sql]
+    exempt: ["**/ikg_datasets_validation/**", "**/*report*.sql"]
+    message: "Remove ORDER BY from the table-building statement (keep it only inside window functions / LIMIT queries)"
+
+  # ---------------------------------------------------------------- IKG parameterisation (overlaps STD-VAR-*; kept here for Greenplum context)
+  - rule_id: "OPT-PRM-001"
+    name: "schema_via_params"
+    description: "Schema names come from {{params.<X>_SCHEMA}}; literal schemas (core_ikg, sandbox_ikg_pre_prd, core_wma_shared ...) break UAT / PROD portability"
+    enabled: true
+    pattern: "\\b(core_ikg|sandbox_ikg_pre_prd|core_wma_shared|core_nlg|core_odm)\\s*\\."
+    must_match: false
+    severity: "critical"
+    languages: [sql, python]
+    exempt: ["**/notebooks/**"]
+    message: "Use {{params.IKG_SCHEMA}} / {{params.EDW_INPUT_SCHEMA}} / {{params.NLG_SCHEMA}} instead of the literal schema"
+
+  - rule_id: "OPT-PRM-002"
+    name: "profile_date_via_params"
+    description: "Hard-coded dates in WHERE clauses"
+    enabled: true
+    pattern: "WHERE[\\s\\S]{0,200}?'\\d{4}-\\d{2}-\\d{2}'|WHERE[\\s\\S]{0,200}?'\\d{8}'"
+    must_match: false
+    severity: "critical"
+    languages: [sql]
+    message: "Use '{{params.IKG_PROFILE_DATE}}' / '{{params.IKG_PREV_PROFILE_DATE}}' instead of a literal date"
+
+  # ---------------------------------------------------------------- IKG table pattern (owner / grant / cleanup)
+  - rule_id: "OPT-TBL-001"
+    name: "drop_if_exists_before_create"
+    description: "IKG scripts rebuild tables: DROP TABLE IF EXISTS precedes CREATE TABLE"
+    enabled: true
+    pattern: "DROP\\s+TABLE\\s+IF\\s+EXISTS|\\A(?![\\s\\S]*CREATE\\s+TABLE)"
+    must_match: true
+    severity: "medium"
+    languages: [sql]
+    exempt: ["**/ikg_create_profiles_history/**", "**/ikg_datasets_validation/**"]
+    message: "Add DROP TABLE IF EXISTS {{params.IKG_SCHEMA}}.<table>; before the CREATE TABLE"
+
+  - rule_id: "OPT-TBL-002"
+    name: "owner_and_grant_present"
+    description: "Every created table ends with ALTER TABLE ... OWNER TO {{params.IKG_TABLE_OWNER_GROUP}} and GRANT SELECT ... TO {{params.IKG_TABLE_READER_GROUP}}"
+    enabled: true
+    pattern: "GRANT\\s+SELECT\\s+ON\\s+\\{\\{params\\.\\w+\\}\\}\\.\\w+\\s+TO\\s+\\{\\{params\\.\\w+READER_GROUP\\}\\}|\\A(?![\\s\\S]*CREATE\\s+TABLE)"
+    must_match: true
+    severity: "high"
+    languages: [sql]
+    exempt: ["**/ikg_create_profiles_history/**", "**/ikg_datasets_validation/**"]
+    message: "Add the OWNER / GRANT pair (ALTER TABLE ... OWNER TO {{params.IKG_TABLE_OWNER_GROUP}}; GRANT SELECT ON ... TO {{params.IKG_TABLE_READER_GROUP}};)"
+
+  - rule_id: "OPT-TBL-003"
+    name: "no_temp_tables_left_behind"
+    description: "Intermediate TEMP / scratch tables must be dropped in the same script"
+    enabled: true
+    pattern: "CREATE\\s+(TEMP|TEMPORARY)\\s+TABLE"
+    must_match: false
+    severity: "low"
+    languages: [sql]
+    message: "TEMP tables are fine inside one session but break the one-file-one-table lineage; prefer CTEs or a named intermediate table"
+
+  - rule_id: "OPT-TBL-004"
+    name: "analyze_after_large_load"
+    description: "Greenplum needs statistics after building a table that is joined downstream"
+    enabled: false        # enable once the team decides ANALYZE is mandatory (ikg_data_refresh may run it centrally)
+    pattern: "\\bANALYZE\\s+\\{\\{params\\.|\\A(?![\\s\\S]*CREATE\\s+TABLE)"
+    must_match: true
+    severity: "low"
+    languages: [sql]
+    message: "Add ANALYZE {{params.IKG_SCHEMA}}.<table>; after the load"
+
+  # ---------------------------------------------------------------- python helpers
+  - rule_id: "OPT-PY-001"
+    name: "no_pandas_full_table_read"
+    description: "Reading a whole Greenplum table into pandas in a DAG task"
+    enabled: true
+    pattern: "read_sql\\s*\\(\\s*[\"']\\s*SELECT\\s+\\*\\s+FROM"
+    must_match: false
+    severity: "medium"
+    languages: [python]
+    message: "Push the work into SQL (CREATE TABLE AS) instead of pulling the full table into pandas"
+
+# ---------------------------------------------------------------- exceptions (path based)
+exceptions:
+  exclude_files:
+    - "*_test.sql"
+    - "*_debug.sql"
+  rule_overrides:
+    - path_pattern: "dags/ikg/scripts/sql/ikg_datasets_validation/*.sql"
+      disabled_rules: ["OPT-DIST-001", "OPT-TBL-001", "OPT-TBL-002", "OPT-PAT-008"]   # validation queries, not tables
+    - path_pattern: "dags/ikg/scripts/sql/ikg_create_profiles_history/*.sql"
+      disabled_rules: ["OPT-TBL-001", "OPT-TBL-002"]                                 # INSERT INTO existing history tables
