@@ -126,20 +126,32 @@ def _is_ignored(rel_path):
     return False
 
 
+def _is_prohibited(rel_path):
+    """True if the file extension is blocked by the project's GitLab push rule."""
+    ext = os.path.splitext(rel_path)[1].lower()
+    return ext in {e.lower() for e in getattr(config, "PROHIBITED_EXTENSIONS", [])}
+
+
 def unzip(zip_path, dest_dir):
-    """Extract zip and return list of (relative_path, absolute_path) for all files."""
+    """Extract zip and return (files, prohibited):
+    files      - list of (relative_path, absolute_path) to check in
+    prohibited - list of relative paths skipped because of PROHIBITED_EXTENSIONS"""
     with zipfile.ZipFile(zip_path) as zf:
         zf.extractall(dest_dir)
-    files = []
+    files, prohibited = [], []
     for root, _dirs, names in os.walk(dest_dir):
         for name in names:
             abs_path = os.path.join(root, name)
             rel_path = os.path.relpath(abs_path, dest_dir).replace(os.sep, "/")
             if _is_ignored(rel_path):
                 continue
+            if _is_prohibited(rel_path):
+                prohibited.append(rel_path)
+                continue
             files.append((rel_path, abs_path))
     files.sort()
-    return files
+    prohibited.sort()
+    return files, prohibited
 
 
 def _file_action(action, repo_path, abs_path):
@@ -202,7 +214,12 @@ def run(zip_path=None, branch=None, token=None, dry_run=False):
     # ---- unzip --------------------------------------------------------------
     target = config.TARGET_FOLDER.strip("/")
     with tempfile.TemporaryDirectory(prefix="zip_checkin_") as tmp:
-        files = unzip(zip_path, tmp)
+        files, prohibited = unzip(zip_path, tmp)
+        if prohibited:
+            print(f"\nWARNING: {len(prohibited)} file(s) skipped - extension prohibited by the GitLab push rule:")
+            for rel in prohibited:
+                print(f"  [skip  ] {target}/{rel}")
+            print()
         if not files:
             print("Zip contains no files to check in.")
             return
@@ -223,7 +240,8 @@ def run(zip_path=None, branch=None, token=None, dry_run=False):
             actions.append(_file_action(action, repo_path, abs_path))
             print(f"  [{action:6}] {repo_path}")
 
-        print(f"\nSummary : {created} new, {updated} replaced -> {len(actions)} total")
+        print(f"\nSummary : {created} new, {updated} replaced -> {len(actions)} total"
+              + (f", {len(prohibited)} skipped" if prohibited else ""))
 
         if dry_run:
             print("Dry run - nothing committed.")
@@ -235,7 +253,16 @@ def run(zip_path=None, branch=None, token=None, dry_run=False):
         base_msg = f"{config.COMMIT_MESSAGE}: {os.path.basename(zip_path)}"
         for n, chunk in enumerate(chunks, start=1):
             msg = base_msg if len(chunks) == 1 else f"{base_msg} (part {n}/{len(chunks)})"
-            result = gl.commit(branch, msg, chunk)
+            try:
+                result = gl.commit(branch, msg, chunk)
+            except RuntimeError as e:
+                if "prohibited by the pattern" in str(e):
+                    raise RuntimeError(
+                        "GitLab rejected the commit because a file name is blocked by the project's "
+                        "push rule. Add that file's extension to PROHIBITED_EXTENSIONS in config.py "
+                        "and re-run.\n" + str(e)
+                    ) from None
+                raise
             print(f"Commit {n}/{len(chunks)}: {result['short_id']}  ({len(chunk)} file(s))")
 
     web = info.get("web_url", "")

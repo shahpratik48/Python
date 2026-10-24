@@ -32,3 +32,13 @@ VERIFY_SSL = True
 
 # Files / folders inside the zip that should never be checked in
 IGNORE_PATTERNS = ["__MACOSX/", ".DS_Store", "Thumbs.db"]
+
+# File extensions the GitLab project's push rule prohibits (binary / archive files).
+# Files with these extensions are skipped with a warning instead of failing the whole commit.
+# Taken from the push-rule pattern on ikg-dags; extend if GitLab reports another one.
+PROHIBITED_EXTENSIONS = [
+    ".7z", ".bz2", ".bin", ".class", ".com", ".dat", ".deb", ".dll", ".dmg", ".ear",
+    ".exe", ".gz", ".iso", ".jar", ".lz", ".mdb", ".mp3", ".mp4", ".msi", ".msp",
+    ".nupkg", ".o", ".ocx", ".pkg", ".pyc", ".rar", ".rpm", ".rz", ".so", ".tar",
+    ".tgz", ".war", ".wav", ".wim", ".xz", ".zip",
+]

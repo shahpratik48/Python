@@ -18,6 +18,7 @@ You will be prompted for your GitLab token (hidden) and the branch name.
 - File already in branch -> replaced; not in branch -> created; nothing deleted
 - Text files sent as UTF-8, binary files as base64
 - `__MACOSX/`, `.DS_Store`, `Thumbs.db` skipped
+- Files with an extension blocked by the project's GitLab push rule (`.zip`, `.pyc`, `.jar`, `.exe`, … see `PROHIBITED_EXTENSIONS` in config) are skipped with a warning instead of failing the commit
 - Commits are chunked (100 files per commit by default)
 - `run(..., dry_run=True)` shows the create/update plan without committing
 
