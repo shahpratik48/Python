@@ -59,11 +59,12 @@ greenplum_rules:
     name: "no_cross_join"
     description: "CROSS JOIN / comma joins produce cartesian products"
     enabled: true
-    pattern: "\\bCROSS\\s+JOIN\\b"
+    pattern: "\\bCROSS\\s+JOIN\\b(?!\\s+LATERAL)"
+    unless: "cross\\s+join\\s+intended"
     must_match: false
     severity: "high"
     languages: [sql]
-    message: "CROSS JOIN - if intended (e.g. a one-row parameter table) add a comment '-- cross join intended'"
+    message: "CROSS JOIN - if intended (e.g. a one-row parameter table) add a comment '-- cross join intended'; CROSS JOIN LATERAL (unnest / jsonb_array_elements) is allowed"
 
   - rule_id: "OPT-PAT-003"
     name: "join_needs_on_condition"
