@@ -40,5 +40,11 @@ PROHIBITED_EXTENSIONS = [
     ".7z", ".bz2", ".bin", ".class", ".com", ".dat", ".deb", ".dll", ".dmg", ".ear",
     ".exe", ".gz", ".iso", ".jar", ".lz", ".mdb", ".mp3", ".mp4", ".msi", ".msp",
     ".nupkg", ".o", ".ocx", ".pkg", ".pyc", ".rar", ".rpm", ".rz", ".so", ".tar",
-    ".tgz", ".war", ".wav", ".wim", ".xz", ".zip",
+    ".tgz", ".war", ".wav", ".wim", ".xz",
 ]
+
+# Zip files found INSIDE the uploaded zip are NOT unpacked. They are uploaded as-is
+# (binary) at their original path, in a separate commit after all other files, so that
+# if the GitLab push rule rejects .zip files only that commit fails and everything else
+# is already checked in. Set to False to skip inner zips entirely.
+UPLOAD_INNER_ZIPS = True

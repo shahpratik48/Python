@@ -133,25 +133,32 @@ def _is_prohibited(rel_path):
 
 
 def unzip(zip_path, dest_dir):
-    """Extract zip and return (files, prohibited):
-    files      - list of (relative_path, absolute_path) to check in
+    """Extract ONLY the outer zip (zip files inside it are left packed) and return
+    (files, inner_zips, prohibited):
+    files      - list of (relative_path, absolute_path) to check in normally
+    inner_zips - list of (relative_path, absolute_path) of .zip files found inside,
+                 uploaded as-is in a separate commit (see UPLOAD_INNER_ZIPS)
     prohibited - list of relative paths skipped because of PROHIBITED_EXTENSIONS"""
     with zipfile.ZipFile(zip_path) as zf:
         zf.extractall(dest_dir)
-    files, prohibited = [], []
+    files, inner_zips, prohibited = [], [], []
     for root, _dirs, names in os.walk(dest_dir):
         for name in names:
             abs_path = os.path.join(root, name)
             rel_path = os.path.relpath(abs_path, dest_dir).replace(os.sep, "/")
             if _is_ignored(rel_path):
                 continue
+            if rel_path.lower().endswith(".zip"):
+                inner_zips.append((rel_path, abs_path))
+                continue
             if _is_prohibited(rel_path):
                 prohibited.append(rel_path)
                 continue
             files.append((rel_path, abs_path))
     files.sort()
+    inner_zips.sort()
     prohibited.sort()
-    return files, prohibited
+    return files, inner_zips, prohibited
 
 
 def _file_action(action, repo_path, abs_path):
@@ -214,13 +221,22 @@ def run(zip_path=None, branch=None, token=None, dry_run=False):
     # ---- unzip --------------------------------------------------------------
     target = config.TARGET_FOLDER.strip("/")
     with tempfile.TemporaryDirectory(prefix="zip_checkin_") as tmp:
-        files, prohibited = unzip(zip_path, tmp)
+        files, inner_zips, prohibited = unzip(zip_path, tmp)
         if prohibited:
             print(f"\nWARNING: {len(prohibited)} file(s) skipped - extension prohibited by the GitLab push rule:")
             for rel in prohibited:
                 print(f"  [skip  ] {target}/{rel}")
             print()
-        if not files:
+        upload_inner = getattr(config, "UPLOAD_INNER_ZIPS", True)
+        if inner_zips:
+            if upload_inner:
+                print(f"Inner zip file(s) found: {len(inner_zips)} - kept packed, uploaded as-is in a separate commit:")
+            else:
+                print(f"Inner zip file(s) found: {len(inner_zips)} - skipped (UPLOAD_INNER_ZIPS = False):")
+            for rel, _ in inner_zips:
+                print(f"  [zip   ] {target}/{rel}")
+            print()
+        if not files and not (inner_zips and upload_inner):
             print("Zip contains no files to check in.")
             return
         print(f"Unzipped: {len(files)} file(s) from {os.path.basename(zip_path)}")
@@ -264,6 +280,30 @@ def run(zip_path=None, branch=None, token=None, dry_run=False):
                     ) from None
                 raise
             print(f"Commit {n}/{len(chunks)}: {result['short_id']}  ({len(chunk)} file(s))")
+
+        # ---- inner zip files: separate commit, uploaded packed ---------------
+        if inner_zips and upload_inner:
+            # refresh the file list: the commits above may have created folders
+            existing = gl.list_files(branch, target)
+            zip_actions = []
+            for rel_path, abs_path in inner_zips:
+                repo_path = f"{target}/{rel_path}"
+                action = "update" if repo_path in existing else "create"
+                zip_actions.append(_file_action(action, repo_path, abs_path))
+                print(f"  [{action:6}] {repo_path}  (zip, uploaded as-is)")
+            try:
+                result = gl.commit(branch, f"{base_msg} (inner zip files)", zip_actions)
+                print(f"Commit zip : {result['short_id']}  ({len(zip_actions)} zip file(s))")
+            except RuntimeError as e:
+                if "prohibited by the pattern" in str(e):
+                    print(
+                        "\nWARNING: GitLab's push rule on this project rejects .zip files, so the inner "
+                        "zip file(s) above were NOT uploaded. All other files are already checked in.\n"
+                        "Ask the project maintainers to allow .zip in the push rule, or set "
+                        "UPLOAD_INNER_ZIPS = False in config.py to silence this.\n" + str(e)
+                    )
+                else:
+                    raise
 
     web = info.get("web_url", "")
     if web:

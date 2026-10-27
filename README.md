@@ -19,6 +19,7 @@ You will be prompted for your GitLab token (hidden) and the branch name.
 - Text files sent as UTF-8, binary files as base64
 - `__MACOSX/`, `.DS_Store`, `Thumbs.db` skipped
 - Files with an extension blocked by the project's GitLab push rule (`.zip`, `.pyc`, `.jar`, `.exe`, … see `PROHIBITED_EXTENSIONS` in config) are skipped with a warning instead of failing the commit
+- Zip files inside the uploaded zip are NOT unpacked: they are uploaded as-is (binary) at their original path in a separate, final commit, so a push-rule rejection of .zip affects only that commit (`UPLOAD_INNER_ZIPS` in config)
 - Commits are chunked (100 files per commit by default)
 - `run(..., dry_run=True)` shows the create/update plan without committing
 
