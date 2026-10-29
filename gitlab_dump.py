@@ -6,11 +6,14 @@ Three features, each can be run or skipped independently:
   (1) export  - connect to GitLab, read EVERY file (all folders / subfolders) from the
                 `main` branch of the ikg / odm / nlg projects and write one txt per
                 project: i.txt, o.txt, n.txt
-  (2) mask    - create i_masked.txt, o_masked.txt, n_masked.txt from the txt files
-                (every letter shifted by MASK_SHIFT from config, default 1:
-                a->b ... z->a, A->B ... Z->A, everything else unchanged)
-  (3) unmask  - read i_masked.txt / o_masked.txt / n_masked.txt from the same folder
-                and restore the originals as i_restored.txt / o_restored.txt / n_restored.txt
+  (2) mask    - mask i.txt / o.txt / n.txt (every letter shifted by MASK_SHIFT from
+                config, default 1: a->b ... z->a, A->B ... Z->A, everything else
+                unchanged) and write the result into MASKED_DIR split into numbered
+                parts each below MAX_MASKED_FILE_BYTES (~5 MB):
+                masked/i_1_masked.txt, masked/i_2_masked.txt, ...
+  (3) unmask  - read all parts for each project from MASKED_DIR (i_1_masked.txt,
+                i1_masked.txt, i-1-masked.txt ... are all accepted), join them in
+                numeric order 1,2,3..., unmask and write UNMASKED_DIR/i_restored.txt
                 (set restore_to_original=True to overwrite i.txt / o.txt / n.txt instead)
   (4) rebuild - read the restored txt files and recreate every real file, with its
                 original name and content, in the original folder structure under
@@ -41,6 +44,7 @@ Dependencies: requests   (pip install requests)
 
 import getpass
 import os
+import re
 import shutil
 import sys
 from urllib.parse import quote
@@ -99,6 +103,59 @@ class GitLab:
 # =========================================================================== #
 def _out_path(prefix, suffix=""):
     return os.path.join(config.OUTPUT_DIR, f"{prefix}{suffix}.txt")
+
+
+def _masked_dir():
+    return os.path.join(config.OUTPUT_DIR, config.MASKED_DIR)
+
+
+def _unmasked_dir():
+    return os.path.join(config.OUTPUT_DIR, config.UNMASKED_DIR)
+
+
+def _masked_part_path(prefix, n):
+    return os.path.join(_masked_dir(), f"{prefix}_{n}{config.MASKED_SUFFIX}.txt")
+
+
+def _restored_path(prefix):
+    return os.path.join(_unmasked_dir(), f"{prefix}{config.RESTORED_SUFFIX}.txt")
+
+
+def split_text(text, max_bytes):
+    """
+    Split `text` into chunks whose UTF-8 size is <= max_bytes, cutting only at
+    line ends ("\n") so lines are never broken across parts. A single line longer
+    than max_bytes is cut at character boundaries. "".join(chunks) == text.
+    """
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be positive")
+    chunks, cur, cur_size = [], [], 0
+    pieces = text.split("\n")
+    for i, piece in enumerate(pieces):
+        line = piece + "\n" if i < len(pieces) - 1 else piece
+        if not line:
+            continue
+        size = len(line.encode(config.ENCODING))
+        if size > max_bytes:  # over-long line: flush, then cut it by characters
+            if cur:
+                chunks.append("".join(cur)); cur, cur_size = [], 0
+            start = 0
+            while start < len(line):
+                end = start
+                acc = 0
+                while end < len(line):
+                    b = len(line[end].encode(config.ENCODING))
+                    if acc + b > max_bytes:
+                        break
+                    acc += b; end += 1
+                chunks.append(line[start:end]); start = end
+            continue
+        if cur_size + size > max_bytes:
+            chunks.append("".join(cur)); cur, cur_size = [], 0
+        cur.append(line); cur_size += size
+    if cur:
+        chunks.append("".join(cur))
+    return chunks or [""]
 
 
 def _decode(raw):
@@ -204,31 +261,93 @@ def export_projects(token=None, projects=None):
 # =========================================================================== #
 # Feature 2: mask
 # =========================================================================== #
+def _part_pattern(prefix):
+    """Regex matching i_1_masked.txt, i1_masked.txt, i-1-masked.txt, I_01_MASKED.TXT ..."""
+    suf = re.escape(config.MASKED_SUFFIX.strip("_-"))
+    return re.compile(rf"^{re.escape(prefix)}[_-]?(\d+)[_-]?{suf}\.txt$", re.IGNORECASE)
+
+
 def mask_files(projects=None):
     projects = projects or config.PROJECTS
+    out_dir = _masked_dir()
+    os.makedirs(out_dir, exist_ok=True)
+    limit = int(config.MAX_MASKED_FILE_BYTES)
+
     for key, (_path, prefix) in projects.items():
         src = _out_path(prefix)
-        dst = _out_path(prefix, config.MASKED_SUFFIX)
         if not os.path.isfile(src):
             print(f"[{key}] skip - {src} not found")
             continue
-        _write(dst, mask_text(_read(src)))
-        print(f"[{key}] {src} -> {dst}")
+
+        # remove parts from a previous run so stale numbers can't be picked up later
+        pat = _part_pattern(prefix)
+        for old in os.listdir(out_dir):
+            if pat.match(old):
+                os.remove(os.path.join(out_dir, old))
+
+        text = _read(src)
+        masked = mask_text(text)
+        parts = split_text(masked, limit)
+        total_bytes = len(masked.encode(config.ENCODING))
+        total_lines = masked.count("\n") + (0 if masked.endswith("\n") or not masked else 1)
+        print(f"[{key}] {src}: {total_bytes:,} bytes, {total_lines:,} lines -> {len(parts)} part(s) in {out_dir}")
+        for n, part in enumerate(parts, start=1):
+            dst = _masked_part_path(prefix, n)
+            _write(dst, part)
+            size = len(part.encode(config.ENCODING))
+            lines = part.count("\n") + (0 if part.endswith("\n") or not part else 1)
+            assert size <= limit, f"{dst} is {size} bytes > limit {limit}"
+            print(f"      {os.path.basename(dst)}: {size:,} bytes ({size / 1024 / 1024:.2f} MB), {lines:,} lines")
 
 
 # =========================================================================== #
 # Feature 3: unmask
 # =========================================================================== #
+def find_masked_parts(prefix, folder=None):
+    """
+    Return [(number, path), ...] of all masked parts for `prefix` in MASKED_DIR,
+    sorted by number. Also accepts a single un-numbered <prefix>_masked.txt as part 1.
+    Raises if numbers are duplicated or have gaps (e.g. 1,2,4).
+    """
+    folder = folder or _masked_dir()
+    if not os.path.isdir(folder):
+        return []
+    pat = _part_pattern(prefix)
+    single = f"{prefix}{config.MASKED_SUFFIX}.txt".lower()
+    found = {}
+    for name in os.listdir(folder):
+        m = pat.match(name)
+        n = int(m.group(1)) if m else (1 if name.lower() == single else None)
+        if n is None:
+            continue
+        if n in found:
+            raise ValueError(f"Duplicate part number {n} for '{prefix}': {found[n]} and {name}")
+        found[n] = name
+    if not found:
+        return []
+    nums = sorted(found)
+    expected = list(range(nums[0], nums[-1] + 1))
+    if nums != expected:
+        missing = sorted(set(expected) - set(nums))
+        raise ValueError(f"Missing part number(s) {missing} for '{prefix}' in {folder}; found {nums}")
+    if nums[0] not in (0, 1):
+        raise ValueError(f"Parts for '{prefix}' start at {nums[0]}, expected 1")
+    return [(n, os.path.join(folder, found[n])) for n in nums]
+
+
 def unmask_files(projects=None, restore_to_original=False):
     projects = projects or config.PROJECTS
+    os.makedirs(_unmasked_dir(), exist_ok=True)
     for key, (_path, prefix) in projects.items():
-        src = _out_path(prefix, config.MASKED_SUFFIX)
-        dst = _out_path(prefix, "" if restore_to_original else config.RESTORED_SUFFIX)
-        if not os.path.isfile(src):
-            print(f"[{key}] skip - {src} not found")
+        parts = find_masked_parts(prefix)
+        if not parts:
+            print(f"[{key}] skip - no {prefix}_<n>{config.MASKED_SUFFIX}.txt files in {_masked_dir()}")
             continue
-        _write(dst, unmask_text(_read(src)))
-        print(f"[{key}] {src} -> {dst}")
+        joined = "".join(_read(path) for _n, path in parts)
+        dst = _out_path(prefix) if restore_to_original else _restored_path(prefix)
+        _write(dst, unmask_text(joined))
+        names = ", ".join(os.path.basename(path) for _n, path in parts)
+        print(f"[{key}] {len(parts)} part(s) [{names}] -> {dst}")
 
 
 # =========================================================================== #
@@ -301,11 +420,10 @@ def rebuild_files(projects=None, source="restored"):
     project key folder (ikg/, odm/, nlg/).
     """
     projects = projects or config.PROJECTS
-    suffix = config.RESTORED_SUFFIX if source == "restored" else ""
     root = os.path.join(config.OUTPUT_DIR, config.REBUILD_DIR)
 
     for key, (_path, prefix) in projects.items():
-        src = _out_path(prefix, suffix)
+        src = _restored_path(prefix) if source == "restored" else _out_path(prefix)
         if not os.path.isfile(src):
             print(f"[{key}] skip - {src} not found")
             continue
@@ -377,7 +495,7 @@ def verify_files(projects=None):
 
     for key, (_path, prefix) in projects.items():
         orig = _out_path(prefix)
-        rest = _out_path(prefix, config.RESTORED_SUFFIX)
+        rest = _restored_path(prefix)
         if not os.path.isfile(orig):
             print(f"[{key}] skip - {orig} not found")
             continue

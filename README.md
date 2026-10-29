@@ -12,10 +12,10 @@ txt files, masks them, restores masked files, and rebuilds the real files from t
 | step   | input                      | output                                    |
 |--------|----------------------------|-------------------------------------------|
 | export | GitLab (token asked)       | i.txt, o.txt, n.txt                       |
-| mask   | i.txt, o.txt, n.txt        | i_masked.txt, o_masked.txt, n_masked.txt  |
-| unmask | *_masked.txt (same folder) | i_restored.txt, o_restored.txt, n_restored.txt (or i/o/n.txt with restore_to_original=True) |
-| rebuild | *_restored.txt (or i/o/n.txt with rebuild_source="original") | real files under rebuilt/ikg/, rebuilt/odm/, rebuilt/nlg/ in the original folder structure, e.g. rebuilt/ikg/dags/ikg/test/test.sql, plus rebuilt/ikg.zip, rebuilt/odm.zip, rebuilt/nlg.zip next to the folders |
-| verify | i/o/n.txt, *_restored.txt, rebuilt/ | report: byte-by-byte comparison of original vs restored txt, and of every rebuilt file vs the original txt; first difference shown with line/column |
+| mask   | i.txt, o.txt, n.txt        | masked/i_1_masked.txt, i_2_masked.txt, ... (each < 5 MB, split on line ends); same for o_, n_ |
+| unmask | masked/<prefix>_<n>_masked.txt parts (i_1_masked, i1_masked, i-1-masked ... accepted) | joined in order 1,2,3..., unmasked -> unmasked/i_restored.txt, o_restored.txt, n_restored.txt (or i/o/n.txt with restore_to_original=True) |
+| rebuild | unmasked/*_restored.txt (or i/o/n.txt with rebuild_source="original") | real files under rebuilt/ikg/, rebuilt/odm/, rebuilt/nlg/ in the original folder structure, e.g. rebuilt/ikg/dags/ikg/test/test.sql, plus rebuilt/ikg.zip, rebuilt/odm.zip, rebuilt/nlg.zip next to the folders |
+| verify | i/o/n.txt, unmasked/*_restored.txt, rebuilt/ | report: byte-by-byte comparison of original vs restored txt, and of every rebuilt file vs the original txt; first difference shown with line/column |
 
     pip install requests
     python gitlab_dump.py                 # asks y/n for each step
@@ -45,6 +45,11 @@ to the originals (verified with tabs, CRLF, unicode, no-trailing-newline, empty 
 files containing separator-like lines).
 
 ## Masking
+Masked output is split into numbered parts (`MAX_MASKED_FILE_BYTES`, just under 5 MB each),
+cut only at line ends so no line is broken. Unmask scans `masked/` for all parts of a project,
+accepts `i_1_masked.txt` / `i1_masked.txt` / `i-1-masked.txt` style names, sorts by number,
+refuses duplicates or gaps (e.g. 1,2,4) and joins them before unmasking.
+
 Every ASCII letter is shifted by `MASK_SHIFT` (config.py, default 1), case kept (shift 1: a->b, z->a, A->B, Z->A);
 digits, punctuation, whitespace and non-ASCII characters are unchanged. Unmask is the reverse shift.
 

@@ -35,6 +35,18 @@ MASK_SHIFT = 1
 MASKED_SUFFIX = "_masked"
 RESTORED_SUFFIX = "_restored"
 
+# Step 2 (mask) writes into OUTPUT_DIR/MASKED_DIR, split into numbered parts:
+#   masked/i_1_masked.txt, masked/i_2_masked.txt, ...   (same for o_ and n_)
+# Each part is kept below MAX_MASKED_FILE_BYTES; the split is on line boundaries.
+MASKED_DIR = "masked"
+MAX_MASKED_FILE_BYTES = 5 * 1024 * 1024 - 64 * 1024   # just under 5 MB
+
+# Step 3 (unmask) reads every part for a project from MASKED_DIR (i_1_masked.txt,
+# i1_masked.txt, i-1-masked.txt ... all accepted), joins them in numeric order and
+# writes OUTPUT_DIR/UNMASKED_DIR/i_restored.txt (o_, n_ likewise).
+# Steps 4 (rebuild) and 5 (verify) read the restored files from UNMASKED_DIR.
+UNMASKED_DIR = "unmasked"
+
 # Step 4 (rebuild): folder where the real files are recreated from the restored txt files.
 # Inside it one folder per project is created: ikg/, odm/, nlg/ (the PROJECTS keys),
 # and under each the original repo folder structure, e.g. rebuilt/ikg/dags/ikg/test/test.sql
