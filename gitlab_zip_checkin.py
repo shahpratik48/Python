@@ -89,7 +89,7 @@ class GitLab:
                 self._url("/repository/tree"),
                 params={
                     "ref": branch,
-                    "path": folder,
+                    **({"path": folder} if folder else {}),
                     "recursive": "true",
                     "per_page": 100,
                     "page": page,
@@ -181,7 +181,18 @@ def _file_action(action, repo_path, abs_path):
 # --------------------------------------------------------------------------- #
 # Main entry point
 # --------------------------------------------------------------------------- #
-def run(zip_path=None, branch=None, token=None, dry_run=False):
+def run(zip_path=None, branch=None, token=None, dry_run=False, target_folder=None):
+    """
+    zip_path      - zip to upload (asked if None)
+    branch        - target branch; created from BASE_BRANCH if missing, otherwise
+                    the commit goes on top of the existing branch
+    token         - GitLab token (asked, hidden, if None)
+    dry_run       - only print the create/update plan, commit nothing
+    target_folder - repo folder the zip root maps to. Default: config.TARGET_FOLDER.
+                    Use e.g. "agile_dev_assist_agent" when the zip contains only the
+                    files that belong under that folder (keeping their sub-structure).
+    Existing files at the same path are replaced; new files are created; nothing is deleted.
+    """
     # ---- inputs -----------------------------------------------------------
     if not zip_path:
         zip_path = input("Path to zip file (e.g. c:\\folder\\test.zip): ").strip().strip('"')
@@ -219,13 +230,21 @@ def run(zip_path=None, branch=None, token=None, dry_run=False):
             print(f"Branch  : '{branch}' created from '{config.BASE_BRANCH}'.")
 
     # ---- unzip --------------------------------------------------------------
-    target = config.TARGET_FOLDER.strip("/")
+    target = (target_folder if target_folder is not None else config.TARGET_FOLDER)
+    target = str(target).strip().replace("\\", "/").strip("/")
+    if target in (".", "./"):
+        target = ""  # repository root
+
+    def _repo_path(rel):
+        return f"{target}/{rel}" if target else rel
+
+    print(f"Target  : {target or '<repository root>'}  (zip root maps here; existing files are replaced)")
     with tempfile.TemporaryDirectory(prefix="zip_checkin_") as tmp:
         files, inner_zips, prohibited = unzip(zip_path, tmp)
         if prohibited:
             print(f"\nWARNING: {len(prohibited)} file(s) skipped - extension prohibited by the GitLab push rule:")
             for rel in prohibited:
-                print(f"  [skip  ] {target}/{rel}")
+                print(f"  [skip  ] {_repo_path(rel)}")
             print()
         upload_inner = getattr(config, "UPLOAD_INNER_ZIPS", True)
         if inner_zips:
@@ -234,7 +253,7 @@ def run(zip_path=None, branch=None, token=None, dry_run=False):
             else:
                 print(f"Inner zip file(s) found: {len(inner_zips)} - skipped (UPLOAD_INNER_ZIPS = False):")
             for rel, _ in inner_zips:
-                print(f"  [zip   ] {target}/{rel}")
+                print(f"  [zip   ] {_repo_path(rel)}")
             print()
         if not files and not (inner_zips and upload_inner):
             print("Zip contains no files to check in.")
@@ -246,7 +265,7 @@ def run(zip_path=None, branch=None, token=None, dry_run=False):
 
         actions, created, updated = [], 0, 0
         for rel_path, abs_path in files:
-            repo_path = f"{target}/{rel_path}"
+            repo_path = _repo_path(rel_path)
             if repo_path in existing:
                 action = "update"
                 updated += 1
@@ -287,7 +306,7 @@ def run(zip_path=None, branch=None, token=None, dry_run=False):
             existing = gl.list_files(branch, target)
             zip_actions = []
             for rel_path, abs_path in inner_zips:
-                repo_path = f"{target}/{rel_path}"
+                repo_path = _repo_path(rel_path)
                 action = "update" if repo_path in existing else "create"
                 zip_actions.append(_file_action(action, repo_path, abs_path))
                 print(f"  [{action:6}] {repo_path}  (zip, uploaded as-is)")
@@ -307,7 +326,7 @@ def run(zip_path=None, branch=None, token=None, dry_run=False):
 
     web = info.get("web_url", "")
     if web:
-        print(f"\nDone. Branch: {web}/-/tree/{quote(branch, safe='/')}/{target}")
+        print(f"\nDone. Branch: {web}/-/tree/{quote(branch, safe='/')}" + (f"/{target}" if target else ""))
     else:
         print("\nDone.")
 

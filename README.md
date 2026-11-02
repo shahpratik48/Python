@@ -22,6 +22,7 @@ You will be prompted for your GitLab token (hidden) and the branch name.
 - Zip files inside the uploaded zip are NOT unpacked: they are uploaded as-is (binary) at their original path in a separate, final commit, so a push-rule rejection of .zip affects only that commit (`UPLOAD_INNER_ZIPS` in config)
 - Commits are chunked (100 files per commit by default)
 - `run(..., dry_run=True)` shows the create/update plan without committing
+- `run(..., target_folder="agile_dev_assist_agent")` maps the zip root onto that repo folder, for adding / replacing a few files inside an existing folder of an existing branch (zip only the changed files, keep their sub-structure)
 
 ## Notes
 - Token needs `api` scope (or `write_repository`) with Developer role on the project.
